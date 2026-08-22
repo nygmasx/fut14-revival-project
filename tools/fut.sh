@@ -207,6 +207,18 @@ WATCH_MISSES=${WATCH_MISSES:-4}
 # watcher would keep sweeping the heap for nothing. Give up after this many
 # consecutive misses.
 WATCH_GIVE_UP=${WATCH_GIVE_UP:-20}
+# Combien la console encaisse d'un coup, en lecture XBDM.
+#
+# Ce balayage lisait par blocs de 4 Mo. Les mesures du 22 août donnent une
+# tolérance d'environ 300 Ko de `getmem` pendant que le titre tourne, au-delà
+# de laquelle XBDM se fige et la console tombe du réseau -- quatre fois dans
+# l'après-midi, bouton d'alimentation à chaque fois. Ce surveillant s'infligeait
+# donc, tout seul et en boucle, plus de dix fois la dose. Il précédait deux des
+# trois chutes notées en août, et personne n'avait fait le rapprochement.
+#
+# Le balayage est un peu plus lent ainsi. Une console qui répond lentement vaut
+# mieux qu'une console qu'il faut aller rallumer.
+WATCH_SWEEP_CHUNK=${WATCH_SWEEP_CHUNK:-0x40000}
 WATCH_LOG=runtime/patch-watch.log
 
 stop_watch() {
@@ -232,7 +244,7 @@ start_watch() {
         dry=0
         while [ \$dry -lt $WATCH_GIVE_UP ]; do
             if [ \$misses -ge $WATCH_MISSES ]; then
-                out=\$('$PY' tools/fifa14_tu3_helperfunctions_runtime_patch.py '$XBOX' --timeout 20 --chunk-size 0x400000 2>&1 | tail -1)
+                out=\$('$PY' tools/fifa14_tu3_helperfunctions_runtime_patch.py '$XBOX' --timeout 20 --chunk-size $WATCH_SWEEP_CHUNK 2>&1 | tail -1)
                 misses=0
             else
                 out=\$('$PY' tools/fifa14_tu3_helperfunctions_runtime_patch.py '$XBOX' --hint-only --timeout 8 --interval 2 --chunk-size 0x100000 2>&1 | tail -1)
