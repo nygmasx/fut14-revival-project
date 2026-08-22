@@ -159,6 +159,12 @@ STATS_GET_STATS_BY_GROUP = 16
 # Le code exact n'est pas connu. Ce qui est vérifié sur la console, c'est
 # qu'une erreur la sort de son attente là où un succès vide l'y laisse.
 STATS_ERR_NO_DATA = 1
+# Le nom de cette commande n'est pas lu dans le binaire : il est déduit de son
+# seul argument, `NAME`, et des valeurs qu'on lui voit passer --
+# « FriendliesLeaderboards ». C'est un arbre de classements demandé par son
+# nom, et c'est dit ainsi plutôt que baptisé d'un nom de SDK qu'on ne peut pas
+# vérifier.
+STATS_GET_LEADERBOARD_TREE = 17
 STATS_GET_KEY_SCOPES_MAP = 15
 # Leaderboards. Command 10 arrives as LBID plus NAME ("SkillGame41"), which is
 # a request for one leaderboard's descriptor; command 13 arrives as CENT (the
@@ -2356,6 +2362,25 @@ class Fifa14Protocol:
             Field("VID", INTEGER, int(view.value) if view is not None else 0),
         ]))
 
+    def leaderboard_tree(self, request: bytes) -> bytes:
+        """Un arbre de classements demandé par son nom.
+
+        Même raisonnement que pour les valeurs de statistiques, et il vient
+        d'être vérifié sur la console : quand ce serveur n'a rien, le dire est
+        ce qui débloque l'écran, et se taire poliment est ce qui le fige. Un
+        succès portant un arbre vide se lit « pas encore arrivé ».
+
+        Il n'y a aucun classement ici, et il n'y en aura pas tant que personne
+        n'aura joué : un classement est un agrégat de matchs, et ce serveur
+        n'en a aucun à agréger. L'erreur est donc exacte, pas commode.
+        """
+        asked = find_field(decode_frame(request, tolerant=True)["fields"], "NAME")
+        self.logger.event(
+            "leaderboard_tree_refused",
+            tree=str(asked.value) if asked is not None else "",
+        )
+        return response_frame(request, error=STATS_ERR_NO_DATA)
+
     def stats_notification_sweep(self, request: bytes,
                                  state: ClientState) -> list[bytes]:
         """Chercher le numéro de la notification qui clôt un `...Async`.
@@ -4217,6 +4242,8 @@ class Fifa14Protocol:
             ]
         if route == (STATS, STATS_GET_STAT_GROUP):
             return [self.stat_group(request)]
+        if route == (STATS, STATS_GET_LEADERBOARD_TREE):
+            return [self.leaderboard_tree(request)]
         if route == (STATS, STATS_GET_STATS_BY_GROUP):
             return [
                 self.stats_by_group(request),
