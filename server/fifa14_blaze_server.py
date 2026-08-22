@@ -237,6 +237,16 @@ SETUP_REASON_MATCHMAKING = 3
 # The made-up opponent's nucleus id. Far from any real one.
 SYNTHETIC_PERSONA = 1_000_002
 SETUP_CONTEXT_CREATE_GAME = 0
+# L'énumérateur suivant : celui qui entre dans une partie déjà là.
+#
+# Le 0 de CREATE_GAME est lu dans le binaire. Le 1 ne l'est pas -- c'est la
+# valeur suivante d'une énumération dont l'ordre est celui du SDK, et c'est
+# dit ici plutôt que caché. Ce qui est certain, c'est que 0 est faux à cet
+# endroit : on annonçait à une console qui venait de rejoindre la partie d'un
+# autre qu'elle venait d'en créer une. Elle se comportait alors en créateur et
+# attendait que quelqu'un arrive -- « chargement en cours », indéfiniment,
+# pendant que l'hôte affichait « En attente d'adversaire » en face.
+SETUP_CONTEXT_JOIN_GAME = 1
 
 MATCHMAKING_SUCCESS_CREATED_GAME = 0
 MATCHMAKING_SUCCESS_JOINED_NEW_GAME = 1
@@ -2204,7 +2214,8 @@ class Fifa14Protocol:
         return sorted(fields, key=lambda field: encode_tag(field.label))
 
     def setup_reason(self, session: int,
-                     result: int = MATCHMAKING_SUCCESS_CREATED_GAME) -> tuple:
+                     result: int = MATCHMAKING_SUCCESS_CREATED_GAME,
+                     context: int = SETUP_CONTEXT_CREATE_GAME) -> tuple:
         """Why this game exists, in the shape the client asks for.
 
         A game the console asked for itself is union index 0 -- a dataless
@@ -2222,7 +2233,7 @@ class Fifa14Protocol:
             return (
                 SETUP_REASON_DATALESS,
                 Field("VALU", STRUCT, [
-                    Field("DCTX", INTEGER, SETUP_CONTEXT_CREATE_GAME),
+                    Field("DCTX", INTEGER, context),
                 ]),
             )
         return (
@@ -2302,7 +2313,8 @@ class Fifa14Protocol:
 
     def game_setup_payload(self, game: HostedGame, session: int = 0,
                            result: int = MATCHMAKING_SUCCESS_CREATED_GAME,
-                           viewer: ClientState | None = None) -> list[Field]:
+                           viewer: ClientState | None = None,
+                           context: int = SETUP_CONTEXT_CREATE_GAME) -> list[Field]:
         """The five members of NotifyGameSetup.
 
         Shared by notification 20 and notification 22, because the 557-class
@@ -2317,7 +2329,7 @@ class Fifa14Protocol:
                 self.member_player(game, member, viewer) for member in game.members
             ] or [self.replicated_game_player(game)])),
             Field("QUEU", LIST, (STRUCT, [])),
-            Field("REAS", UNION, self.setup_reason(session, result)),
+            Field("REAS", UNION, self.setup_reason(session, result, context)),
         ]
 
     def game_setup_notifications(
@@ -3069,7 +3081,7 @@ class Fifa14Protocol:
                 encode_fields(self.game_setup_payload(
                     game, session=arrival["session"],
                     result=MATCHMAKING_SUCCESS_JOINED_EXISTING_GAME,
-                    viewer=state)),
+                    viewer=state, context=SETUP_CONTEXT_JOIN_GAME)),
             ),
             notification_frame(
                 GAME_MANAGER,
