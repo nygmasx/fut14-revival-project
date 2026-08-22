@@ -2478,26 +2478,43 @@ class Fifa14Protocol:
         ]
 
     def join_game(self, request: bytes, state: ClientState) -> list[bytes]:
-        """Somebody entering a game that already exists.
+        """Rejoindre la partie de quelqu'un -- par son numéro, ou par lui.
 
-        The joiner brings everything needed with it -- its own `PNET` and its
-        own `XSES` -- so nothing about the second console has to have been
-        cached beforehand. It is added to the roster, told what it joined, and
-        the people already in there are told somebody arrived.
+        C'est le chemin de l'invitation entre amis, et il ne ressemble pas à
+        celui du matchmaking. Le 22 août, la trame envoyée par la console
+        invitée disait :
 
-        The response is four members, not the two the published tables give:
-        `JEX` and `REX` list external players who came along, and are empty
-        here because nobody brings a party to a two-player match.
+            GID  = 0
+            SLOT = 1
+            USER = { ID: 2535469248587161, ... }
+
+        `GID` à zéro n'est pas une partie introuvable : c'est le client qui dit
+        qu'il ne raisonne pas en numéro de partie. Il désigne son hôte par son
+        identifiant de joueur, parce qu'il l'a pris dans sa liste d'amis et
+        non dans une liste de salons. Un serveur qui cherche `self.games[0]`
+        ici répond « aucune partie » à une demande parfaitement valide -- ce
+        qu'il faisait.
+
+        La lecture est tolérante parce que cette trame porte `RRST`, un
+        dictionnaire dont la grammaire nous échappe encore ; le décodeur se
+        resynchronise après lui et retrouve `USER`, qui est tout l'objet de
+        la requête.
         """
-        decoded = decode_frame(request)
+        try:
+            decoded = decode_frame(request, tolerant=True)
+        except ValueError:
+            return [response_frame(request)]
         fields = decoded["fields"]
         game_id = find_field(fields, "GID")
-        game = self.games.get(int(game_id.value) if game_id is not None else 0)
+        wanted = int(game_id.value) if game_id is not None else 0
+        game = self.games.get(wanted) if wanted else None
+        if game is None:
+            game = self.game_hosted_by(find_field(fields, "USER"))
         if game is None:
             self.logger.event(
                 "join_refused",
                 connection=state.connection_id,
-                game=int(game_id.value) if game_id is not None else 0,
+                game=wanted,
                 reason="no such game",
             )
             return [response_frame(request)]
@@ -2508,10 +2525,10 @@ class Fifa14Protocol:
             active, valu = network.value
             if valu is not None:
                 address = (active, valu)
+        slot = len(game.members)
         joined = self.member(
             game, state.xuid, state.gamertag, state.connection_id,
-            address, slot=len(game.members), team=len(game.members) % 2,
-            state=state,
+            address, slot=slot, team=slot % 2, state=state,
         )
         game.members.append(joined)
         game.roster.append(state.connection_id)
@@ -2520,25 +2537,20 @@ class Fifa14Protocol:
             connection=state.connection_id,
             game=game.game_id,
             persona=state.xuid,
+            by=("game_id" if wanted else "host_persona"),
             players=len(game.members),
         )
-        self.tell_members(game, notification_frame(
-            GAME_MANAGER,
-            NOTIFY_PLAYER_JOINING,
-            encode_fields([
-                Field("GID", INTEGER, game.game_id),
-                Field("PDAT", STRUCT, self.member_player(game, joined)),
-            ]),
-        ), skip=state)
-        self.tell_members(game, notification_frame(
-            GAME_MANAGER,
-            NOTIFY_PLAYER_JOIN_COMPLETED,
-            encode_fields([
-                Field("GID", INTEGER, game.game_id),
-                Field("PID", INTEGER, state.xuid),
-            ]),
-        ), skip=state)
-        self.broadcast_census()
+        # La réponse d'abord, les notifications ensuite, et la 20 plutôt que
+        # la 22 : c'est le seul jeu qui ait jamais fait parler une deuxième
+        # console. Il est produit par le même code que l'arrivée dans un salon
+        # qui attendait, pour que le client voie la même chose quelle que
+        # soit la porte qu'il a prise.
+        follow_up = self.announce_late_join(
+            game,
+            {"member": joined, "session": 0, "slot": slot},
+            state,
+            deferred=True,
+        )
         return [
             response_frame(request, encode_fields([
                 Field("GID", INTEGER, game.game_id),
@@ -2546,22 +2558,34 @@ class Fifa14Protocol:
                 Field("JGS", INTEGER, JOIN_STATE_JOINED_GAME),
                 Field("REX", LIST, (INTEGER, [])),
             ])),
-            notification_frame(
-                GAME_MANAGER,
-                NOTIFY_JOINING_PLAYER_INITIATE_CONNECTIONS,
-                encode_fields(self.game_setup_payload(
-                    game, session=0, result=MATCHMAKING_SUCCESS_JOINED_EXISTING_GAME
-                )),
-            ),
-            notification_frame(
-                GAME_MANAGER,
-                NOTIFY_PLAYER_JOIN_COMPLETED,
-                encode_fields([
-                    Field("GID", INTEGER, game.game_id),
-                    Field("PID", INTEGER, state.xuid),
-                ]),
-            ),
+            *follow_up,
         ]
+
+    def game_hosted_by(self, user: Field | None) -> HostedGame | None:
+        """La partie que tient le joueur désigné par `USER`.
+
+        `USER` est une struct, et l'identifiant y apparaît deux fois : `ID` et
+        `EXID`. Les deux portaient la même valeur dans la seule trame qu'on
+        ait ; on lit `ID` d'abord et `EXID` en second plutôt que d'en choisir
+        un et d'espérer.
+        """
+        if user is None or not isinstance(user.value, list):
+            return None
+        persona = None
+        for label in ("ID", "EXID"):
+            found = find_field(user.value, label)
+            if found is not None and int(found.value):
+                persona = int(found.value)
+                break
+        if persona is None:
+            return None
+        for game in self.games.values():
+            if game.persona_id != persona:
+                continue
+            if game.state not in (GAME_STATE_INITIALIZING, GAME_STATE_PRE_GAME):
+                continue
+            return game
+        return None
 
     def advance_game_state(self, request: bytes, state: ClientState) -> list[bytes]:
         """The host moves the game on by itself.
@@ -2982,7 +3006,8 @@ class Fifa14Protocol:
         return {"member": joined, "session": mine["session"], "slot": slot}
 
     def announce_late_join(self, game: HostedGame, arrival: dict,
-                           state: ClientState) -> list[bytes]:
+                           state: ClientState,
+                           deferred: bool = False) -> list[bytes]:
         """Dire à l'arrivant où il arrive, et aux autres qui arrive.
 
         C'est le même jeu de notifications que l'appariement de deux
@@ -3048,9 +3073,18 @@ class Fifa14Protocol:
                     Field("XSES", BINARY, game.xnet_session),
                 ]),
             ))
-        for frame in frames:
-            if state.push(frame):
-                self.logger.frame("notification", state, frame)
+        if deferred:
+            # L'arrivant doit lire la réponse à sa requête *avant* les
+            # notifications qu'elle déclenche. Poussées ici, elles partiraient
+            # d'abord -- c'est précisément ce qui a fait rester l'invité muet
+            # le 22 août, quand la 22 et la 30 sont arrivées avant la réponse
+            # qui portait son identifiant de session.
+            pending = frames
+        else:
+            pending = []
+            for frame in frames:
+                if state.push(frame):
+                    self.logger.frame("notification", state, frame)
 
         self.tell_members(game, notification_frame(
             GAME_MANAGER,
@@ -3064,7 +3098,7 @@ class Fifa14Protocol:
 
         self.broadcast_census()
         self.publish_relay_pairs()
-        return []
+        return pending
 
     def pair_searches(self, state: ClientState) -> list[bytes]:
         """Two consoles looking for a game at the same time are each other's.

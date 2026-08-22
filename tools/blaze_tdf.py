@@ -66,11 +66,28 @@ def encode_integer(value: int) -> bytes:
     return bytes(output)
 
 
+TAG_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_ "
+)
+
+
+def plausible_tag(label: str) -> bool:
+    """Un tag Blaze ne s'écrit qu'avec ces caractères-là.
+
+    Les quatre caractères d'un tag sortent d'un encodage sur six bits qui ne
+    produit rien d'autre. Une étiquette qui contient `]`, `@` ou `[` n'est pas
+    un tag : c'est du bruit lu comme un tag, donc la preuve qu'on est décalé.
+    """
+    return bool(label) and all(character in TAG_ALPHABET for character in label)
+
+
 class Decoder:
     def __init__(self, data: bytes) -> None:
         self.data = data
         self.position = 0
         self.leftover = 0
+        self.resynchronised_at = None
+        self.skipped = 0
 
     def take(self, size: int) -> bytes:
         end = self.position + size
@@ -258,9 +275,53 @@ class Decoder:
                 fields.append(self.field())
             except (ValueError, IndexError):
                 self.position = mark
+                recovered = self.resynchronise()
+                if recovered is None:
+                    break
+                fields.extend(recovered)
                 break
         self.leftover = len(self.data) - self.position
         return fields
+
+    def resynchronise(self) -> list[Field] | None:
+        """Reprendre après un champ qu'on ne sait pas mesurer.
+
+        C'est une resynchronisation, pas une grammaire : on ne prétend pas
+        comprendre le champ fautif, on cherche où la trame redevient lisible.
+        Deux conditions, et elles sont strictes.
+
+        D'abord, le reste doit se décoder **exactement** jusqu'au dernier
+        octet. Un décalage d'un seul octet produit presque toujours un type
+        inconnu ou une longueur qui dépasse la fin ; tomber pile sur la fin
+        par hasard est possible mais rare, et c'est ce qui rend le critère
+        utile.
+
+        Ensuite, toutes les étiquettes retrouvées doivent être de vrais tags.
+        Sur le `joinGame` du 22 août, quatre décalages décodaient jusqu'au
+        bout -- mais trois rendaient des étiquettes comme `]@TA` ou `@P`, et
+        un seul rendait `SLEN SLID SLOT STRT TIDX USER XSES`. Sans cette
+        seconde condition on aurait pris le premier, et lu de travers.
+
+        On prend le plus proche qui satisfait les deux. S'il n'y en a aucun,
+        on ne rend rien : mieux vaut une trame amputée qu'une trame inventée.
+        """
+        start = self.position
+        end = len(self.data)
+        for offset in range(start + 1, end):
+            probe = Decoder(self.data[offset:])
+            try:
+                candidate = probe._all_strict()
+            except (ValueError, IndexError):
+                continue
+            if probe.position != end - offset or not candidate:
+                continue
+            if not all(plausible_tag(field.label) for field in candidate):
+                continue
+            self.position = end
+            self.resynchronised_at = offset
+            self.skipped = offset - start
+            return candidate
+        return None
 
     def _all_strict(self) -> list[Field]:
         fields: list[Field] = []

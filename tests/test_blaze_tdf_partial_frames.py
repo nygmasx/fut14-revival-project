@@ -75,21 +75,67 @@ def test_strict_decoding_still_refuses_what_it_cannot_read():
         decode_frame(JOIN_GAME)
 
 
-def test_tolerant_decoding_keeps_the_fields_it_understood():
-    decoded = decode_frame(JOIN_GAME, tolerant=True)
-    labels = [field.label for field in decoded["fields"]]
-    assert labels == ["BTPL", "GENT", "GID", "GVER", "JMET", "PNET", "RRST"]
+def test_tolerant_decoding_recovers_the_whole_frame():
+    """La resynchronisation retrouve tout, y compris ce qui suivait.
 
-
-def test_tolerant_decoding_admits_what_it_left_behind():
-    """Le compte d'octets abandonnés n'est pas décoratif.
-
-    Sans lui, rien ne distingue une trame entièrement comprise d'une trame
-    lue à moitié, et le journal ne garderait pas de quoi finir le travail.
+    Le champ `RRST` reste incompris -- il occupe douze octets et notre
+    lecture n'en consomme que dix. Mais la trame redevient lisible à 0x7D, et
+    les sept champs qui suivaient sont là.
     """
     decoded = decode_frame(JOIN_GAME, tolerant=True)
-    assert decoded["leftover"] == 95
-    assert decoded["leftover"] < len(JOIN_GAME) - 12
+    labels = [field.label for field in decoded["fields"]]
+    assert labels == [
+        "BTPL", "GENT", "GID", "GVER", "JMET", "PNET", "RRST",
+        "SLEN", "SLID", "SLOT", "STRT", "TIDX", "USER", "XSES",
+    ]
+    assert decoded["leftover"] == 0
+
+
+def test_the_recovered_tail_carries_the_player_being_joined():
+    """Ce qui était perdu était exactement ce qui comptait.
+
+    `GID` vaut zéro : le client ne désigne pas la partie par son numéro. Il
+    désigne son hôte par son identifiant de joueur, dans `USER` -- et `USER`
+    était dans la partie que le décodeur abandonnait. Sans lui, la requête
+    est illisible dans son intention même, et le serveur répondait « aucune
+    partie » à une demande valide.
+    """
+    fields = decode_frame(JOIN_GAME, tolerant=True)["fields"]
+    by_label = {field.label: field for field in fields}
+    assert by_label["GID"].value == 0
+    assert by_label["SLOT"].value == 1
+    user = {field.label: field.value for field in by_label["USER"].value}
+    assert user["ID"] == 2535469248587161
+    assert user["EXID"] == user["ID"]
+
+
+def test_resynchronisation_refuses_a_plausible_looking_wrong_offset():
+    """Décoder jusqu'au bout ne suffit pas à prouver qu'on est aligné.
+
+    Quatre décalages de cette trame se décodent entièrement jusqu'au dernier
+    octet. Trois sont faux, et se dénoncent par leurs étiquettes -- `]@TA`,
+    `@P` -- qui ne peuvent pas être des tags. C'est cette seconde condition
+    qui choisit le bon, et sans elle on prendrait le premier venu.
+    """
+    from blaze_tdf import Decoder, plausible_tag
+
+    payload = JOIN_GAME[12:]
+    decodes_fully = []
+    for offset in range(0x71, 0x86):
+        probe = Decoder(payload[offset:])
+        try:
+            fields = probe._all_strict()
+        except (ValueError, IndexError):
+            continue
+        if fields and probe.position == len(payload) - offset:
+            decodes_fully.append(offset)
+
+    assert len(decodes_fully) > 1, "le critère serait inutile s'il n'y avait qu'un candidat"
+    survivors = [
+        offset for offset in decodes_fully
+        if all(plausible_tag(f.label) for f in Decoder(payload[offset:])._all_strict())
+    ]
+    assert survivors[0] == 0x7D
 
 
 def test_a_complete_frame_is_unaffected_by_tolerance():

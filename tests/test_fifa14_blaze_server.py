@@ -3161,11 +3161,20 @@ class TwoConsolesTests(unittest.TestCase):
             sorted(f.label for f in reply["fields"]), ["GID", "JEX", "JGS", "REX"]
         )
         self.assertEqual([f["command"] for f in self.pushed(self.two)], [])
+        # 20, pas 22.
+        #
+        # 22 -- `NotifyJoiningPlayerInitiateConnections` -- porte le nom de ce
+        # qu'un arrivant devrait recevoir, et c'est pour ça qu'il avait été
+        # choisi. Le 22 août 2026, deux consoles ont tranché : celle qui a reçu
+        # la 20 a répondu deux secondes plus tard avec sa session XNet, celle
+        # qui a reçu la 22 n'a plus rien dit. On envoie donc à l'arrivant
+        # exactement ce qu'on envoie à un joueur apparié, et ce qui distingue
+        # les deux cas est `REAS`, qui est fait pour ça.
         self.assertEqual(
-            [decode_frame(f)["command"] for f in answered[1:]], [22, 30]
+            [decode_frame(f)["command"] for f in answered[1:]], [20, 71, 30, 100]
         )
         # And the one already in there hears that somebody arrived.
-        self.assertEqual([f["command"] for f in self.pushed(self.one)], [21, 30])
+        self.assertEqual([f["command"] for f in self.pushed(self.one)], [21])
         self.assertEqual(len(self.protocol.games[7].members), 2)
 
     def test_joining_a_game_that_does_not_exist_is_refused_quietly(self) -> None:
