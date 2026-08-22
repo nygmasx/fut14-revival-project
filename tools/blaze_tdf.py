@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,17 @@ UNION = 6
 VARIABLE = 7
 OBJECT_TYPE = 8
 OBJECT_ID = 9
+# Le dixième type, découvert dans un rapport de match le 22 août 2026.
+#
+# Un `submitGameReport` portait `CRAT` avec un type 10, que le décodeur ne
+# connaissait pas -- la liste s'arrêtait à `OBJECT_ID`. Quatre octets plus
+# loin, le champ suivant tombait pile : c'est un flottant sur 32 bits, gros
+# boutiste comme tout le reste du protocole.
+#
+# Il n'a rien d'exotique : un rapport de match porte des moyennes, des taux et
+# des notes. On ne l'avait simplement jamais croisé, parce qu'aucune des trames
+# lues jusque-là n'en contenait.
+FLOAT = 10
 
 
 @dataclass
@@ -179,6 +191,8 @@ class Decoder:
             return (self.integer(), self.integer())
         if item_type == OBJECT_ID:
             return (self.integer(), self.integer(), self.integer())
+        if item_type == FLOAT:
+            return struct.unpack(">f", self.take(4))[0]
         raise ValueError(
             f"Unsupported TDF list item type {item_type} "
             f"at offset 0x{self.position:X}"
@@ -242,6 +256,8 @@ class Decoder:
             value = (self.integer(), self.integer())
         elif field_type == OBJECT_ID:
             value = (self.integer(), self.integer(), self.integer())
+        elif field_type == FLOAT:
+            value = struct.unpack(">f", self.take(4))[0]
         else:
             raise ValueError(
                 f"Unsupported TDF type {field_type} for {label} "
@@ -354,6 +370,8 @@ def encode_item(item_type: int, value: Any) -> bytes:
             + encode_integer(value[1])
             + encode_integer(value[2])
         )
+    if item_type == FLOAT:
+        return struct.pack(">f", value)
     raise ValueError(f"Unsupported TDF item type {item_type}")
 
 
@@ -404,6 +422,8 @@ def encode_field(field: Field) -> bytes:
         output += encode_integer(field.value[0])
         output += encode_integer(field.value[1])
         output += encode_integer(field.value[2])
+    elif field.type == FLOAT:
+        output += struct.pack(">f", field.value)
     else:
         raise ValueError(f"Unsupported TDF type {field.type}")
     return bytes(output)
@@ -474,6 +494,21 @@ def decode_frame(data: bytes, tolerant: bool = False) -> dict[str, Any]:
         "message_number": message_number,
         "fields": fields,
         "leftover": decoder.leftover,
+        # Une lecture obtenue par resynchronisation n'a pas la même valeur
+        # qu'une lecture franche, et l'appelant doit pouvoir faire la
+        # différence.
+        #
+        # Le 22 août, un rapport de match resynchronisé a rendu un champ
+        # `YSDU` qui n'existe pas : le décalage retenu consommait bien toute la
+        # trame et ses étiquettes passaient le test de plausibilité, mais la
+        # lecture était fausse. Le vrai champ était `RPRT`, et il a fallu
+        # découvrir le type flottant pour le voir.
+        #
+        # Le critère « ça se décode jusqu'au bout avec des tags plausibles »
+        # est donc nécessaire, pas suffisant. Ce qui sort d'ici après une
+        # resynchronisation est une hypothèse, pas une lecture.
+        "resynchronised": decoder.resynchronised_at,
+        "skipped": decoder.skipped,
     }
 
 

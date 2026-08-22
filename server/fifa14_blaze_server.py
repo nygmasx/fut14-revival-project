@@ -4082,6 +4082,11 @@ class Fifa14Protocol:
                 command=decoded["command"],
                 read=[field.label for field in decoded["fields"]],
                 leftover=decoded.get("leftover", 0),
+                # Dit si ces champs sortent d'une resynchronisation, et combien
+                # d'octets elle a sautés. Sans ça, une lecture devinée se
+                # présente dans le journal exactement comme une lecture sûre.
+                resynchronised=decoded.get("resynchronised"),
+                skipped=decoded.get("skipped", 0),
             )
         route = (decoded["component"], decoded["command"])
 
