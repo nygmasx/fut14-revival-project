@@ -1142,14 +1142,27 @@ def response_frame(
     error: int = 0,
     message_type: int = REPLY,
 ) -> bytes:
-    decoded = decode_frame(request[:12] + request[normal_header_size(request):])
+    # L'en-tête d'une réponse ne se déduit que de l'en-tête de la requête.
+    #
+    # Ceci décodait la trame entière -- charge utile comprise -- pour en tirer
+    # trois nombres qui tiennent tous dans les douze premiers octets. Le 22
+    # août, ça a coûté la partie : un `joinGame` portant un champ dont la
+    # grammaire nous échappe était traité correctement, le joueur rejoignait
+    # bien, puis la construction de la réponse relisait la même trame en mode
+    # strict et l'exception fermait la connexion. Le journal montrait
+    # `player_joined` suivi d'un `connection_error`, et la console affichait
+    # « Cette session de jeu n'existe plus ».
+    #
+    # Ce n'est pas seulement une erreur rattrapée trop tard : c'est un travail
+    # qui n'avait pas lieu d'être. Répondre à une requête ne demande pas de la
+    # comprendre.
     result = bytearray(
         encode_frame(
-            decoded["component"],
-            decoded["command"],
+            int.from_bytes(request[2:4], "big"),
+            int.from_bytes(request[4:6], "big"),
             error,
             message_type,
-            decoded["message_number"],
+            ((request[9] & 0x0F) << 16) | int.from_bytes(request[10:12], "big"),
             payload,
         )
     )
@@ -2825,16 +2838,27 @@ class Fifa14Protocol:
             peers=sorted(peers),
             synthetic=bool(test_opponent()),
         )
-        return [
-            notification_frame(
-                GAME_MANAGER,
-                NOTIFY_GAME_STATE_CHANGE,
-                encode_fields([
-                    Field("GID", INTEGER, game.game_id),
-                    Field("GSTA", INTEGER, game.state),
-                ]),
-            )
-        ]
+        # Le coup d'envoi se dit à toute la partie, pas au dernier arrivé.
+        #
+        # Ceci ne rendait la notification qu'à l'appelant, et l'appelant est
+        # la console dont le rapport de maillage a complété le tableau. Le 22
+        # août, deux consoles se sont enfin trouvées : le maillage s'est
+        # bouclé, la partie est passée en IN_GAME -- et seul Racim l'a su. La
+        # console qui hébergeait est restée sur son écran de chargement à
+        # attendre un signal qui ne lui était pas adressé.
+        #
+        # Un état de partie appartient à la partie. Il se pousse à tous ses
+        # membres, y compris celui qui vient de parler.
+        started = notification_frame(
+            GAME_MANAGER,
+            NOTIFY_GAME_STATE_CHANGE,
+            encode_fields([
+                Field("GID", INTEGER, game.game_id),
+                Field("GSTA", INTEGER, game.state),
+            ]),
+        )
+        self.tell_members(game, started)
+        return []
 
     def expire_matchmaking(self, state: ClientState, session: int) -> None:
         """End a search nobody could be found for.

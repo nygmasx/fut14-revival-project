@@ -2855,8 +2855,14 @@ class SyntheticOpponentTests(unittest.TestCase):
         os.environ["FIFA14_TEST_OPPONENT"] = "Sparring"
         session = self.search()
         self.protocol.expire_matchmaking(self.state, session)
+        self.channel.sent.clear()
         answered = self.mesh(self.state.connection_id, 2)
-        started = [decode_frame(f) for f in answered[1:]]
+        # Le coup d'envoi est poussé à toute la partie, pas rendu à celui qui
+        # a parlé en dernier. Rendu, il n'atteignait que lui -- et le 22 août
+        # la console qui hébergeait est restée sur son chargement pendant que
+        # l'autre était déjà en jeu.
+        self.assertEqual(answered, answered[:1])
+        started = [f for f in self.pushed() if f["command"] == 100]
         self.assertEqual([(f["component"], f["command"]) for f in started], [(4, 100)])
         # 131 is IN_GAME. 130 was PRE_GAME, which is where the setup left it.
         self.assertEqual(by_label(started[0], "GSTA").value, 131)
@@ -2882,8 +2888,12 @@ class SyntheticOpponentTests(unittest.TestCase):
         session = self.search()
         self.protocol.expire_matchmaking(self.state, session)
         host = self.state.connection_id
-        self.assertEqual(len(self.mesh(host, 2)), 2)
+        self.channel.sent.clear()
         self.assertEqual(len(self.mesh(host, 2)), 1)
+        self.assertEqual(len([f for f in self.pushed() if f["command"] == 100]), 1)
+        self.channel.sent.clear()
+        self.assertEqual(len(self.mesh(host, 2)), 1)
+        self.assertEqual([f for f in self.pushed() if f["command"] == 100], [])
 
     def test_a_game_with_nobody_to_play_never_starts(self) -> None:
         """A host connected to itself is not a match. "Everything reported is
