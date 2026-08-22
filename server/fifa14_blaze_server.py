@@ -2277,6 +2277,93 @@ class Fifa14Protocol:
             Field("NAME", STRING, name),
         ]))
 
+    def stats_by_group(self, request: bytes) -> bytes:
+        """Les valeurs d'un groupe de statistiques, pour des joueurs donnés.
+
+        Ce que la console fait est sans ambiguïté : elle demande une fois, puis
+        n'envoie plus que ses pings toutes les vingt secondes. Elle n'attend
+        rien d'autre que cette réponse -- l'écran des matchs amicaux reste sur
+        « Téléchargement informations match amicaux » indéfiniment.
+
+        La classe de la réponse n'est pas connue. La lire dans la table de
+        réflexion du titre demanderait de balayer deux mégaoctets de `.data`,
+        et cette console ne supporte qu'environ 300 Ko de `getmem` avant de
+        tomber du réseau -- six ou sept redémarrages pour un écran de
+        statistiques.
+
+        Alors on procède autrement, et honnêtement : la réponse porte
+        **plusieurs conteneurs vides candidats à la fois**. Un décodeur TDF
+        ignore les tags qu'il ne connaît pas et met des valeurs par défaut au
+        reste -- c'est ce qui a été établi sur `NotifyGameSetup`, où une
+        notification à moitié comprise se lisait aussi bien qu'une complète.
+        Un seul essai couvre donc autant de candidats qu'on veut, et c'est la
+        console qui tranche.
+
+        `VID` est renvoyé tel qu'il est venu. Si le client raisonne en vues,
+        c'est le fil qui relie sa question à la réponse ; sinon il l'ignore,
+        et ça ne coûte rien.
+
+        Le groupe est vide de toute façon : `getStatGroup` ne déclare aucune
+        colonne, donc zéro ligne est la seule réponse vraie. Ce qu'on cherche
+        ici, c'est le tag sous lequel dire « zéro ».
+        """
+        fields = decode_frame(request, tolerant=True)["fields"]
+        view = find_field(fields, "VID")
+        group = find_field(fields, "NAME")
+        self.logger.event(
+            "stats_by_group_requested",
+            group=str(group.value) if group is not None else "",
+            view=int(view.value) if view is not None else 0,
+        )
+        payload = encode_fields([
+            Field("KVAL", LIST, (STRUCT, [])),
+            Field("STAT", LIST, (STRING, [])),
+            Field("SVAL", LIST, (STRUCT, [])),
+            Field("VID", INTEGER, int(view.value) if view is not None else 0),
+        ])
+        return response_frame(request, payload)
+
+    def stats_notification_sweep(self, request: bytes,
+                                 state: ClientState) -> list[bytes]:
+        """Chercher le numéro de la notification qui clôt un `...Async`.
+
+        C'est une expérience, pas un comportement, et elle ne s'allume qu'avec
+        `FIFA14_STATS_NOTIFY_SWEEP`. Elle envoie la même charge utile sous
+        plusieurs numéros de notification à la fois.
+
+        Ce qui rend ça possible : une notification dont le client n'a pas de
+        gestionnaire est ignorée sans un mot. On l'a constaté en août avec la
+        22, qui a été envoyée pendant des heures à une console qui n'en a
+        jamais rien fait. Le coût d'un mauvais numéro est donc nul, et un seul
+        aller-retour couvre autant de candidats qu'on veut.
+
+        Si l'écran se débloque, on dichotomise sur l'intervalle pour isoler le
+        bon numéro, puis on retire tout ceci. S'il ne se débloque pas, c'est
+        que ce que la console attend n'est pas une notification de ce
+        composant, et il faudra chercher ailleurs -- ce qui est aussi une
+        réponse.
+        """
+        raw = os.environ.get("FIFA14_STATS_NOTIFY_SWEEP", "").strip()
+        if not raw:
+            return []
+        try:
+            first, last = (int(piece) for piece in raw.split("-", 1))
+        except ValueError:
+            return []
+        fields = decode_frame(request, tolerant=True)["fields"]
+        view = find_field(fields, "VID")
+        payload = encode_fields([
+            Field("KVAL", LIST, (STRUCT, [])),
+            Field("STAT", LIST, (STRING, [])),
+            Field("SVAL", LIST, (STRUCT, [])),
+            Field("VID", INTEGER, int(view.value) if view is not None else 0),
+        ])
+        self.logger.event("stats_notify_sweep", first=first, last=last)
+        return [
+            notification_frame(STATS, number, payload)
+            for number in range(first, last + 1)
+        ]
+
     def synthetic_address(self) -> tuple:
         """A well-formed XNADDR that leads nowhere.
 
@@ -4097,6 +4184,11 @@ class Fifa14Protocol:
             ]
         if route == (STATS, STATS_GET_STAT_GROUP):
             return [self.stat_group(request)]
+        if route == (STATS, STATS_GET_STATS_BY_GROUP):
+            return [
+                self.stats_by_group(request),
+                *self.stats_notification_sweep(request, state),
+            ]
         if route == (STATS, STATS_GET_PERIOD_IDS):
             return [self.period_ids(request)]
         if route == (GAME_MANAGER, GAME_MANAGER_JOIN_GAME):
