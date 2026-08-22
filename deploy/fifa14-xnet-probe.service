@@ -1,0 +1,35 @@
+# La sonde XNet : écoute si une console envoie quoi que ce soit au relais.
+#
+# Le trafic de match ne passe pas par le serveur -- les deux consoles se
+# parlent directement, à l'adresse que ce serveur leur a donnée l'une pour
+# l'autre. `FIFA14_PEER_RELAY` réécrit cette adresse pour la faire pointer
+# ici. Reste à savoir si le noyau de la console honore la réécriture : un
+# XNADDR porte vingt octets remplis par la passerelle Xbox LIVE, et rien ne
+# dit publiquement si l'association de sécurité s'en sert pour router.
+#
+# Un seul paquet reçu répond à la question.
+#
+#   sudo cp fifa14-xnet-probe.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fifa14-xnet-probe
+#   journalctl -u fifa14-xnet-probe -f
+#
+# Elle n'écoute que. Elle ne relaie rien, et n'écrit qu'un journal.
+
+[Unit]
+Description=FUT 14 Revival — sonde XNet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fifa14
+WorkingDirectory=/opt/fifa14-revival
+ExecStart=/usr/bin/python3 /opt/fifa14-revival/tools/xnet_probe.py --port 3074 --journal /opt/fifa14-revival/runtime/xnet-probe.jsonl
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/fifa14-revival/runtime
+
+[Install]
+WantedBy=multi-user.target

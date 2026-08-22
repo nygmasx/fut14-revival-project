@@ -2944,6 +2944,128 @@ class Fifa14Protocol:
             return
         self.logger.event("relay_pairs_published", pairs=pairs)
 
+    def game_awaiting_player(self, state: ClientState) -> HostedGame | None:
+        """Une partie créée par quelqu'un d'autre et qui a une place libre."""
+        for game in self.games.values():
+            if game.persona_id == state.xuid:
+                continue
+            if len(game.members) >= max(2, game.max_capacity):
+                continue
+            if game.protocol_version and game.protocol_version != getattr(
+                self.searches.get(state.connection_id, {}).get("draft"),
+                "protocol_version", game.protocol_version,
+            ):
+                continue
+            if game.state not in (GAME_STATE_INITIALIZING, GAME_STATE_PRE_GAME):
+                continue
+            return game
+        return None
+
+    def enlist_in_waiting_game(self, state: ClientState, mine: dict,
+                               game: HostedGame) -> dict | None:
+        """Inscrire celui qui cherche dans la partie qui l'attendait.
+
+        Appelée avec le verrou tenu, et ne fait donc que muter la partie :
+        pas un octet n'est envoyé d'ici. Les notifications partent de
+        `announce_late_join`, une fois le verrou rendu -- pousser des trames
+        vers deux consoles en tenant le verrou du matchmaking, c'est le tenir
+        pendant tout un aller-retour réseau.
+        """
+        self.searches.pop(state.connection_id, None)
+        slot = len(game.members)
+        joined = self.member(
+            game, state.xuid, state.gamertag, state.connection_id,
+            mine["draft"].host_address, slot=slot, team=slot % 2, state=state,
+        )
+        game.members.append(joined)
+        game.roster.append(state.connection_id)
+        return {"member": joined, "session": mine["session"], "slot": slot}
+
+    def announce_late_join(self, game: HostedGame, arrival: dict,
+                           state: ClientState) -> list[bytes]:
+        """Dire à l'arrivant où il arrive, et aux autres qui arrive.
+
+        C'est le même jeu de notifications que l'appariement de deux
+        recherches -- 20 pour l'arrivant, 21 pour ceux qui étaient là -- et
+        c'est voulu. Le client ne sait pas si sa partie est née d'une
+        recherche appariée ou d'un salon déjà ouvert ; ce qui le renseigne,
+        c'est `REAS`, et rien d'autre ne doit changer.
+        """
+        self.forget_matchmaking(state.connection_id)
+        self.logger.event(
+            "matchmaking_joined_waiting_game",
+            game=game.game_id,
+            host=game.persona_id,
+            guest=state.xuid,
+            slot=arrival["slot"],
+        )
+        frames = [
+            notification_frame(
+                GAME_MANAGER,
+                NOTIFY_GAME_SETUP,
+                encode_fields(self.game_setup_payload(
+                    game, session=arrival["session"],
+                    result=MATCHMAKING_SUCCESS_JOINED_EXISTING_GAME,
+                    viewer=state)),
+            ),
+            notification_frame(
+                GAME_MANAGER,
+                NOTIFY_PLATFORM_HOST_INITIALIZED,
+                encode_fields([
+                    Field("GID", INTEGER, game.game_id),
+                    Field("PHID", INTEGER, game.persona_id),
+                    Field("PHST", INTEGER, 0),
+                ]),
+            ),
+            notification_frame(
+                GAME_MANAGER,
+                NOTIFY_PLAYER_JOIN_COMPLETED,
+                encode_fields([
+                    Field("GID", INTEGER, game.game_id),
+                    Field("PID", INTEGER, state.xuid),
+                ]),
+            ),
+            notification_frame(
+                GAME_MANAGER,
+                NOTIFY_GAME_STATE_CHANGE,
+                encode_fields([
+                    Field("GID", INTEGER, game.game_id),
+                    Field("GSTA", INTEGER, game.state),
+                ]),
+            ),
+        ]
+        # L'hôte a déjà fini sa création : sa session XNet existe depuis
+        # longtemps, et l'arrivant ne la recevra jamais par la 115 que le
+        # serveur a poussée avant qu'il n'existe. Il faut la lui redonner ici,
+        # sinon il a une partie complète et personne à appeler.
+        if game.xnet_session:
+            frames.append(notification_frame(
+                GAME_MANAGER,
+                NOTIFY_GAME_SESSION_UPDATED,
+                encode_fields([
+                    Field("GID", INTEGER, game.game_id),
+                    Field("XNNC", BINARY, game.xnet_nonce or b""),
+                    Field("XSES", BINARY, game.xnet_session),
+                ]),
+            ))
+        for frame in frames:
+            if state.push(frame):
+                self.logger.frame("notification", state, frame)
+
+        self.tell_members(game, notification_frame(
+            GAME_MANAGER,
+            NOTIFY_PLAYER_JOINING,
+            encode_fields([
+                Field("GID", INTEGER, game.game_id),
+                Field("PDAT", STRUCT,
+                      self.member_player(game, arrival["member"])),
+            ]),
+        ), skip=state)
+
+        self.broadcast_census()
+        self.publish_relay_pairs()
+        return []
+
     def pair_searches(self, state: ClientState) -> list[bytes]:
         """Two consoles looking for a game at the same time are each other's.
 
@@ -2965,6 +3087,25 @@ class Fifa14Protocol:
         with self.matchmaking_lock:
             mine = self.searches.get(state.connection_id)
             if mine is None:
+                return []
+            # Une partie déjà créée et qui attend quelqu'un compte comme un
+            # joueur qui cherche.
+            #
+            # L'écran de Face-à-Face a deux portes : une qui lance une
+            # recherche, et un bouton "Créer un match" qui fabrique un salon.
+            # Deux joueurs qui prennent la seconde se retrouvent chacun seul
+            # dans son coin, à s'attendre -- ce qui est arrivé le 22 août, et
+            # ce que rien ici ne rattrapait. Un serveur dont le comportement
+            # dépend du bouton choisi est un serveur qui a tort.
+            waiting_game = self.game_awaiting_player(state)
+            arrival = (
+                self.enlist_in_waiting_game(state, mine, waiting_game)
+                if waiting_game is not None else None
+            )
+        if arrival is not None:
+            return self.announce_late_join(waiting_game, arrival, state)
+        with self.matchmaking_lock:
+            if self.searches.get(state.connection_id) is None:
                 return []
             # Un hôte de test attend déjà, s'il y en a un et qu'il n'y a
             # personne d'autre.
@@ -3618,7 +3759,50 @@ class Fifa14Protocol:
         )
 
     def handle(self, request: bytes, state: ClientState) -> list[bytes]:
-        decoded = decode_frame(request)
+        try:
+            decoded = decode_frame(request)
+        except ValueError as error:
+            # Une trame dont la charge utile ne se décode pas ne doit pas
+            # emporter la connexion.
+            #
+            # Le 22 août, un `joinGame` portait un dictionnaire de chaînes
+            # vers structs -- une forme jamais vue -- et le décodeur est mort
+            # dessus en pleine partie. L'exception a fermé la socket Blaze
+            # d'un joueur au moment précis où il essayait de rejoindre
+            # l'autre. Ce n'est pas le décodeur qui était de trop, c'est le
+            # fait qu'il soit fatal.
+            #
+            # L'en-tête, lui, se lit toujours : douze octets, taille,
+            # composant, commande. C'est tout ce qu'il faut pour répondre
+            # quelque chose plutôt que de raccrocher, et pour écrire dans le
+            # journal de quoi comprendre plus tard.
+            self.logger.event(
+                "frame_payload_unreadable",
+                connection=state.connection_id,
+                component=int.from_bytes(request[2:4], "big") if len(request) >= 4 else None,
+                command=int.from_bytes(request[4:6], "big") if len(request) >= 6 else None,
+                error=str(error),
+                hex=request.hex().upper(),
+            )
+            # Deuxième chance : lire ce qui se laisse lire.
+            #
+            # Une trame Blaze est une suite de champs indépendants. Ne pas
+            # savoir lire le neuvième ne rend pas les huit premiers faux. On
+            # repart donc de la lecture partielle et on route normalement --
+            # le gestionnaire verra moins de champs qu'il n'y en avait, ce
+            # qu'il traite comme n'importe quel champ absent.
+            try:
+                decoded = decode_frame(request, tolerant=True)
+            except ValueError:
+                return [response_frame(request)]
+            self.logger.event(
+                "frame_payload_partial",
+                connection=state.connection_id,
+                component=decoded["component"],
+                command=decoded["command"],
+                read=[field.label for field in decoded["fields"]],
+                leftover=decoded.get("leftover", 0),
+            )
         route = (decoded["component"], decoded["command"])
 
         if route == (REDIRECTOR, REDIRECTOR_GET_SERVER_INSTANCE):

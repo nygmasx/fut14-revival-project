@@ -70,6 +70,7 @@ class Decoder:
     def __init__(self, data: bytes) -> None:
         self.data = data
         self.position = 0
+        self.leftover = 0
 
     def take(self, size: int) -> bytes:
         end = self.position + size
@@ -112,7 +113,7 @@ class Decoder:
         self.position += 1
         return fields
 
-    def list_item(self, item_type: int) -> Any:
+    def list_item(self, item_type: int, unions: bool = True) -> Any:
         if item_type == INTEGER:
             return self.integer()
         if item_type == STRING:
@@ -142,7 +143,19 @@ class Decoder:
             # which is also a lone 0x00. None has ever appeared here, and a
             # union with no members would be indistinguishable from it on the
             # wire in any decoder.
-            if self.position < len(self.data) and self.data[self.position] < TAG_FIRST_BYTE:
+            #
+            # `unions` is False for map keys and values, and that is not a
+            # detail. `joinGame` carries a map of strings to structs whose one
+            # value is an *empty* struct -- a lone 0x00 -- and this rule read
+            # that as a union index and then swallowed the fields after it.
+            # The frame died at "Unsupported TDF type 201 for @PCN", which is
+            # what a desynchronised decoder always looks like.
+            #
+            # Blaze has lists of unions; it does not have maps of them. So the
+            # rule belongs to lists, where the evidence for it came from, and
+            # nowhere else.
+            if (unions and self.position < len(self.data)
+                    and self.data[self.position] < TAG_FIRST_BYTE):
                 return (self.byte(), self.struct())
             return self.struct()
         if item_type == OBJECT_TYPE:
@@ -176,8 +189,8 @@ class Decoder:
             count = self.integer()
             pairs = [
                 (
-                    self.list_item(key_type),
-                    self.list_item(value_type),
+                    self.list_item(key_type, unions=False),
+                    self.list_item(value_type, unions=False),
                 )
                 for _ in range(count)
             ]
@@ -219,7 +232,37 @@ class Decoder:
             )
         return Field(label, field_type, value)
 
-    def all(self) -> list[Field]:
+    def all(self, tolerant: bool = False) -> list[Field]:
+        """Décode les champs. En mode tolérant, s'arrête à la première
+        incompréhension au lieu de la propager.
+
+        Une trame Blaze est une suite de champs indépendants, dans l'ordre des
+        tags. Si l'on ne sait pas lire le neuvième, cela ne rend pas les huit
+        premiers faux -- ils ont déjà été lus, entièrement, et ils portent
+        presque toujours ce qui compte. Le `joinGame` du 22 août en est
+        l'exemple : il s'est cassé sur un dictionnaire de chaînes vers structs,
+        mais `GID`, le numéro de la partie à rejoindre, était lu depuis
+        longtemps.
+
+        Le reste est perdu, et c'est assumé -- pas deviné. `self.leftover`
+        retient combien d'octets n'ont pas été compris, pour que l'appelant
+        sache qu'il travaille sur une lecture partielle et que le journal
+        garde de quoi finir le travail plus tard.
+        """
+        if not tolerant:
+            return self._all_strict()
+        fields: list[Field] = []
+        while self.position < len(self.data):
+            mark = self.position
+            try:
+                fields.append(self.field())
+            except (ValueError, IndexError):
+                self.position = mark
+                break
+        self.leftover = len(self.data) - self.position
+        return fields
+
+    def _all_strict(self) -> list[Field]:
         fields: list[Field] = []
         while self.position < len(self.data):
             fields.append(self.field())
@@ -348,7 +391,7 @@ def json_value(value: Any) -> Any:
     return value
 
 
-def decode_frame(data: bytes) -> dict[str, Any]:
+def decode_frame(data: bytes, tolerant: bool = False) -> dict[str, Any]:
     if len(data) < 12:
         raise ValueError("ProtoFire frame is shorter than its header")
     payload_size = int.from_bytes(data[0:2], "big")
@@ -357,6 +400,8 @@ def decode_frame(data: bytes) -> dict[str, Any]:
             f"ProtoFire size mismatch: header={payload_size}, "
             f"actual={len(data) - 12}"
         )
+    decoder = Decoder(data[12:])
+    fields = decoder.all(tolerant=tolerant)
     message_type = data[8] >> 4
     message_number = ((data[9] & 0xF) << 16) | int.from_bytes(data[10:12], "big")
     return {
@@ -366,7 +411,8 @@ def decode_frame(data: bytes) -> dict[str, Any]:
         "error": int.from_bytes(data[6:8], "big"),
         "message_type": message_type,
         "message_number": message_number,
-        "fields": Decoder(data[12:]).all(),
+        "fields": fields,
+        "leftover": decoder.leftover,
     }
 
 
