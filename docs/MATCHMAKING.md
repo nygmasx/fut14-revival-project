@@ -359,3 +359,37 @@ Obtenue en deux commandes XBDM qui ne lisent aucune mémoire :
 Et surtout : chercher les paires `lis`/`ori` dans `.text` est inutile pendant
 que le jeu tourne. Elles écrivent dans `.data`, et `.data` est déjà rempli --
 il suffit de lire la table, si on sait où elle est.
+
+
+## Les types de partie, reconnus à leur signature
+
+    gameType0     Face-à-Face
+    gameType20    Matchs amicaux en ligne
+    gameType95    Match local (rapport de match du 22 août)
+
+`gameType20` se distingue aussi par sa capacité : les deux joueurs sont placés
+dans le **deuxième** groupe d'équipes (`[0, [0, 2, 0, 0]]`) là où le
+Face-à-Face les met dans le premier (`[0, [2, 0, 0, 0]]`). C'est ce qui a
+attiré l'attention avant que le joueur ne confirme d'où il venait.
+
+Ce qui compte : la séquence est **identique**. Création, `finalizeGameCreation`,
+attente d'un second joueur. Les amicaux en ligne empruntent donc le même chemin
+GameManager que le Face-à-Face, et tout ce qui a été corrigé pour l'un vaut
+pour l'autre -- le `joinGame` par identifiant de joueur, la notification 30 qui
+manquait, le contexte de mise en place, le coup d'envoi laissé à l'hôte.
+
+## Ce que les rapports de match donnent
+
+Le `submitGameReport` de fin de partie porte, par joueur : buts, buts
+encaissés, tirs, tirs cadrés, passes tentées et réussies, tacles tentés et
+réussis, corners, hors-jeu, fautes, cartons, arrêts, interceptions, résultat.
+
+Les libellés ne sont pas devinés par ressemblance : sur la trame du 22 août,
+`GOAL` valait 1, `GLAG` 0 et `WINS` 1, pour un match gagné 1-0. C'est cette
+concordance qui les établit. Deux restent des lectures plausibles et sont
+gardées comme telles : `PSCT` (67, probablement la possession en pourcentage)
+et `GTIM` (5567, une durée dont l'unité est inconnue).
+
+Un rapport de match local ne contient qu'un joueur. Un rapport de match en
+ligne devrait en contenir deux -- c'est la seule chose qui distingue les deux
+cas, et elle n'a pas encore été observée.
