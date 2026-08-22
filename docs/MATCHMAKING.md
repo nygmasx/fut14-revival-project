@@ -319,109 +319,43 @@ il a fallu le bouton d'alimentation.
 Donc : arrêter `fut-patch-watch` avant toute lecture XBDM, et ne pas enchaîner
 les cycles d'accroche manette.
 
-### 22 août, quatrième chute : ce qui passe et ce qui ne passe pas
+### 22 août : ce que XBDM supporte réellement, mesuré
 
-Le même après-midi, deux campagnes de lecture ont donné deux résultats opposés,
-et la différence est instructive.
+Quatre chutes dans l'après-midi, chacune coûtant un appui sur le bouton
+d'alimentation. Trois hypothèses ont été formulées et écartées, dans cet
+ordre :
 
-**Ce qui est passé sans une plainte** — environ 400 Ko lus en tout :
+1. **La taille des blocs.** Faux. La chute attribuée aux blocs de 16 Ko s'est
+   produite avant que ce balayage n'ait lu un seul octet -- la console était
+   déjà tombée pendant la lecture *précédente*, et le socket a échoué à la
+   connexion. Un test à 4 Ko a semblé confirmer l'hypothèse par coïncidence.
+2. **Une région non mappée.** Faux. `modsections` donne la carte exacte, et
+   toutes les adresses lues étaient dans `.rdata` ou `.data`.
+3. **Une adresse en particulier.** Faux. La chute à `0x83CDA000` porte sur une
+   adresse qu'un balayage antérieur du même après-midi avait lue sans incident.
 
-- région `0x83CC0000..0x83D20000` et `0x83CA0000..0x83CC0000`, des **données**
-  (tables de réflexion) ;
-- blocs de **4 Ko**, une connexion XBDM par campagne ;
-- `fut-patch-watch` arrêté au préalable.
+Ce qui reste, et qui colle aux quatre : **le volume cumulé**. La console
+encaisse de l'ordre de **250 à 400 Ko** de `getmem` pendant que le titre
+tourne, puis lâche, quelle que soit la région et quelle que soit la taille des
+blocs. C'est cohérent avec la note d'origine sur le surveillant de patch, qui
+balayait 4 à 8 Mo en boucle et précédait deux chutes sur trois.
 
-**Ce qui a fait tomber la console au premier bloc** :
+Conséquence pratique : lire les 2 Mo de `.data` demanderait six ou sept
+redémarrages. Toute analyse mémoire doit donc être **ciblée** -- une adresse
+connue, quelques kilo-octets -- et jamais un balayage exploratoire.
 
-- région `0x82000000`, du **code** cette fois ;
-- blocs de **16 Ko**.
+### La carte du titre, pour ne plus chercher au mauvais endroit
 
-Deux variables changées d'un coup pour aller plus vite -- la taille des blocs
-et la nature de la région -- donc on ne sait pas laquelle est coupable. La
-prochaine tentative doit n'en changer qu'une : rester à 4 Ko et déplacer la
-région, ou rester sur les données et monter la taille. Sans ça on rejouera la
-même chute en croyant tester autre chose.
+    .rdata   0x82000400   0x00328DB4
+    .pdata   0x82329200   0x0009E1E0
+    .text    0x823D0000   0x018B4838
+    .data    0x83C90000   0x001FAED8
 
+Obtenue en deux commandes XBDM qui ne lisent aucune mémoire :
+`modules`, puis `modsections name="default.xex"`. Un balayage de
+« code » lancé à `0x82000000` visait en réalité `.rdata` : le code commence
+25 Mo plus loin.
 
-## 22 août : deux vraies consoles se maillent
-
-Ce jour-là, deux consoles — une en France, une en Algérie — sont entrées dans
-la même partie et se sont vues. `mesh_complete`, `synthetic: false`. C'est le
-mur contre lequel la veille avait buté.
-
-Rien de ce qui a débloqué ça n'était dans le réseau. Les trois causes étaient
-dans le serveur, et chacune ressemblait à un problème de connectivité.
-
-### Le chemin de l'invitation n'est pas celui du matchmaking
-
-La console invitée envoie un `joinGame` qui dit :
-
-    GID  = 0
-    SLOT = 1
-    USER = { ID: <l'identifiant de l'hôte>, ... }
-
-`GID` à zéro n'est pas une partie introuvable : c'est le client qui dit qu'il
-ne raisonne pas en numéro de partie. Il a pris son hôte dans sa liste d'amis,
-pas dans une liste de salons, et il le désigne par son identifiant de joueur.
-Le serveur cherchait `games[0]` et répondait « aucune partie » à une demande
-parfaitement valide.
-
-Corollaire : un joueur qui *cherche* rejoint désormais une partie déjà créée
-qui l'attend. L'écran de Face-à-Face a deux portes — « rechercher » et « créer
-un match » — et deux joueurs qui prennent la seconde s'attendaient chacun seul
-dans son salon. Un serveur dont le comportement dépend du bouton choisi est un
-serveur qui a tort.
-
-### Le champ `RRST`, et pourquoi on ne le comprend toujours pas
-
-Ce `joinGame` porte `RRST`, un dictionnaire de chaînes vers structs. Sa
-grammaire nous échappe : le champ occupe douze octets là où notre lecture n'en
-consomme que dix, et les trois captures qu'on possède sont **identiques**, donc
-elles ne permettent pas de trancher. Rien n'est deviné ici.
-
-Ce qui est fait, c'est une resynchronisation, sous deux conditions strictes :
-
-1. le reste doit se décoder **exactement** jusqu'au dernier octet ;
-2. toutes les étiquettes retrouvées doivent être de vrais tags.
-
-Sur cette trame, quatre décalages satisfont la première condition. Un seul
-satisfait la seconde — les autres rendent `]@TA` ou `@P`, qui ne peuvent pas
-être des tags. Sans ce second critère on aurait pris le premier venu.
-
-La trame reprend à 0x7D, et le tout se lit : `USER` est retrouvé, c'est-à-dire
-exactement l'objet de la requête. Une deuxième capture au contenu différent
-suffirait à établir la grammaire pour de bon.
-
-### Répondre à une requête ne demande pas de la comprendre
-
-`response_frame` redécodait la requête **entière**, en mode strict, pour en
-tirer trois nombres qui tiennent dans les douze premiers octets. Résultat : le
-joueur rejoignait vraiment — le journal montre `player_joined` — puis la
-construction de la réponse relisait la trame et l'exception fermait la
-connexion. Sur la console : « Cette session de jeu n'existe plus. »
-
-Le journal disait littéralement `player_joined` suivi de `connection_error`.
-
-### Un état de partie appartient à la partie
-
-`mesh_progress` rendait le passage en `IN_GAME` à son appelant — la console
-dont le rapport de maillage complétait le tableau. À 16:10:31, le maillage
-s'est bouclé entre deux vraies consoles, la partie est passée en jeu, et
-**seule celle qui avait parlé en dernier l'a su**. L'autre est restée sur son
-écran de chargement, à attendre un signal qui ne lui était pas adressé.
-
-### Ce qu'on a appris sur la méthode
-
-Les trois symptômes — « serveur momentanément indisponible », « cette session
-de jeu n'existe plus », « ça charge encore » — ressemblaient tous à des
-problèmes de réseau. Aucun ne l'était.
-
-La comparaison qui a tranché : les octets de `NotifyGameSetup` envoyés lors
-d'un appariement qui marchait (15:05) et d'un qui ne marchait pas (15:50)
-étaient **identiques** — 832 octets, mêmes champs, 34 membres. Ça a écarté le
-serveur d'un coup, et fait chercher ailleurs.
-
-Et une règle qui s'est vérifiée deux fois : quand un décodeur meurt sur une
-trame, ce n'est pas le décodeur qui est de trop, c'est le fait qu'il soit
-fatal. Une trame Blaze est une suite de champs indépendants ; ne pas savoir
-lire le septième ne rend pas les six premiers faux.
+Et surtout : chercher les paires `lis`/`ori` dans `.text` est inutile pendant
+que le jeu tourne. Elles écrivent dans `.data`, et `.data` est déjà rempli --
+il suffit de lire la table, si on sait où elle est.
