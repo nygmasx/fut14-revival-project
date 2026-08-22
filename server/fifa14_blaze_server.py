@@ -27,6 +27,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -836,6 +837,12 @@ def with_balance(payload: bytes, coins: int) -> bytes:
 # The club's cards. Built once at import from the icebreaker packs this build
 # ships, so every screen that asks about the club sees the same inventory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from game_records import (  # noqa: E402
+    RecordStore,
+    extract_players,
+)
+from game_records import match_duration as report_duration  # noqa: E402
+from game_records import match_type as report_match_type  # noqa: E402
 from fut_inventory import (  # noqa: E402
     GOLD_PACK_ID,
     ConsumableRefused,
@@ -1383,6 +1390,11 @@ class Fifa14Protocol:
         self.core_port = core_port
         self.logger = logger
         self.identity_port = identity_port
+        # Ce que les matchs ont laissé. Un classement en est la somme, rien
+        # de plus -- il n'y a donc rien à stocker d'autre que les matchs.
+        self.records = RecordStore(
+            Path(os.environ.get("FIFA14_GAME_RECORDS", "runtime/game-records.jsonl"))
+        )
         # `accounts` is the registry; `account_store` stays as the store for
         # the console that has not named itself, which is what every caller
         # without a persona in hand means.
@@ -4382,11 +4394,47 @@ class Fifa14Protocol:
                 grid = find_field(report.value, "GRID")
                 if grid is not None and isinstance(grid.value, int):
                     identifier = max(0, grid.value)
+            # Garder ce que le match a produit.
+            #
+            # Ce rapport porte tout : buts, tirs, passes, tacles, cartons,
+            # résultat. Il était jeté jusqu'au 22 août parce qu'on ne savait
+            # pas le lire -- le décodeur mourait sur un flottant. Un classement
+            # n'est rien d'autre que la somme de ces rapports, donc les jeter
+            # revenait à décréter qu'il n'y aurait jamais de classement.
+            #
+            # L'enregistrement ne doit jamais faire échouer la soumission : le
+            # titre attend son accusé de réception pour quitter l'écran de fin
+            # de match, et une erreur de disque n'est pas une raison de l'y
+            # laisser.
+            recorded = []
+            if report is not None:
+                try:
+                    recorded = extract_players(report)
+                    self.records.add(
+                        recorded,
+                        kind=report_match_type(report),
+                        duration=report_duration(report),
+                        when=datetime.now(timezone.utc).isoformat(),
+                    )
+                except Exception as error:      # noqa: BLE001
+                    self.logger.event(
+                        "game_report_not_recorded",
+                        connection=state.connection_id,
+                        error=f"{type(error).__name__}: {error}",
+                    )
             self.logger.event(
                 "game_report_submitted",
                 connection=state.connection_id,
                 reportId=identifier,
                 fields=[field.label for field in decoded["fields"]],
+                players=[
+                    {
+                        "persona": entry.persona_id,
+                        "buts": entry.stats.get("buts", 0),
+                        "encaisses": entry.stats.get("buts_encaisses", 0),
+                    }
+                    for entry in recorded
+                ],
             )
             return [
                 response_frame(request),
