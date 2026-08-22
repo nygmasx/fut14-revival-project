@@ -2831,13 +2831,27 @@ class Fifa14Protocol:
         if any(seen.get(peer) != MESH_CONNECTED for peer in expected):
             return []
         peers = expected
-        game.state = GAME_STATE_IN_GAME
         self.logger.event(
             "mesh_complete",
             game=game.game_id,
             peers=sorted(peers),
             synthetic=bool(test_opponent()),
         )
+        # Le coup d'envoi appartient à l'hôte, pas au serveur.
+        #
+        # Cette avance automatique a été écrite pour l'adversaire inventé, qui
+        # n'a pas de console pour envoyer `advanceGameState`. Avec deux vraies
+        # consoles elle est fausse, et le 22 août elle a coûté le match : dès
+        # le maillage fermé, la partie était déclarée IN_GAME alors que l'hôte
+        # était sur l'écran de sélection des équipes, à afficher « En attente
+        # d'adversaire ». Une partie en cours dont les deux clients sont
+        # encore en avant-match, ça ne se rattrape pas tout seul.
+        #
+        # L'hôte enverra la commande 3 quand il aura fini. Le serveur note
+        # simplement que tout le monde se voit.
+        if not test_opponent():
+            return []
+        game.state = GAME_STATE_IN_GAME
         # Le coup d'envoi se dit à toute la partie, pas au dernier arrivé.
         #
         # Ceci ne rendait la notification qu'à l'appelant, et l'appelant est
