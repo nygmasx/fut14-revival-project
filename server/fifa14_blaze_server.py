@@ -156,6 +156,9 @@ USER_UPDATE_NETWORK_INFO = 20
 STATS_GET_STAT_GROUP_LIST = 3
 STATS_GET_STAT_GROUP = 4
 STATS_GET_STATS_BY_GROUP = 16
+# Le code exact n'est pas connu. Ce qui est vérifié sur la console, c'est
+# qu'une erreur la sort de son attente là où un succès vide l'y laisse.
+STATS_ERR_NO_DATA = 1
 STATS_GET_KEY_SCOPES_MAP = 15
 # Leaderboards. Command 10 arrives as LBID plus NAME ("SkillGame41"), which is
 # a request for one leaderboard's descriptor; command 13 arrives as CENT (the
@@ -2315,13 +2318,43 @@ class Fifa14Protocol:
             group=str(group.value) if group is not None else "",
             view=int(view.value) if view is not None else 0,
         )
-        payload = encode_fields([
+        # Dire « il n'y en a pas » plutôt que de ne rien dire.
+        #
+        # Ce fut l'affaire de la soirée du 22 août. La console demandait les
+        # valeurs du groupe `MyFriendlies`, recevait un succès portant zéro
+        # ligne, et restait sur « Téléchargement informations match amicaux »
+        # indéfiniment -- plus rien que ses pings toutes les vingt secondes.
+        # Elle ne réessayait même pas.
+        #
+        # Deux hypothèses opposées ont été essayées sur la console elle-même.
+        # Un succès vide, poussé sous vingt-quatre numéros de notification à la
+        # fois : aucun effet. Une erreur : l'historique des amicaux en ligne
+        # s'est affiché. Le client lit donc « succès, zéro ligne » comme « les
+        # données ne sont pas encore là », et attend un envoi qui ne viendra
+        # jamais.
+        #
+        # Ce serveur n'a aucune statistique à donner, et c'est vrai de tous les
+        # groupes qu'on lui demande. Répondre une erreur est la seule chose
+        # exacte qu'il puisse dire, et c'est ce qui rend l'écran utilisable.
+        # Le jour où il y aura des lignes à rendre, il faudra la forme exacte
+        # de la réponse -- que la table de réflexion du titre détient et qu'on
+        # n'a pas pu lire, cette console ne supportant qu'environ 300 Ko de
+        # `getmem` avant de tomber du réseau.
+        #
+        # `FIFA14_STATS_EMPTY_OK=1` rend le succès vide, pour rejouer l'essai
+        # sans toucher au code.
+        if not os.environ.get("FIFA14_STATS_EMPTY_OK", "").strip():
+            self.logger.event(
+                "stats_by_group_refused",
+                group=str(group.value) if group is not None else "",
+            )
+            return response_frame(request, error=STATS_ERR_NO_DATA)
+        return response_frame(request, encode_fields([
             Field("KVAL", LIST, (STRUCT, [])),
             Field("STAT", LIST, (STRING, [])),
             Field("SVAL", LIST, (STRUCT, [])),
             Field("VID", INTEGER, int(view.value) if view is not None else 0),
-        ])
-        return response_frame(request, payload)
+        ]))
 
     def stats_notification_sweep(self, request: bytes,
                                  state: ClientState) -> list[bytes]:
