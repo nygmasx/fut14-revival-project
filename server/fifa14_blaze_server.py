@@ -154,6 +154,8 @@ USER_UPDATE_HARDWARE_FLAGS = 8
 USER_UPDATE_NETWORK_INFO = 20
 
 STATS_GET_STAT_GROUP_LIST = 3
+STATS_GET_STAT_GROUP = 4
+STATS_GET_STATS_BY_GROUP = 16
 STATS_GET_KEY_SCOPES_MAP = 15
 # Leaderboards. Command 10 arrives as LBID plus NAME ("SkillGame41"), which is
 # a request for one leaderboard's descriptor; command 13 arrives as CENT (the
@@ -2246,6 +2248,35 @@ class Fifa14Protocol:
             ]),
         )
 
+    def stat_group(self, request: bytes) -> bytes:
+        """La description d'un groupe de statistiques, réduite à ce qu'on sait.
+
+        Le titre demande quatre groupes par leur nom -- `MyFriends`,
+        `MyFriendlies`, `VProStatAccom`, `SkillGameStats` -- et redemande le
+        même toutes les cinq secondes tant qu'on ne lui répond rien d'utile.
+        Vingt et une fois dans la journée du 22 août.
+
+        La structure complète de `StatGroupResponse` n'est pas connue ici, et
+        rien n'est inventé pour la combler : la réponse ne porte que le nom du
+        groupe, tel que demandé, et une description vide. Un décodeur TDF
+        ignore les tags qu'il ne connaît pas et met des valeurs par défaut au
+        reste -- c'est ce qui a été établi sur `NotifyGameSetup`, et c'est ce
+        qui rend une réponse partielle sûre là où une réponse inventée ne le
+        serait pas.
+
+        Ce que ça teste est net : si la console cesse de redemander, le nom
+        était ce qu'elle attendait. Si elle continue, il lui faut les colonnes
+        du groupe, et il faudra aller les lire dans la table de réflexion du
+        titre plutôt que les deviner.
+        """
+        asked = find_field(decode_frame(request)["fields"], "NAME")
+        name = str(asked.value) if asked is not None else ""
+        self.logger.event("stat_group_requested", group=name)
+        return response_frame(request, encode_fields([
+            Field("DESC", STRING, ""),
+            Field("NAME", STRING, name),
+        ]))
+
     def synthetic_address(self) -> tuple:
         """A well-formed XNADDR that leads nowhere.
 
@@ -4064,6 +4095,8 @@ class Fifa14Protocol:
                     encode_fields([Field("GRPS", LIST, (STRUCT, []))]),
                 )
             ]
+        if route == (STATS, STATS_GET_STAT_GROUP):
+            return [self.stat_group(request)]
         if route == (STATS, STATS_GET_PERIOD_IDS):
             return [self.period_ids(request)]
         if route == (GAME_MANAGER, GAME_MANAGER_JOIN_GAME):

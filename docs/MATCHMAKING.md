@@ -319,6 +319,29 @@ il a fallu le bouton d'alimentation.
 Donc : arrêter `fut-patch-watch` avant toute lecture XBDM, et ne pas enchaîner
 les cycles d'accroche manette.
 
+### 22 août, quatrième chute : ce qui passe et ce qui ne passe pas
+
+Le même après-midi, deux campagnes de lecture ont donné deux résultats opposés,
+et la différence est instructive.
+
+**Ce qui est passé sans une plainte** — environ 400 Ko lus en tout :
+
+- région `0x83CC0000..0x83D20000` et `0x83CA0000..0x83CC0000`, des **données**
+  (tables de réflexion) ;
+- blocs de **4 Ko**, une connexion XBDM par campagne ;
+- `fut-patch-watch` arrêté au préalable.
+
+**Ce qui a fait tomber la console au premier bloc** :
+
+- région `0x82000000`, du **code** cette fois ;
+- blocs de **16 Ko**.
+
+Deux variables changées d'un coup pour aller plus vite -- la taille des blocs
+et la nature de la région -- donc on ne sait pas laquelle est coupable. La
+prochaine tentative doit n'en changer qu'une : rester à 4 Ko et déplacer la
+région, ou rester sur les données et monter la taille. Sans ça on rejouera la
+même chute en croyant tester autre chose.
+
 
 ## 22 août : deux vraies consoles se maillent
 
