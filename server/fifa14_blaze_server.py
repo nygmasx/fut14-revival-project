@@ -3119,6 +3119,26 @@ class Fifa14Protocol:
                       self.member_player(game, arrival["member"])),
             ]),
         ), skip=state)
+        # Et qu'il est arrivé, pas seulement qu'il arrivait.
+        #
+        # La 21 annonce une arrivée en cours ; la 30 la conclut. Sans elle,
+        # l'arrivant reste `ACTIVE_CONNECTING` dans le roster de ceux qui
+        # étaient déjà là. Le 22 août, l'hôte est passé à la sélection des
+        # maillots pendant que l'invité restait sur son chargement : l'hôte
+        # n'avait jamais appris que l'autre avait fini de se connecter, donc
+        # il ne l'attendait pas -- et l'invité attendait d'être reconnu.
+        #
+        # L'ancien `joinGame` envoyait bien cette paire. Elle a été perdue en
+        # factorisant les deux chemins d'arrivée ; la remettre ici la rend aux
+        # deux.
+        self.tell_members(game, notification_frame(
+            GAME_MANAGER,
+            NOTIFY_PLAYER_JOIN_COMPLETED,
+            encode_fields([
+                Field("GID", INTEGER, game.game_id),
+                Field("PID", INTEGER, state.xuid),
+            ]),
+        ), skip=state)
 
         self.broadcast_census()
         self.publish_relay_pairs()

@@ -299,8 +299,7 @@ mais personne ne devrait le lire comme une connaissance sur ce jeu.
   un adversaire inventé (`FIFA14_TEST_OPPONENT`, désactivé par défaut). Le
   maillage ne peut pas se fermer contre quelqu'un qui n'existe pas : la
   console rapporte `DISCONNECTED`, ce qui est la bonne réponse.
-- **`joinGame` (commande 9)** et le navigateur de parties (100/101), pour
-  qu'une deuxième console puisse entrer.
+- ~~**`joinGame` (commande 9)**~~ — fait le 22 août, voir plus bas.
 - **Les modes FUT en ligne** — on ne sait pas encore s'ils passent par
   GameManager ou par l'API web FUT.
 
@@ -319,3 +318,87 @@ il a fallu le bouton d'alimentation.
 
 Donc : arrêter `fut-patch-watch` avant toute lecture XBDM, et ne pas enchaîner
 les cycles d'accroche manette.
+
+
+## 22 août : deux vraies consoles se maillent
+
+Ce jour-là, deux consoles — une en France, une en Algérie — sont entrées dans
+la même partie et se sont vues. `mesh_complete`, `synthetic: false`. C'est le
+mur contre lequel la veille avait buté.
+
+Rien de ce qui a débloqué ça n'était dans le réseau. Les trois causes étaient
+dans le serveur, et chacune ressemblait à un problème de connectivité.
+
+### Le chemin de l'invitation n'est pas celui du matchmaking
+
+La console invitée envoie un `joinGame` qui dit :
+
+    GID  = 0
+    SLOT = 1
+    USER = { ID: <l'identifiant de l'hôte>, ... }
+
+`GID` à zéro n'est pas une partie introuvable : c'est le client qui dit qu'il
+ne raisonne pas en numéro de partie. Il a pris son hôte dans sa liste d'amis,
+pas dans une liste de salons, et il le désigne par son identifiant de joueur.
+Le serveur cherchait `games[0]` et répondait « aucune partie » à une demande
+parfaitement valide.
+
+Corollaire : un joueur qui *cherche* rejoint désormais une partie déjà créée
+qui l'attend. L'écran de Face-à-Face a deux portes — « rechercher » et « créer
+un match » — et deux joueurs qui prennent la seconde s'attendaient chacun seul
+dans son salon. Un serveur dont le comportement dépend du bouton choisi est un
+serveur qui a tort.
+
+### Le champ `RRST`, et pourquoi on ne le comprend toujours pas
+
+Ce `joinGame` porte `RRST`, un dictionnaire de chaînes vers structs. Sa
+grammaire nous échappe : le champ occupe douze octets là où notre lecture n'en
+consomme que dix, et les trois captures qu'on possède sont **identiques**, donc
+elles ne permettent pas de trancher. Rien n'est deviné ici.
+
+Ce qui est fait, c'est une resynchronisation, sous deux conditions strictes :
+
+1. le reste doit se décoder **exactement** jusqu'au dernier octet ;
+2. toutes les étiquettes retrouvées doivent être de vrais tags.
+
+Sur cette trame, quatre décalages satisfont la première condition. Un seul
+satisfait la seconde — les autres rendent `]@TA` ou `@P`, qui ne peuvent pas
+être des tags. Sans ce second critère on aurait pris le premier venu.
+
+La trame reprend à 0x7D, et le tout se lit : `USER` est retrouvé, c'est-à-dire
+exactement l'objet de la requête. Une deuxième capture au contenu différent
+suffirait à établir la grammaire pour de bon.
+
+### Répondre à une requête ne demande pas de la comprendre
+
+`response_frame` redécodait la requête **entière**, en mode strict, pour en
+tirer trois nombres qui tiennent dans les douze premiers octets. Résultat : le
+joueur rejoignait vraiment — le journal montre `player_joined` — puis la
+construction de la réponse relisait la trame et l'exception fermait la
+connexion. Sur la console : « Cette session de jeu n'existe plus. »
+
+Le journal disait littéralement `player_joined` suivi de `connection_error`.
+
+### Un état de partie appartient à la partie
+
+`mesh_progress` rendait le passage en `IN_GAME` à son appelant — la console
+dont le rapport de maillage complétait le tableau. À 16:10:31, le maillage
+s'est bouclé entre deux vraies consoles, la partie est passée en jeu, et
+**seule celle qui avait parlé en dernier l'a su**. L'autre est restée sur son
+écran de chargement, à attendre un signal qui ne lui était pas adressé.
+
+### Ce qu'on a appris sur la méthode
+
+Les trois symptômes — « serveur momentanément indisponible », « cette session
+de jeu n'existe plus », « ça charge encore » — ressemblaient tous à des
+problèmes de réseau. Aucun ne l'était.
+
+La comparaison qui a tranché : les octets de `NotifyGameSetup` envoyés lors
+d'un appariement qui marchait (15:05) et d'un qui ne marchait pas (15:50)
+étaient **identiques** — 832 octets, mêmes champs, 34 membres. Ça a écarté le
+serveur d'un coup, et fait chercher ailleurs.
+
+Et une règle qui s'est vérifiée deux fois : quand un décodeur meurt sur une
+trame, ce n'est pas le décodeur qui est de trop, c'est le fait qu'il soit
+fatal. Une trame Blaze est une suite de champs indépendants ; ne pas savoir
+lire le septième ne rend pas les six premiers faux.

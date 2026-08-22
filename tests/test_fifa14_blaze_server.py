@@ -3183,8 +3183,10 @@ class TwoConsolesTests(unittest.TestCase):
         self.assertEqual(
             [decode_frame(f)["command"] for f in answered[1:]], [20, 71, 30, 100]
         )
-        # And the one already in there hears that somebody arrived.
-        self.assertEqual([f["command"] for f in self.pushed(self.one)], [21])
+        # And the one already in there hears that somebody arrived -- 21 --
+        # and then qu'il est arrivé -- 30. Sans la seconde, l'arrivant reste
+        # `ACTIVE_CONNECTING` dans son roster et n'est jamais attendu.
+        self.assertEqual([f["command"] for f in self.pushed(self.one)], [21, 30])
         self.assertEqual(len(self.protocol.games[7].members), 2)
 
     def test_joining_a_game_that_does_not_exist_is_refused_quietly(self) -> None:
