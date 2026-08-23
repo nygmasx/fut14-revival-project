@@ -1323,6 +1323,31 @@ def relayed_host_addresses(addresses: "Field | None",
     return Field("HNET", LIST, (item_type, rewritten_items))
 
 
+def join_notification_choice() -> str:
+    """Ce qu'un arrivant reçoit : `20`, `22`, ou les deux.
+
+    La notification 22 s'appelle `NotifyJoiningPlayerInitiateConnections` et
+    porte la même charge que la 20 -- le binaire n'a qu'une classe 557. Ce qui
+    les distingue est ce qu'elles font faire : la 20 décrit une partie, la 22
+    dit à celui qui arrive de composer le maillage au lieu d'attendre qu'on
+    l'appelle.
+
+    Le défaut est `20`, et il est mesuré, pas choisi : le 22 août 2026, la
+    console qui a reçu la 20 a répondu deux secondes plus tard avec sa session
+    XNet, celle qui a reçu la 22 seule n'a plus rien dit. Remplacer l'une par
+    l'autre est donc une régression connue.
+
+    Ce qui n'a jamais été essayé, c'est les deux ensemble -- et c'est ce que
+    le 23 août rend intéressant : sur deux essais aux rôles inversés, seul
+    l'hôte a émis de l'UDP, l'invité n'a envoyé ni paquet ni
+    `updateMeshConnection` alors qu'il avait l'adresse, la clé de session et
+    le roster. `both` est là pour trancher ça en un essai, réversible sans
+    redéployer, parce que la réponse se lit sur le réseau et pas dans le code.
+    """
+    choice = os.environ.get("FIFA14_JOIN_NOTIFICATION", "20").strip().lower()
+    return choice if choice in ("20", "22", "both") else "20"
+
+
 def mirror_test_host_address() -> bool:
     """Faut-il donner à l'hôte inventé une adresse authentique ?
 
@@ -3319,15 +3344,18 @@ class Fifa14Protocol:
             guest=state.xuid,
             slot=arrival["slot"],
         )
+        setup = encode_fields(self.game_setup_payload(
+            game, session=arrival["session"],
+            result=MATCHMAKING_SUCCESS_JOINED_EXISTING_GAME,
+            viewer=state, context=SETUP_CONTEXT_JOIN_GAME))
+        choice = join_notification_choice()
         frames = [
-            notification_frame(
+            *([notification_frame(GAME_MANAGER, NOTIFY_GAME_SETUP, setup)]
+              if choice in ("20", "both") else []),
+            *([notification_frame(
                 GAME_MANAGER,
-                NOTIFY_GAME_SETUP,
-                encode_fields(self.game_setup_payload(
-                    game, session=arrival["session"],
-                    result=MATCHMAKING_SUCCESS_JOINED_EXISTING_GAME,
-                    viewer=state, context=SETUP_CONTEXT_JOIN_GAME)),
-            ),
+                NOTIFY_JOINING_PLAYER_INITIATE_CONNECTIONS, setup)]
+              if choice in ("22", "both") else []),
             notification_frame(
                 GAME_MANAGER,
                 NOTIFY_PLATFORM_HOST_INITIALIZED,

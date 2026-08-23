@@ -18,6 +18,7 @@ dont la grammaire nous échappe toujours.
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -118,3 +119,39 @@ class JoinFromFriendsListTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JoinNotificationChoiceTests(unittest.TestCase):
+    """Ce que reçoit un arrivant est réglable, et le défaut est celui qu'on a mesuré.
+
+    La 22 s'appelle `NotifyJoiningPlayerInitiateConnections` et porte la même
+    charge que la 20 -- le binaire n'a qu'une classe 557. Elle a été essayée
+    seule le 22 août : la console qui l'a reçue n'a plus rien dit, quand celle
+    qui recevait la 20 répondait deux secondes plus tard avec sa session XNet.
+    Le défaut protège ce résultat ; le réglage existe pour essayer `both`, qui
+    n'a jamais été tenté, sans avoir à réécrire quoi que ce soit.
+    """
+
+    def setUp(self) -> None:
+        self.previous = os.environ.get("FIFA14_JOIN_NOTIFICATION")
+
+    def tearDown(self) -> None:
+        if self.previous is None:
+            os.environ.pop("FIFA14_JOIN_NOTIFICATION", None)
+        else:
+            os.environ["FIFA14_JOIN_NOTIFICATION"] = self.previous
+
+    def test_the_default_is_the_one_the_consoles_answered(self) -> None:
+        os.environ.pop("FIFA14_JOIN_NOTIFICATION", None)
+        self.assertEqual(SERVER.join_notification_choice(), "20")
+
+    def test_an_unreadable_setting_falls_back_rather_than_guessing(self) -> None:
+        """Une valeur invalide ne doit pas silencieusement changer le
+        comportement observé sur le matériel."""
+        os.environ["FIFA14_JOIN_NOTIFICATION"] = "yes please"
+        self.assertEqual(SERVER.join_notification_choice(), "20")
+
+    def test_the_three_shapes_are_reachable(self) -> None:
+        for value, expected in (("22", "22"), ("both", "both"), ("20", "20")):
+            os.environ["FIFA14_JOIN_NOTIFICATION"] = value
+            self.assertEqual(SERVER.join_notification_choice(), expected)
