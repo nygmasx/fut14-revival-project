@@ -393,3 +393,103 @@ et `GTIM` (5567, une durée dont l'unité est inconnue).
 Un rapport de match local ne contient qu'un joueur. Un rapport de match en
 ligne devrait en contenir deux -- c'est la seule chose qui distingue les deux
 cas, et elle n'a pas encore été observée.
+
+## Le 23 août : le maillage, et pourquoi une seule console composait
+
+Deux consoles, une en France et une aux États-Unis, ont fait six appariements
+dans l'après-midi. Le Blaze s'est déroulé sans faute à chaque fois. Le
+maillage, jamais. Ce que la journée a établi, dans l'ordre où ça s'est su.
+
+### L'invitation entre amis ne traverse pas Blaze
+
+Quand une console invite, **elle n'envoie rien au serveur**. Sur la fenêtre
+complète d'une invitation, le journal ne montre qu'un `getStatsByGroup`, un
+`createGame` et un `getClubInvitations` -- aucune trame d'invitation, ni
+servie ni refusée. La liste de tout ce qui est jamais tombé en
+`unknown_route` ne contient rien qui y ressemble non plus.
+
+L'invitation passe donc par la file de notifications Xbox LIVE (`XSessionInvite`,
+XAM), pas par Blaze. Hors ligne elle n'existe pas, et **aucun code serveur ne
+peut la rattraper**. Le chemin qui marche est « rejoindre depuis la liste
+d'amis », qui produit un vrai `joinGame` avec `GID = 0` et l'hôte dans
+`USER.ID`.
+
+Corollaire pratique : deux joueurs qui s'attendent mutuellement finissent
+chacun par créer sa propre partie, et le journal montre alors deux parties à
+un joueur au lieu d'une à deux.
+
+### Réécrire une adresse sur trois revient à n'en réécrire aucune
+
+`FIFA14_PEER_RELAY` réécrit l'adresse publique du XNADDR pour la faire pointer
+sur le relais. Elle n'était appliquée qu'au roster de la notification 20. La
+trame envoyée à l'invité portait donc **trois** `XDDR` :
+
+    192.168.1.25 / 2.11.99.154:3074     l'hôte, adresse réelle
+    192.168.1.25 / 87.106.7.87:3074     l'hôte, réécrite
+    10.0.0.179  / 73.128.188.206:3074   l'invité lui-même
+
+La console avait le choix et a composé la vraie. Deux sites manquaient :
+`HNET`, qui sortait de `game.host_addresses` sans être touché, et la
+notification 21, construite sans `viewer`. La 21 annonce toujours une arrivée
+à quelqu'un d'autre que l'arrivant, donc le membre décrit n'y est jamais le
+destinataire et la réécriture s'y applique sans condition. `createGame` doit
+au contraire passer `viewer=state` : le créateur est l'hôte, et une console ne
+passe pas par un relais pour s'atteindre elle-même.
+
+### Un relais qui affirme avoir livré coûte plus cher qu'un paquet perdu
+
+Le relais n'écrit qu'aux adresses dont il a reçu un paquet -- mais il ne les
+oubliait jamais, et son dictionnaire vivait en mémoire d'un processus démarré
+la veille. Il a expédié dix paquets vers une correspondance NAT apprise le 22,
+en journalisant `relay_forwarded`. La lecture du journal a été fausse pendant
+un quart d'heure : on cherchait pourquoi les paquets mouraient à la box, alors
+que le vrai fait à expliquer était qu'une des deux consoles n'émettait pas.
+
+Une adresse silencieuse depuis plus de quarante-cinq secondes est maintenant
+périmée, et une paire défaite efface les siennes.
+
+### C'est la notification 22 qui fait composer l'invité
+
+Trois essais aux rôles inversés ont donné le même résultat : **seul l'hôte
+émettait de l'UDP**. L'invité n'envoyait ni paquet vers le relais ni
+`updateMeshConnection`, alors qu'il avait l'adresse, le roster, et une clé de
+session identique à l'octet près à celle que l'hôte avait déposée -- vérifié
+sur `XNNC` (16 octets) et `XSES` (256 octets). Ce n'était donc pas une console
+qui avait un problème, c'était le rôle.
+
+La notification 22, `NotifyJoiningPlayerInitiateConnections`, porte la même
+charge que la 20 -- le binaire n'a qu'une classe 557 -- et dit à celui qui
+arrive de composer le maillage au lieu d'attendre. Essayée **seule** le
+22 août, elle rendait la console muette. Envoyée **après** la 20, elle a
+produit immédiatement ce qu'on cherchait :
+
+    relay_endpoint  peer: 2.11.99.154:3074   partner: 73.128.188.206
+    relay_flushed   packets: 9  →  73.128.188.206:3074
+
+Le trafic circule désormais dans les deux sens. `FIFA14_JOIN_NOTIFICATION`
+accepte `20`, `22` ou `both` ; le défaut reste `20`, parce que remplacer l'une
+par l'autre est une régression mesurée.
+
+### Ce qui bloque encore
+
+Les paquets circulent et **aucune des deux consoles n'accepte l'autre**. Elles
+déclarent `STAT = 0` dix secondes après le premier paquet. Le détail qui
+oriente : tous les paquets font 122 octets, dans les deux sens, dix fois de
+suite. Ce n'est pas une conversation qui progresse puis échoue, c'est la même
+sonde répétée -- chacun émet, chacun reçoit, chacun jette.
+
+Deux explications tiennent, et aucune n'est tranchée :
+
+1. Les vingt octets d'`abOnline` du XNADDR ne sont pas réécrits, parce qu'on
+   ne sait pas les lire. Si l'association XNet s'en sert pour valider
+   l'expéditeur, l'adresse d'origine ne correspond plus à ce qu'annonce la
+   clé.
+2. Un désaccord de mode XNet entre les deux consoles. Le manifeste applique
+   `xnet_nosecure` et `xnet_bypass` au même rang que la redirection, mais le
+   plugin **refuse de patcher une image qu'il ne reconnaît pas** : une version
+   ou un TU différent ferait échouer ces patches-là en silence pendant que les
+   autres passent.
+
+L'expérience qui les sépare est un essai avec le relais désarmé. Échec
+identique : le relais est hors de cause. Symptôme différent : c'est la
+réécriture.
