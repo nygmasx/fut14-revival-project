@@ -401,6 +401,15 @@ class ClientState:
     email: str = "offline@localhost"
     authenticated: bool = False
     request_count: int = 0
+    # When this connection was last heard from, on the monotonic clock. A
+    # console that reboots its title leaves the TCP connection half open: the
+    # server keeps writing census notifications into a socket nobody reads,
+    # and keeps holding the game that connection created at the name of a
+    # host that no longer exists. Blaze's heartbeat only travels one way --
+    # the client sends `Utility.ping` every twenty seconds and the server
+    # never asks -- so silence is the only symptom available, and this is
+    # where it gets noticed.
+    last_seen: float = field(default_factory=time.monotonic)
     send_lock: threading.Lock = field(default_factory=threading.Lock)
     # The socket this connection is on, so the server can say something the
     # client did not ask for. Every frame until now was a reply, written by
@@ -1283,6 +1292,37 @@ def relayed_address(address: bytes, relay: tuple[str, int]) -> bytes:
     return address[:4] + packed + port.to_bytes(2, "big") + address[10:]
 
 
+def relayed_host_addresses(addresses: "Field | None",
+                           relay: tuple[str, int] | None) -> "Field | None":
+    """`HNET`, with the host's public address pointed at the relay.
+
+    The roster carried a rewritten address and `HNET` carried the real one,
+    in the same notification 20. A guest handed both dialled the real one and
+    the relay never saw a packet -- which is exactly what the 23 August
+    capture shows: three `XDDR` in one frame, only the middle one rewritten.
+    Rewriting one copy of an address is the same as rewriting none.
+    """
+    if addresses is None or relay is None:
+        return addresses
+    try:
+        item_type, items = addresses.value
+    except (TypeError, ValueError):
+        return addresses
+    rewritten_items = []
+    for item in items:
+        try:
+            active, entries = item
+        except (TypeError, ValueError):
+            rewritten_items.append(item)
+            continue
+        rewritten_items.append((active, [
+            Field("XDDR", BINARY, relayed_address(bytes(entry.value), relay))
+            if getattr(entry, "label", None) == "XDDR" else entry
+            for entry in entries
+        ]))
+    return Field("HNET", LIST, (item_type, rewritten_items))
+
+
 def mirror_test_host_address() -> bool:
     """Faut-il donner à l'hôte inventé une adresse authentique ?
 
@@ -2061,7 +2101,8 @@ class Fifa14Protocol:
             Field("HSLT", INTEGER, 0),
         ]
 
-    def replicated_game_data(self, game: HostedGame) -> list[Field]:
+    def replicated_game_data(self, game: HostedGame,
+                             viewer: ClientState | None = None) -> list[Field]:
         """The game, all thirty-six members of it.
 
         The first pass sent fourteen, because fourteen was all the title's
@@ -2094,7 +2135,13 @@ class Fifa14Protocol:
             Field("GSTA", INTEGER, game.state),
             Field("GTYP", STRING, game.game_type),
             Field("GURL", STRING, game.status_url),
-            game.host_addresses or Field("HNET", LIST, (STRUCT, [])),
+            # Pointed at the relay for everyone but the host itself, on the
+            # same rule as the roster: a console is never told to dial
+            # through a relay to reach the machine it is running on.
+            (relayed_host_addresses(game.host_addresses, peer_relay())
+             if viewer is None or viewer.xuid != game.persona_id
+             else game.host_addresses)
+            or Field("HNET", LIST, (STRUCT, [])),
             # The session that hosts the topology.
             Field("HSES", INTEGER, game.persona_id),
             Field("IGNO", INTEGER, 0),
@@ -2148,6 +2195,13 @@ class Fifa14Protocol:
         address is left alone -- it knows where it lives -- and everybody
         else's is pointed at the relay, because those are the ones it will
         dial.
+
+        No `viewer` means the recipient is somebody other than this member --
+        which is what notification 21 is, always: it announces an arrival to
+        the players who were already there, and never to the arrival itself.
+        So the relay rewrite applies there too. It did not, and that is why
+        the host kept dialling the guest's real address on 23 August while a
+        relay sat armed and idle.
         """
         fields = [
             Field("CONG", INTEGER, member["group"]),
@@ -2183,8 +2237,8 @@ class Fifa14Protocol:
         ]
         address = member["address"]
         relay = peer_relay()
-        if (address is not None and relay is not None and viewer is not None
-                and member["persona"] != viewer.xuid):
+        if (address is not None and relay is not None
+                and (viewer is None or member["persona"] != viewer.xuid)):
             active, valu = address
             rewritten = []
             for entry in valu.value:
@@ -2511,7 +2565,7 @@ class Fifa14Protocol:
         do, not in what they carry.
         """
         return [
-            Field("GAME", STRUCT, self.replicated_game_data(game)),
+            Field("GAME", STRUCT, self.replicated_game_data(game, viewer)),
             Field("LFPJ", INTEGER, 0),
             Field("PROS", LIST, (STRUCT, [
                 self.member_player(game, member, viewer) for member in game.members
@@ -2687,7 +2741,10 @@ class Fifa14Protocol:
         )
         return [
             response_frame(request, encode_fields([Field("GID", INTEGER, game_id)])),
-            *self.game_setup_notifications(game),
+            # `viewer=state` because this one goes back to the creator, and
+            # the creator is the host: it must read its own address, not the
+            # relay's. Everyone else is told to dial through the relay.
+            *self.game_setup_notifications(game, viewer=state),
         ]
 
     def join_game(self, request: bytes, state: ClientState) -> list[bytes]:
@@ -6666,14 +6723,33 @@ class BlazeService:
         state.channel = client
         self.protocol.remember_connection(state)
         buffer = bytearray()
+        # How long a connection may stay silent before it is treated as gone.
+        # The console sends `Utility.ping` every twenty seconds and keeps
+        # doing so through a match, so two minutes is silence rather than a
+        # slow menu -- while still being far short of the forever a half-open
+        # socket would otherwise last. Zero disables the check.
+        idle_limit = float(os.environ.get("FIFA14_IDLE_TIMEOUT", "120"))
         try:
             while not self.stop_event.is_set():
                 try:
                     block = client.recv(65536)
                 except socket.timeout:
+                    if (
+                        idle_limit > 0
+                        and time.monotonic() - state.last_seen > idle_limit
+                    ):
+                        self.journal.event(
+                            "connection_idle",
+                            connection=state.connection_id,
+                            local_port=state.local_port,
+                            silent_for=round(time.monotonic() - state.last_seen, 1),
+                            requests=state.request_count,
+                        )
+                        return
                     continue
                 if not block:
                     return
+                state.last_seen = time.monotonic()
                 buffer.extend(block)
 
                 # A TLS ClientHello starts with a TLS record byte, not a Blaze
