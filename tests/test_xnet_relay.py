@@ -128,3 +128,52 @@ def test_the_relay_forwards_between_two_paired_endpoints(tmp_path) -> None:
     finally:
         relay.kill()
         relay.wait(timeout=5)
+
+
+def test_an_address_learned_yesterday_is_not_written_to_today() -> None:
+    """Le relais oublie une adresse dont il n'a plus de nouvelles.
+
+    Le 23 août il a expédié dix paquets vers une correspondance NAT apprise la
+    veille, et a journalisé `relay_forwarded` -- donc affirmé les avoir
+    livrés. Le paquet perdu n'est pas le problème : le journal qui ment l'est.
+    """
+    sys.path.insert(0, str(REPO / "tools"))
+    import xnet_relay
+
+    endpoint = {"2.11.99.154": ("2.11.99.154", 3074)}
+    seen_at = {"2.11.99.154": 1000.0}
+
+    assert xnet_relay.fresh_endpoint(
+        endpoint, seen_at, "2.11.99.154", now=1010.0, fresh=45.0
+    ) == ("2.11.99.154", 3074), "une adresse fraîche doit rester joignable"
+
+    assert xnet_relay.fresh_endpoint(
+        endpoint, seen_at, "2.11.99.154", now=1000.0 + 86400, fresh=45.0
+    ) is None, "une adresse de la veille ne doit plus être utilisée"
+
+    assert xnet_relay.fresh_endpoint(
+        endpoint, seen_at, "10.0.0.9", now=1010.0, fresh=45.0
+    ) is None, "une adresse jamais apprise n'existe pas"
+
+
+def test_the_pairs_table_reports_whether_it_changed(tmp_path) -> None:
+    """`refresh` doit dire si la composition a bougé.
+
+    C'est ce qui permet d'oublier l'adresse d'un joueur qui n'est plus
+    appairé, au lieu de préparer la livraison d'après-demain à l'adresse
+    d'hier.
+    """
+    sys.path.insert(0, str(REPO / "tools"))
+    import xnet_relay
+
+    pairs = tmp_path / "pairs.json"
+    pairs.write_text(json.dumps({"pairs": [["10.0.0.1", "10.0.0.2"]]}))
+    table = xnet_relay.Pairs(pairs)
+
+    assert table.refresh() is True, "la première lecture est un changement"
+    assert table.refresh() is False, "relire le même fichier ne change rien"
+
+    time.sleep(0.01)
+    pairs.write_text(json.dumps({"pairs": []}))
+    assert table.refresh() is True, "une paire retirée est un changement"
+    assert table.of("10.0.0.1") is None
