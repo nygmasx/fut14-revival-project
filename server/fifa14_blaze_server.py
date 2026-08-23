@@ -160,6 +160,41 @@ STATS_GET_STATS_BY_GROUP = 16
 # Le code exact n'est pas connu. Ce qui est vérifié sur la console, c'est
 # qu'une erreur la sort de son attente là où un succès vide l'y laisse.
 STATS_ERR_NO_DATA = 1
+
+# Rejoindre une partie qui n'est plus là.
+#
+# Le 23 août, une console a demandé à rejoindre un salon que son hôte venait
+# de quitter. On lui a répondu un succès **vide** : ni `GID`, ni `JGS`, ni
+# rien. Elle a donc appris qu'elle avait rejoint quelque chose, sans savoir
+# quoi, et a attendu -- jusqu'au gel du titre.
+#
+# Une erreur est la seule réponse honnête, et c'est aussi la seule utile : la
+# console sait afficher « cette session de jeu n'existe plus », ce qui est
+# exactement le cas. La valeur n'est pas lue dans le binaire ; c'est la même
+# erreur générique que les stats emploient déjà et à laquelle le titre réagit
+# proprement, et elle est nommée ici pour que ce choix soit visible plutôt
+# qu'enfoui dans un appel.
+GAME_MANAGER_ERR_NO_SUCH_GAME = 1
+
+# Le groupe de connexion, tel que la console l'écrit elle-même.
+#
+# `updateMeshConnection` porte deux identifiants d'objet : `TCG`, la cible, et
+# `SCG`, la source. La console sait remplir `TCG` -- elle vaut
+# `(30722, 2, <CONG de l'autre>)`, et le `CONG` vient de nous. Elle mettait
+# `SCG = (0, 0, 0)`, parce que son propre groupe, elle le lit dans son `UGID`
+# de roster, et qu'on y écrivait trois zéros.
+#
+# Chaque console savait donc à qui écrire et **aucune ne savait qui elle
+# était**. Un paquet adressé à un groupe de connexion n'était reconnu par
+# personne. Ces deux nombres ne sont pas devinés : ils sont lus dans le `TCG`
+# que les consoles nous envoient depuis le 21 août.
+CONNECTION_GROUP_COMPONENT = 30722
+CONNECTION_GROUP_TYPE = 2
+
+
+def connection_group(group: int) -> tuple[int, int, int]:
+    """L'identifiant d'objet d'un groupe de connexion."""
+    return (CONNECTION_GROUP_COMPONENT, CONNECTION_GROUP_TYPE, int(group))
 # Le nom de cette commande n'est pas lu dans le binaire : il est déduit de son
 # seul argument, `NAME`, et des valeurs qu'on lui voit passer --
 # « FriendliesLeaderboards ». C'est un arbre de classements demandé par son
@@ -2256,7 +2291,7 @@ class Fifa14Protocol:
                   else PLAYER_STATE_ACTIVE_CONNECTING),
             Field("TIDX", INTEGER, member["team"]),
             Field("TIME", INTEGER, int(time.time())),
-            Field("UGID", OBJECT_ID, (0, 0, 0)),
+            Field("UGID", OBJECT_ID, connection_group(member["group"])),
             # mPlayerSessionId: how a client recognises itself in a roster.
             Field("UID", INTEGER, member["persona"]),
         ]
@@ -2294,7 +2329,7 @@ class Fifa14Protocol:
         one-field test.
         """
         fields = [
-            Field("UGID", OBJECT_ID, (0, 0, 0)),
+            Field("UGID", OBJECT_ID, connection_group(game.connection_group)),
             # The same id the login notifications gave this session.
             Field("UID", INTEGER, game.persona_id),
             Field("CONG", INTEGER, game.connection_group),
@@ -2538,7 +2573,7 @@ class Fifa14Protocol:
         dial it, it will fail -- and *where* it fails is the measurement.
         """
         fields = [
-            Field("UGID", OBJECT_ID, (0, 0, 0)),
+            Field("UGID", OBJECT_ID, connection_group(SYNTHETIC_PERSONA)),
             Field("UID", INTEGER, SYNTHETIC_PERSONA),
             Field("CONG", INTEGER, SYNTHETIC_PERSONA),
             Field("CSID", INTEGER, 1),
@@ -2812,7 +2847,8 @@ class Fifa14Protocol:
                 game=wanted,
                 reason="no such game",
             )
-            return [response_frame(request)]
+            return [response_frame(
+                request, error=GAME_MANAGER_ERR_NO_SUCH_GAME)]
 
         network = find_field(fields, "PNET")
         address = None

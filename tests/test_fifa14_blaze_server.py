@@ -2761,7 +2761,17 @@ class SyntheticOpponentTests(unittest.TestCase):
         _, roster = by_label(self.pushed()[0], "PROS").value
         player = {f.label: f.value for f in roster[0]}
         self.assertEqual(player["UID"], 2535469248587161)
-        self.assertEqual(player["UGID"], (0, 0, 0))
+        # `UGID` doit s'accorder avec `CONG`, parce que c'est là que la console
+        # lit son *propre* groupe de connexion. Tant qu'on y écrivait trois
+        # zéros, elle rapportait `SCG = (0, 0, 0)` dans ses trames de maillage :
+        # elle savait à qui écrire et pas qui elle était. La forme vient du
+        # `TCG` que les consoles envoient elles-mêmes.
+        self.assertEqual(
+            player["UGID"],
+            (SERVER.CONNECTION_GROUP_COMPONENT,
+             SERVER.CONNECTION_GROUP_TYPE,
+             player["CONG"]),
+        )
         # Fifteen of the eighteen: BLOB, PATT and ROLE are empty and left out,
         # which is what the client does with its own -- its 611-byte
         # createGame is thirty-four members less seven empty containers.

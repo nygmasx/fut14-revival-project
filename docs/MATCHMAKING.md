@@ -472,24 +472,81 @@ par l'autre est une régression mesurée.
 
 ### Ce qui bloque encore
 
-Les paquets circulent et **aucune des deux consoles n'accepte l'autre**. Elles
-déclarent `STAT = 0` dix secondes après le premier paquet. Le détail qui
-oriente : tous les paquets font 122 octets, dans les deux sens, dix fois de
-suite. Ce n'est pas une conversation qui progresse puis échoue, c'est la même
-sonde répétée -- chacun émet, chacun reçoit, chacun jette.
+Les paquets circulent et le maillage ne conclut pas. Les deux consoles
+déclarent `STAT = 0` **dix secondes** après le premier paquet, à chaque fois --
+un délai fixe du titre, pas un aléa réseau.
 
-Deux explications tiennent, et aucune n'est tranchée :
+Quatre hypothèses ont été testées dans l'après-midi. **Les quatre sont
+mortes**, et c'est le résultat le plus utile de la journée : elles n'ont plus
+à être reprises.
 
-1. Les vingt octets d'`abOnline` du XNADDR ne sont pas réécrits, parce qu'on
-   ne sait pas les lire. Si l'association XNet s'en sert pour valider
-   l'expéditeur, l'adresse d'origine ne correspond plus à ce qu'annonce la
-   clé.
-2. Un désaccord de mode XNet entre les deux consoles. Le manifeste applique
-   `xnet_nosecure` et `xnet_bypass` au même rang que la redirection, mais le
-   plugin **refuse de patcher une image qu'il ne reconnaît pas** : une version
-   ou un TU différent ferait échouer ces patches-là en silence pendant que les
-   autres passent.
+**Le désaccord de mode XNet.** Le relais échantillonne les premiers octets de
+chaque pair. Deux consoles sans rapport ont envoyé la même sonde de 122
+octets, identique sauf deux octets vers la fin :
 
-L'expérience qui les sépare est un essai avec le relais désarmé. Échec
-identique : le relais est hors de cause. Symptôme différent : c'est la
-réécriture.
+    000000000C58760000000000800148CDF22BBA0300 C5BD 00
+    000000000C58760000000000800148CDF22BBA0300 A7C6 00
+
+Même dialecte, donc. Et `fifa14_dirtysock_mode_state.py` confirme sur le
+matériel : `+0x21A=0 +0x21D=1 +0x22C=0`, soit **nosecure complet**. Il n'y a
+rien à réparer chez personne.
+
+**La réécriture d'adresse.** Un essai avec `FIFA14_PEER_RELAY` désarmé donne
+`STAT = 0` au même délai. Les vingt octets d'`abOnline` qu'on ne réécrit pas
+ne sont donc pas ce qui casse le maillage.
+
+**`UGID` nul.** Les consoles envoient `SCG = (0, 0, 0)` et `TCG = (30722, 2,
+N)`. On y a vu une console qui sait nommer l'autre et pas elle-même, et on a
+rempli les trois `UGID` avec la forme qu'elle emploie. `SCG` est resté nul.
+Un `SCG` à zéro veut probablement dire « moi » par convention. Le changement
+est gardé -- il est plus juste que trois zéros de remplissage -- mais **aucun
+effet ne lui est attribué**.
+
+**Les paquets rejetés à la réception.** Le crochet de réception directe
+DirtySock (`fifa14_plain_recv_log_hook`) ne voit **aucune** réception de 122
+octets, y compris sur un essai où le relais a démontrablement livré dix
+paquets du pair. Mais ce crochet est posé sur le chemin qu'emprunte Blaze,
+qui est du TCP -- son silence ne prouve donc pas une perte, il peut aussi
+dire qu'on ne regarde pas au bon endroit.
+
+### Ce que la journée a établi sur les rôles
+
+Sur six appariements : **celui qui héberge émet vers le relais, celui qui
+rejoint reste souvent muet**. Ce n'est pas une console -- la même a émis en
+hébergeant et s'est tue en rejoignant, dans la même heure.
+
+Et un relais n'apprend les adresses que par les paquets reçus : un invité
+muet est donc **injoignable**, et les paquets de l'hôte s'accumulent en
+attente. Quand l'invité émet, en revanche, la livraison se fait dans les deux
+sens -- `relay_flushed`, dix paquets de chaque côté.
+
+### Un avertissement sur l'outillage
+
+`fifa14_plain_send_hook` **n'est pas une sonde passive**. Il contient une
+branche `local_ack` qui court-circuite certains envois selon le propriétaire
+de la socket, vestige d'une expérience antérieure. Posé le 23 août comme un
+simple journal, il a avalé quatre requêtes au redirecteur : la console
+affichait « les serveurs EA ne sont pas disponibles » pendant que le titre
+émettait des trames parfaitement formées. Lire le corps d'un outil avant de
+le poser, même quand son nom dit « log ».
+
+Le crochet de réception, lui, est bien passif : il n'écrit que dans son
+tampon.
+
+### La piste suivante
+
+Instrumenter le `recvfrom` **UDP**, celui du trafic de match. Trois adresses
+sont déjà connues du dépôt et n'ont pas encore été exploitées :
+
+    0x83C7DBF4   le thunk d'import recvfrom du titre
+    0x81741C78   un export de réception de XAM
+    0x82D69ACC   la réception DirtySock, dans le titre
+
+`NetDll_WSARecvFrom` (0x81741D58) est écarté : aucun appel en 70 secondes.
+L'export `0x81741C78` n'a rien donné non plus, mais sur une fenêtre où aucune
+tentative de match n'a eu lieu -- donc à refaire.
+
+Contrainte : un localisateur à point d'arrêt fige le titre, et la fenêtre
+utile ne dure que dix secondes. Il faut donc **synchroniser** -- armer, puis
+enchaîner immédiatement le créer/rejoindre -- ou écrire un compteur passif à
+l'une de ces adresses plutôt qu'un point d'arrêt.

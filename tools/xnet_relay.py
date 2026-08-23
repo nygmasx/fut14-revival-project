@@ -154,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
     # début de la conversation, pas son milieu.
     waiting: dict[str, list[bytes]] = {}
     HELD = 16
+    # Les formes déjà échantillonnées : (adresse, taille).
+    sampled: set[tuple[str, int]] = set()
 
     def note(kind: str, **values: object) -> None:
         record = {
@@ -195,6 +197,20 @@ def main(argv: list[str] | None = None) -> int:
                  partner=pairs.of(source))
         seen_at[source] = now
         counts[source] = counts.get(source, 0) + 1
+
+        # Les premiers octets de chaque pair, une seule fois.
+        #
+        # Les deux consoles s'envoient dix sondes de 122 octets et se les
+        # jettent mutuellement. Si l'une parle XNet sécurisé et l'autre en
+        # clair, ça se lit ici et nulle part ailleurs : le relais est le seul
+        # point du montage qui voie les deux côtés. On ne journalise qu'un
+        # échantillon par pair et par taille, parce que le but est de
+        # comparer des formes, pas de capturer une session.
+        shape = (source, len(payload))
+        if shape not in sampled:
+            sampled.add(shape)
+            note("relay_sample", peer=source, bytes=len(payload),
+                 head=payload[:24].hex().upper())
 
         partner = pairs.of(source)
         if partner is None:
