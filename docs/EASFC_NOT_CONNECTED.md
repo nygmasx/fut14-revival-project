@@ -295,3 +295,78 @@ La chaîne est complète, des tuiles grisées jusqu'à un handle nul :
 
 Il n'y a plus d'hypothèse réseau à tester, et il n'y en a jamais eu. Ce qui
 reste est un champ à remplir, et l'identité de ce qui devrait le remplir.
+
+
+## Ce qui remplit `+0x3A90`, et pourquoi il est vide
+
+L'écriture existe, et elle échappait au balayage pour une raison bête : elle
+passe par un pointeur intérieur avec un déplacement de **zéro**. Chercher
+`std rX, 0x3A90(rY)` ne pouvait pas la trouver ; chercher l'immédiat 0x3A90
+sous n'importe quel opcode l'a trouvée du premier coup.
+
+```text
+0x8974906C  addi r29, r31, 0x3a90      r29 = &objet.minuteur
+0x89749080  bl   0x89721328            configure(&minuteur, durée, 0)
+0x89749084  ld   r11, 0x3a90(r31)
+0x89749088  cmpldi r11, 0
+0x8974908C  bne  -> 0x897490a0         déjà armé : on ne réarme pas
+0x89749098  mftb r11, 0x10c            le compteur de temps
+0x8974909C  std  r11, 0(r29)           <- l'armement
+```
+
+`+0x3A90` est donc un **horodatage d'armement**, pas un handle. Le petit objet
+embarqué s'étend au-delà : `+0x3AA8` est son échéance, soit `+0x3A90 + 0x18`.
+
+### Le minuteur n'a pas « jamais été armé » : il a expiré
+
+La branche d'état 2, lue en entier, dit autre chose que ce que j'avais compris
+d'abord :
+
+```text
+0x89768038  cmpwi  r11, 2              état == 2 ?
+0x89768040  ld     r11, 0x3a90(r31)    armé ?
+0x89768058  beq    -> sortie           non : on sort
+0x8976805C  mftb   r11, 0x10c          oui : maintenant
+0x89768060  ld     r10, 0x3aa8(r31)    l'échéance
+0x8976807C  beq    -> sortie           pas encore expirée : on sort
+0x89768084  stb    r29, 0x3a80(r31)    expiré : on lève un drapeau
+0x89768088  std    r30, 0x3a90(r31)    et on **désarme**
+0x89768090  std    r30, 0x3a98(r31)
+0x8976809C  bl     ...                 puis on émet un événement vers "fe"
+```
+
+Sur la console, les quatre champs racontent la fin de l'histoire :
+
+```text
++0x0080 = 2                l'attente de reconnexion
++0x3A80 = 1               <- le drapeau « échéance atteinte »
++0x3A90 = 0               <- désarmé par la ligne ci-dessus
++0x3A98 = 0
++0x3AA8 = 46689531059      l'échéance, périmée
+```
+
+Le minuteur **a tiré**. Il a levé son drapeau, s'est désarmé, et a émis son
+événement vers le front-end. Depuis, la branche d'état 2 sort à sa première
+condition, définitivement : plus rien ne peut se produire de ce côté.
+
+Le drapeau `+0x3A80` est lu par un accesseur, `0x89733F50` -- « une reconnexion
+est-elle due ? ». Il vaut 1, ce qui est très probablement pourquoi l'écran
+propose « CONNEXION AUX SERVEURS EAS FC ».
+
+### Où ça laisse le problème
+
+Le module n'est pas bloqué avant d'essayer : il a essayé une fois, à
+l'expiration de son minuteur, et l'essai n'a produit aucun `connect`. Puis il
+s'est mis dans un état d'où rien ne le sort tout seul.
+
+Les deux choses qui réarmeraient sont dans la même grande fonction,
+`0x89748A34..0x897494FC` : elle configure les minuteurs, lit toute la
+configuration `POW_*`, arme l'horodatage en `0x8974909C`, et met l'état à 1 en
+`0x897493A8`. Elle n'a **aucun appelant direct** dans le module -- elle est
+atteinte par table virtuelle -- et son adresse n'apparaît dans aucune des trois
+sections sorties. Trouver son entrée de vtable est le prochain fil.
+
+L'autre question, jumelle : ce que fait le bouton. Il est proposé parce que
+`+0x3A80` vaut 1 ; son action ne remet ni l'état ni l'horodatage, puisque les
+deux sont inchangés après l'appui. Un crochet sur `0x89748A34` répondrait aux
+deux d'un coup -- appelé ou non appelé.
