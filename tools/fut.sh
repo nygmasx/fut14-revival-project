@@ -5,8 +5,7 @@
 #   tools/fut.sh --patch    apply the menu patch only (title already up)
 #   tools/fut.sh --server   restart the server only
 #
-# Nothing to type in the middle of it. From a console on the dashboard to a
-# patched title takes about half a minute.
+# From a console on the dashboard to a patched title takes about half a minute.
 #
 # Entering FUT needs two runtime patches and they are not interchangeable:
 #
@@ -27,9 +26,21 @@
 set -u
 
 REPO=${REPO:-~/Downloads/fifa14-fut-stable/fifa14-fut-offline-revival}
+
+# Which exploit this console runs, because it decides how the title is started.
+#
+#   rgh      the NAND is patched, so a reboot comes back patched. The Mac can
+#            drive the whole thing: `magicboot` to the dashboard, then
+#            `--launch-title`. Nothing to press.
+#   softmod  BadUpdate. A reboot takes the patched hypervisor with it -- no
+#            XBDM, no Dashlaunch, and the Mac has lost the console until
+#            somebody re-runs the exploit by hand. So we never reboot: we ask
+#            for the dashboard and wait, and the title is launched from Aurora
+#            while the launcher sits armed on `modload`.
+CONSOLE_MOD=${CONSOLE_MOD:-rgh}
 PY="$REPO/.venv/bin/python"
 
-cd "$REPO" || { print -u2 "repo introuvable: $REPO"; exit 1 }
+cd "$REPO" || { print -u2 "repo not found: $REPO"; exit 1 }
 
 # Where the server is, and which console to drive, come from
 # `fifa14revival.ini` -- see `tools/revival_config.py` for the format and
@@ -55,7 +66,7 @@ TITLE=${TITLE:-$(config console.title)}
 CORE_PORT=${CORE_PORT:-$(config server.core_port)}
 IDENTITY_PORT=${IDENTITY_PORT:-$(config server.identity_port)}
 
-[[ -n $MAC && -n $XBOX ]] || { print -u2 "configuration illisible -- voir fifa14revival.example.ini"; exit 1 }
+[[ -n $MAC && -n $XBOX ]] || { print -u2 "unreadable configuration -- see fifa14revival.example.ini"; exit 1 }
 
 step() { print "\n== $1" }
 fail() { print -u2 "\n!! $1"; exit 1 }
@@ -69,7 +80,7 @@ fail() { print -u2 "\n!! $1"; exit 1 }
 # kept. If nothing ever arrives on either, the module does not call connect at
 # all, which is worth knowing for certain.
 start_server() {
-    step "serveur"
+    step "server"
     print '{}' > runtime/local-account.json
     pkill -f "server/fifa14_blaze_server.py" 2>/dev/null
     pkill -f "fut-patch-watch" 2>/dev/null
@@ -84,21 +95,21 @@ start_server() {
         >> runtime/server.log 2>&1 &
     sleep 4
     if ! pgrep -f "server/fifa14_blaze_server.py" >/dev/null; then
-        fail "le serveur n'a pas démarré -- voir runtime/server.log"
+        fail "the server did not start -- see runtime/server.log"
     fi
-    print "   démarré, journal $journal"
+    print "   started, journal $journal"
 }
 
-# magicboot behaves differently depending on what is already running:
+# Which title is running right now, according to XBDM.
 #
-#   from the dashboard   FIFA starts
-#   with FIFA running    the console reboots to the dashboard instead
+# Used for two things: deciding whether to ask for a return to the dashboard
+# before arming, and telling a console sitting at the dashboard apart from one
+# that already has FIFA in memory -- re-entering FUT needs a full relaunch,
+# since the title keeps its FUT session and rewrites the account state within
+# seconds of the file being cleared.
 #
-# So launching on top of a running title -- which is exactly what you reach for
-# when the FUT frontend has hung -- costs a reboot and lands nowhere. Worse,
-# the reboot drops XBDM mid-command, the launcher reports "XBDM closed the
-# connection", and that reads as a dead console when it is a healthy one twelve
-# seconds from the dashboard.
+# Historical note: this script used to send `magicboot` here. On a softmod that
+# is exactly the wrong move -- see `await_dashboard` below.
 running_title() {
     "$PY" - "$XBOX" <<'PY' 2>/dev/null
 import sys
@@ -113,12 +124,64 @@ except Exception:
 PY
 }
 
-# Bare `magicboot`, which returns to the dashboard. Not `magicboot cold`: that
-# took this console off the network entirely on 12 August and it needed the
-# power button.
-reboot_to_dashboard() {
+# Is XBDM answering at all?
+#
+# On a softmod this is the question that matters, and it has to be asked before
+# anything else: a reboot returns the console to stock, so XBDM does not fail
+# by refusing a command -- it fails by not being there. Without this check the
+# first symptom is a patcher timing out several minutes in, which reads like a
+# broken patch rather than an unexploited console.
+xbdm_up() {
     "$PY" -c "
 import socket, sys
+try:
+    s = socket.create_connection(('$XBOX', 730), timeout=5)
+    s.recv(256)
+    s.close()
+except Exception:
+    sys.exit(1)
+" >/dev/null 2>&1
+}
+
+require_xbdm() {
+    xbdm_up && return 0
+    print -u2 "\n!! XBDM is not answering on $XBOX:730."
+    if [[ $CONSOLE_MOD == softmod ]]; then
+        print -u2 "   On a BadUpdate softmod this is normally one of three things:"
+        print -u2 "     - the console is off, or rebooted (the patches are volatile)"
+        print -u2 "     - the exploit has not been re-run since the last power-on"
+        print -u2 "     - xbdm.xex is not declared in launch.ini"
+    else
+        print -u2 "   On an RGH: the console is off, Dashlaunch is not loading"
+        print -u2 "   xbdm.xex, or another tool already holds the one debugger"
+        print -u2 "   connection this console serves."
+    fi
+    return 1
+}
+
+# Wait for the console to come back to the dashboard -- without `magicboot`.
+#
+# The original version sent `magicboot` to get there itself. On an RGH that is
+# free: the NAND is patched, so the console reboots patched. On a BadUpdate
+# softmod a reboot **takes the patched hypervisor with it** -- there is no XBDM
+# and no Dashlaunch on the way back, and the Mac has lost the console for good
+# until somebody re-runs the exploit by hand.
+#
+# So we do not reboot. We ask, and we wait. `magicboot cold` stays forbidden
+# for the original reason: it took this console off the network on 12 August
+# and it needed the power button.
+await_dashboard() {
+    if [[ $CONSOLE_MOD == softmod ]]; then
+        print "   Quit FIFA and return to the dashboard (Aurora)."
+    else
+        # This console auto-boots FIFA from the dashboard, so "quit the title
+        # and run me again" is advice nobody can follow: by the time anyone
+        # looks, the title is back. Bare `magicboot`, never `magicboot cold` --
+        # cold took this console off the network on 12 August and it needed the
+        # power button.
+        print "   FIFA is running -- returning to the dashboard"
+        "$PY" -c "
+import socket
 try:
     s = socket.create_connection(('$XBOX', 730), timeout=8)
     s.recv(256)
@@ -127,50 +190,64 @@ try:
 except Exception:
     pass
 " >/dev/null 2>&1
+    fi
     local waited=0
-    while [ $waited -lt 200 ]; do
+    while [ $waited -lt 300 ]; do
         sleep 5
         waited=$((waited + 5))
+        xbdm_up || { print -u2 "   XBDM has gone -- did the console reboot?"; return 1 }
         case "$(running_title)" in
-            *dash.xex*) return 0 ;;
+            *dash.xex*|*aurora*|*Aurora*) return 0 ;;
         esac
     done
-    print -u2 "   le dashboard n'est pas revenu"
+    print -u2 "   still not at the dashboard after five minutes"
     return 1
 }
 
 launch_title() {
-    step "lancement du titre"
+    step "launching the title"
+    require_xbdm || return 1
     case "$(running_title)" in
         *FIFA*|*fifa*)
-            # This console auto-boots FIFA from the dashboard, so "quit the
-            # title and run me again" is advice nobody can follow: by the time
-            # anyone looks, the title is back. Reboot and launch into the gap
-            # instead. The server is already up by now, which is what makes the
-            # gap wide enough to land in.
-            print "   FIFA tourne déjà -- reboot, puis lancement immédiat"
-            reboot_to_dashboard || return 1
+            print "   FIFA is already running."
+            await_dashboard || return 1
             ;;
     esac
+    # `--launch-title` sends `magicboot title=...`, which reboots. On an RGH
+    # the console comes back patched and the launcher catches the title on the
+    # way up; on a softmod it comes back **stock**, and the patcher that
+    # follows would be writing into a console that is no longer listening.
+    #
+    # Without the option the launcher hooks XBDM's `modload` notification and
+    # waits -- the same instant, before any game code runs, whoever pressed the
+    # button. That is the softmod path, and it needs a human at the console.
+    local launch=(--launch-title "$TITLE")
+    if [[ $CONSOLE_MOD == softmod ]]; then
+        launch=()
+        # Said before the run, not during: the launcher's own "Waiting for
+        # default.xex" line is swallowed by the command substitution below and
+        # does not reach the screen until the whole step is over.
+        print "   Launch FIFA 14 from Aurora now -- the launcher is armed and silent."
+    fi
     local out
     out=$("$PY" tools/fifa14_early_local_server.py "$XBOX" \
         --local-ip "$MAC" --identity-port "$IDENTITY_PORT" \
-        --timeout 900 --launch-title "$TITLE" \
+        --timeout 900 "${launch[@]}" \
         --redirector-transport plaintext --redirect-fut-resource 2>&1 | tail -2)
     print "$out" | sed 's/^/   /'
     # Without these the console never reaches this server at all, and the game
-    # says only "connectez-vous a Xbox Live et aux serveurs EA" -- which names
-    # neither the patch nor the step that failed.
+    # says only "you must be signed in to Xbox Live and the EA servers" -- which
+    # names neither the patch nor the step that failed.
     case "$out" in
         *"hostnames preserved"*) ;;
         *) return 1 ;;
     esac
     # The EAS FC session is a second Blaze connection, from powdllzf, to
     # endpoints the launch patch above does not touch -- so the client resolves
-    # them for real, reaches nothing, and the menu eventually says "Vous avez
-    # perdu la connexion avec les serveurs EA". powdllzf is not mapped yet at
-    # this point, so the patcher polls for it.
-    step "endpoints EAS FC"
+    # them for real, reaches nothing, and the menu eventually says it has lost
+    # the connection to the EA servers. powdllzf is not mapped yet at this
+    # point, so the patcher polls for it.
+    step "EAS FC endpoints"
     "$PY" tools/fifa14_easfc_endpoint_patch.py "$XBOX" --local-ip "$MAC" \
         --core-port "$CORE_PORT" --identity-port "$IDENTITY_PORT" \
         --timeout 90 2>&1 | sed 's/^/   /'
@@ -243,6 +320,21 @@ start_watch() {
         misses=0
         dry=0
         while [ \$dry -lt $WATCH_GIVE_UP ]; do
+            # Stop as soon as FUT is entered, rather than counting failures.
+            #
+            # Once Ultimate Team is open the APT is freed for good: the watcher
+            # can no longer find anything, but it carries on sweeping the heap
+            # in 4 MB blocks over XBDM -- while the console is being played.
+            # Measured 15 August 2026: slow menus and a slow pack animation,
+            # both back to normal the second this process was killed. Counting
+            # twenty failures is four to eight minutes of that.
+            #
+            # The journal is the oracle, as everywhere else here: the first FUT
+            # route served says the title is inside, in its own words.
+            if grep -ql 'fut_route_request\|/ut/auth' \"\$(ls -t runtime/live-easw-*.jsonl 2>/dev/null | head -1)\" 2>/dev/null; then
+                print \"\$(date +%T) FUT entered -- watcher stopped\"
+                break
+            fi
             if [ \$misses -ge $WATCH_MISSES ]; then
                 out=\$('$PY' tools/fifa14_tu3_helperfunctions_runtime_patch.py '$XBOX' --timeout 20 --chunk-size $WATCH_SWEEP_CHUNK 2>&1 | tail -1)
                 misses=0
@@ -256,16 +348,16 @@ start_watch() {
             esac
             sleep $WATCH_INTERVAL
         done
-        print \"\$(date +%T) APT introuvable, surveillance arrêtée\"
+        print \"\$(date +%T) APT not found, watcher stopped\"
     " >> "$WATCH_LOG" 2>&1 &
-    print "   surveillance du patch active (voir $WATCH_LOG)"
+    print "   patch watcher active (see $WATCH_LOG)"
 }
 
 # The first patch of a run: poll the hinted window until the APT shows up.
 # start_watch keeps it applied afterwards, which is the part that matters --
 # the title loads helperFunctions again and the first patch does not survive.
 await_patch() {
-    step "patch helperFunctions (automatique)"
+    step "helperFunctions patch (automatic)"
     local out deadline
     deadline=$(( $(date +%s) + HINT_GRACE ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -278,12 +370,12 @@ await_patch() {
     done
     # The heap moved, or this console has no remembered address yet. The title
     # is past the splash by now, so the sweep is safe.
-    print "   la fenêtre hintée n'a rien donné, balayage complet"
+    print "   the hinted window found nothing, doing a full sweep"
     apply_patch
 }
 
 apply_patch() {
-    step "patch helperFunctions"
+    step "helperFunctions patch"
     local out
     out=$("$PY" tools/fifa14_tu3_helperfunctions_runtime_patch.py "$XBOX" \
         --timeout 540 --chunk-size 0x800000 2>&1 | tail -1)
@@ -302,19 +394,25 @@ release_pad() {
 }
 
 case "${1:-}" in
+    # `--server` does not touch the console: it has to work with the Xbox off,
+    # which is how the Mac side gets checked on its own.
     --server) start_server; exit 0 ;;
-    --patch)  apply_patch; release_pad; exit 0 ;;
+    # `--patch` does write into the title's memory. Without this guard an
+    # unreachable console costs the patcher's full 540-second timeout before
+    # anything is said -- and that silence reads like a patch that will not
+    # take, when it is a console that is not there.
+    --patch)  require_xbdm || exit 1; apply_patch; release_pad; exit 0 ;;
     # Same as the full run. Kept because it is the spelling this project is
     # used to typing; the patch applies on its own either way.
     --launch)
         start_server
-        launch_title || fail "les correctifs de lancement n'ont pas pris"
+        launch_title || fail "the launch patches did not take"
         release_pad
-        await_patch || fail "le patch n'a pas pris -- n'entre pas dans FUT"
+        await_patch || fail "the patch did not take -- do not enter FUT"
         start_watch
         print "\n=========================================="
-        print " PRÊT. Titre lancé et patché, manette à toi."
-        print " Tu peux entrer dans Ultimate Team."
+        print " READY. Title launched and patched."
+        print " You can enter Ultimate Team."
         print "=========================================="
         exit 0
         ;;
@@ -328,12 +426,12 @@ esac
 # memory sweep running against the splash. None of it was ever necessary:
 # await_patch waits for the APT itself rather than for a screen.
 start_server
-launch_title || fail "les correctifs de lancement n'ont pas pris -- la console n'atteindra pas le serveur"
+launch_title || fail "the launch patches did not take -- the console will not reach the server"
 release_pad
-await_patch || fail "le patch n'a pas pris -- n'entre pas dans FUT, relance tools/fut.sh"
+await_patch || fail "the patch did not take -- do not enter FUT, re-run tools/fut.sh"
 start_watch
 
 print "\n=========================================="
-print " PRÊT. Rien à faire, tout est en place."
-print " Entre dans Ultimate Team quand tu veux."
+print " READY. Nothing to do, everything is in place."
+print " Enter Ultimate Team whenever you like."
 print "=========================================="

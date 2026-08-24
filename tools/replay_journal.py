@@ -28,6 +28,7 @@ import http.client
 import io
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 from collections import Counter
@@ -82,18 +83,40 @@ def requests_in(path: Path):
 #   400 on an apply  a consumable the replayed club does not own, or a
 #                    goalkeeper style aimed at an outfield player
 #   409 on a pack    bought with coins a fresh club has not got
+#   400 on a squad   delete aimed at the squad the replayed club is fielding.
+#                    A replay rebuilds the club from the seed, so squad 1 is
+#                    active here whatever was active in the recorded session --
+#                    the console that sent this had squad 3 active and the
+#                    request was legitimate.
 EXPECTED = {
     ("GET", "/tutorials"): {404},
 }
+
+SQUAD_DELETE = re.compile(r"^/ut/delete/game/fifa14/squad/\d+$")
+# `GET /trade/<id>/offer`, the View Offer screen. A 404 here is deliberate: the
+# offer document's shape is unknown, and the one guess tried -- the single-
+# auction status document -- froze the console. A recoverable dead button beats
+# a power cycle until the shape is found. See docs/TRADE_PILE.md.
+TRADE_OFFER = re.compile(r"^/ut/game/fifa14/trade/\d+/offer$")
+# The trophy art lives on the disc, in cards0.big. A 404 here is deliberate:
+# answering 200 with an empty BIGF told the client the art existed and was
+# empty, and no cup ever drew a trophy. See docs/TOURNAMENT_IDS.md.
+TROPHY_ARCHIVE = re.compile(r"^/fut/items/images/.*\.big$")
 
 
 def expected(method: str, target: str, status: int) -> bool:
     path = target.split("?")[0]
     if status in EXPECTED.get((method, path), set()):
         return True
+    if status == 404 and method == "GET" and TRADE_OFFER.match(path):
+        return True
+    if status == 404 and method == "GET" and TROPHY_ARCHIVE.match(path):
+        return True
     if status == 400 and "/ut/game/fifa14/item/" in path:
         return True
     if status == 409 and path.endswith("/purchased/items"):
+        return True
+    if status == 400 and SQUAD_DELETE.match(path):
         return True
     return False
 

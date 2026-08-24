@@ -665,12 +665,21 @@ class ProtocolTests(unittest.TestCase):
 
 
 class MatchEndTests(unittest.TestCase):
-    def test_the_destroy_response_carries_its_three_members(self) -> None:
-        # FutDestroyMatchServerResponse has exactly myMatchStats,
-        # opponentMatchStats and matchData -- all three in CardsDLL's name
-        # table. This route answered {}, a document the parser can read and
-        # find nothing in. Nothing else goes out: a sibling build records its
-        # client disconnecting after parsing an oversized destroy response.
+    def test_the_destroy_response_carries_the_award_scalars(self) -> None:
+        # This replaces `test_the_destroy_response_carries_its_three_members`,
+        # which held the reply to exactly myMatchStats, opponentMatchStats and
+        # matchData -- the first two as empty *strings*.
+        #
+        # That restriction was deliberate and temporary: the scalars were not
+        # to go out until a real match end from this console had been read,
+        # because a frontend that hangs after a won final is worse than an
+        # award screen showing zeroes. Four have now been read -- a Cup 2 run
+        # played to the final and won on 16 August 2026, 6 349 coins credited
+        # across four matches, and the player shown none of it.
+        #
+        # The stats are echoed rather than invented: the twelve members the
+        # client itself submitted, returned as integers. An empty string where
+        # the parser expects a stat block is what rendered the zeroes.
         with tempfile.TemporaryDirectory() as temp:
             journal = SERVER.Journal(Path(temp) / "journal.jsonl")
             identity = SERVER.IdentityHttpService(
@@ -690,11 +699,17 @@ class MatchEndTests(unittest.TestCase):
                 body = __import__("json").loads(response.read())
                 client.close()
 
-                self.assertEqual(
+                self.assertLessEqual(
+                    {"myMatchStats", "opponentMatchStats", "matchData", "endReason"},
                     set(body),
-                    {"myMatchStats", "opponentMatchStats", "matchData"},
                 )
                 self.assertEqual(body["matchData"], "QUJD")
+                # The stat blocks are objects now, not empty strings, and every
+                # member the client submits comes back as an integer.
+                for block in ("myMatchStats", "opponentMatchStats"):
+                    self.assertIsInstance(body[block], dict)
+                    self.assertIn("goals", body[block])
+                    self.assertIsInstance(body[block]["goals"], int)
             finally:
                 identity.stop()
 

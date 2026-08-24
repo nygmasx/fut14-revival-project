@@ -60,6 +60,10 @@ work/
 
 # La configuration locale porte une adresse de LAN ; le modèle est versionné.
 fifa14revival.ini
+.DS_Store
+work/club-item-probe.json
+runtime/sold-pile-strategy.txt
+runtime/unlisted-shape.txt
 
 # Paquet serveur assemblé pour un déploiement
 fifa14-revival-server.tgz

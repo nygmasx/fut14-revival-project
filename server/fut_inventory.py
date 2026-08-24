@@ -181,34 +181,433 @@ def _cards_by_asset() -> dict[int, dict]:
 # Kit, badge, stadium and ball. Without these the club has nothing to present
 # and the match cannot dress either side. Asset ids are the retail defaults the
 # PC revival also uses.
-PRESENTATION_ACTIVES = [
-    {"id": 1700000001, "assetId": 14, "resourceId": 6300000, "rating": 0,
-     "itemType": "kit", "itemState": "activeHomeKit"},
-    {"id": 1700000002, "assetId": 15, "resourceId": 6400001, "rating": 0,
-     "itemType": "kit", "itemState": "activeAwayKit"},
-    {"id": 1700000003, "assetId": 241, "resourceId": 6000000, "rating": 0,
-     "itemType": "badge", "itemState": "activeBadge"},
-    {"id": 1700000004, "assetId": 6, "resourceId": 6200004, "rating": 0,
-     "itemType": "stadium", "itemState": "activeStadium"},
-    {"id": 1700000005, "assetId": 23, "resourceId": 8120091, "rating": 0,
-     "itemType": "ball", "itemState": "activeBall"},
+# What a badge calls itself on the wire.
+#
+# Not `badge`. The PC revival files them under the retail `custom` family --
+# "badges through the retail `custom` family used by My Club statistics" -- and
+# its My Club draws them. Ours sent `badge` and drew the grey placeholder a
+# club shows for a card it cannot resolve, reported from the console on
+# 16 August 2026 for badges and kits alike.
+BADGE_WIRE_TYPE = "custom"
+
+# What the club-search screen calls a thing -> what it is called on the wire.
+# Only badges differ, and only because `custom` is what renders.
+CLUB_SEARCH_TYPES = {"badge": BADGE_WIRE_TYPE}
+
+
+# What a new club owns: the five items it presents with, and nothing more.
+#
+# The Barcelona badge is here so it can be chosen, but it is NOT the club's
+# default crest -- see PRESENTATION_ACTIVES.
+# Only the badge. The home kit, away kit, stadium and ball are already owned --
+# `PRESENTATION_ACTIVES` puts them in the club, which is what dresses it -- and
+# seeding them again gave the player two of each.
+#
+# The badge is here because the club no longer wears one by default, so without
+# this there would be no crest to choose.
+CLUB_STARTER_ITEMS = [
+    ("badge", 241, 6_000_000),   # FC Barcelona
 ]
 
 
-def _presentation_items() -> list[dict]:
+PRESENTATION_ACTIVES = [
+    {"id": 1700000001, "assetId": 14, "resourceId": 6300000, "rating": 84,
+     "itemType": "kit", "itemState": "activeHomeKit", "rareflag": 1,
+     "category": 0, "teamkittypetechid": 0},
+    {"id": 1700000002, "assetId": 15, "resourceId": 6400001, "rating": 84,
+     "itemType": "kit", "itemState": "activeAwayKit", "rareflag": 1,
+     "category": 0, "teamkittypetechid": 1},
+    # No active badge.
+    #
+    # This slot used to carry FC Barcelona at resource 6000000, so every new
+    # club wore Barcelona's crest and the player had no way to tell the default
+    # from a choice. Leaving the slot empty lets the client fall back to its own
+    # default, which is the FIFA 14 Ultimate Team crest -- what a real new club
+    # starts with, and an honest blank until the player picks.
+    #
+    # The Barcelona badge is still seeded and ownable, so choosing it is one
+    # activation away. If a club with no active badge turns out to present
+    # badly, put the entry back: it is a cosmetic slot, not a load-bearing one,
+    # and the kit, stadium and ball slots below are untouched.
+    {"id": 1700000004, "assetId": 6, "resourceId": 6200004, "rating": 84,
+     "itemType": "stadium", "itemState": "activeStadium", "rareflag": 1,
+     "category": 4, "stadiumid": 6, "StadiumId": 6},
+    {"id": 1700000005, "assetId": 23, "resourceId": 8120091, "rating": 84,
+     "itemType": "ball", "itemState": "activeBall", "rareflag": 1},
+]
+
+
+# Which `itemState` marks the active card of each club kind.
+#
+# `PUT /ut/game/fifa14/item/<id>` with `{"itemState":"active"}` is how the club
+# screen changes a stadium, badge, ball or kit -- journalled from the console on
+# 16 August 2026 while a player tried to move off Camp Nou. The same path with
+# an `apply` body is a consumable application, and this server matched the path
+# alone, so every stadium change was answered "item is not a consumable" and the
+# screen said the FIFA servers could not be reached.
+ACTIVE_STATES = {
+    "stadium": "activeStadium",
+    "badge": "activeBadge",
+    BADGE_WIRE_TYPE: "activeBadge",
+    "ball": "activeBall",
+    "kit": "activeHomeKit",
+}
+
+# Every state that marks a card as the club's active one, the away kit
+# included -- `ACTIVE_STATES` maps a kind to the slot activation puts it in,
+# and a kit has two slots but only one of them is reachable that way.
+ACTIVE_STATE_VALUES = set(ACTIVE_STATES.values()) | {"activeAwayKit"}
+
+
+def activate_item(
+    inventory: "ClubInventory", item_id: int,
+    actions: "CardActions | None" = None,
+) -> dict | None:
+    """Make one club item the active stadium, badge, ball or kit.
+
+    Returns the item, or None if it cannot be found at all or its kind has no
+    active slot -- a player card has none.
+
+    With `actions` it also looks in the purchased pile and the transfer list,
+    and moves the card into the club before activating it. Activating a card
+    is keeping it.
+
+    The previously active card of the same kind goes back to `free`. A club has
+    one stadium, and leaving two marked active is how a screen picks whichever
+    it met first.
+
+    Kits are the one ambiguity. There are two slots, home and away, and the
+    body observed carries only `active` -- so a kit with no slot named lands in
+    the home slot. If the console is ever seen sending `activeAwayKit` the
+    request's own value is honoured first, below, and this note can go.
+    """
+    target = next(
+        (item for item in inventory.items if int(item.get("id") or 0) == int(item_id)),
+        None,
+    )
+    if target is None and actions is not None:
+        # A card straight out of a pack, still in New Items. The club screen
+        # offers Make Active there and the console sends the same PUT, and this
+        # only ever searched the club -- so activating a kit you had just packed
+        # failed, and the 400 that came back ejected the player from Ultimate
+        # Team entirely.
+        #
+        # Activating a card is keeping it, so it moves into the club first
+        # rather than being activated where it sits and lost on the next save.
+        for pool in (actions.shop.pending, actions.transfer):
+            for held in list(pool):
+                if int(held.get("id") or 0) == int(item_id):
+                    actions.move(
+                        {"itemData": [{"id": item_id, "pile": PILE_CLUB}]}
+                    )
+                    target = next(
+                        (
+                            item
+                            for item in inventory.items
+                            if int(item.get("id") or 0) == int(item_id)
+                        ),
+                        None,
+                    )
+                    break
+            if target is not None:
+                break
+    if target is None:
+        return None
+    kind = str(target.get("itemType") or "")
+    state = ACTIVE_STATES.get(kind)
+    if not state:
+        return None
+    for item in inventory.items:
+        if item is not target and item.get("itemState") == state:
+            item["itemState"] = "free"
+    target["itemState"] = state
+    return target
+
+
+def squad_manager(inventory: "ClubInventory | None" = None) -> list[dict]:
+    """What the squad document says sits in the manager slot.
+
+    Empty by default, which is what the PC revival serves on its active squad
+    and what this server has always served. A manager is not required to field
+    a side -- `docs/FUT_CLUB_INVENTORY.md` establishes that -- and the club's
+    own manager cards carry resource ids invented in this file (6100000 and
+    up), because no table in `cards_ng_db` or `fifa_ng_db` names a real one.
+    The PC revival reached the same place independently and disabled manager
+    emission outright: "resource IDs are not verified against this PC build".
+
+    `FIFA14_SQUAD_MANAGER=1` puts the club's first manager card in the slot
+    instead. It exists because a player watching a single-player tournament
+    hang on a black screen noticed he had no manager, and that is a question
+    worth answering rather than arguing about.
+
+    Off by default, and it should stay off unless it is being tested. An
+    invented asset id in the squad document is precisely the shape that can
+    make the squad screen reject the whole response rather than the one item,
+    which would cost more than the manager slot is worth.
+    """
+    if os.environ.get("FIFA14_SQUAD_MANAGER", "").strip().lower() not in {"1", "true", "yes"}:
+        return []
+    club = inventory if inventory is not None else INVENTORY
+    for item in getattr(club, "items", []):
+        if item.get("itemType") == "manager":
+            return [item]
+    return []
+
+
+def _presentation_items(inventory: "ClubInventory | None" = None) -> list[dict]:
+    """The kit, badge, stadium and ball the club actually presents.
+
+    This used to return `PRESENTATION_ACTIVES` verbatim -- five hardcoded cards
+    with FC Barcelona's crest baked in at asset 241 -- on every squad load. So
+    `activate_item` worked, the club screen agreed, the item really did become
+    `activeBadge`, and the club header went on showing Barcelona forever,
+    because the header reads this list and this list had never heard of the
+    club. The console asks for `squad/active` immediately after every
+    activation, which is how the two were seen to disagree.
+
+    The club's own active card wins per slot. The hardcoded entry is a fallback
+    for a slot nothing fills, not a default that outranks the player.
+    """
+    # Called with no club while the club is still being built -- this is what
+    # seeds the five defaults in the first place -- and with one thereafter.
+    chosen: dict[str, dict] = {}
+    for item in getattr(inventory, "items", []):
+        state = str(item.get("itemState") or "")
+        if state in ACTIVE_STATE_VALUES:
+            chosen.setdefault(state, item)
+
     items = []
-    for base in PRESENTATION_ACTIVES:
-        item = dict(base)
+    # The badge slot has no default: a club with no badge chosen presents none,
+    # and the client draws its own FIFA 14 Ultimate Team crest. But the slot
+    # still has to exist once a badge IS chosen -- dropping it from this list
+    # outright meant activation worked, the club agreed, and the header went on
+    # showing the FUT crest forever with no way to ever change it.
+    slots = list(PRESENTATION_ACTIVES)
+    active_badge = chosen.get("activeBadge")
+    if active_badge is not None:
+        slots.append(active_badge)
+
+    for base in slots:
+        item = dict(chosen.get(str(base["itemState"]), base))
+        item["itemState"] = base["itemState"]
         item.update(
             {
                 "discardValue": 0,
                 "lastSalePrice": 0,
-                "timestamp": 1,
+                "timestamp": issued_now(),
                 "untradeable": True,
             }
         )
         items.append(item)
     return items
+
+
+def issued_now() -> int:
+    """When a card came into the club, as the client's card detail reads it.
+
+    Every item shipped `"timestamp": 1` -- one second past the Unix epoch --
+    so every card in the game, however it was obtained, was issued on
+    **1 January 1970**. It is one of those fields nothing reads back on the
+    server, so nothing here ever noticed; the console prints it.
+
+    Called at build time rather than baked in as a constant, so a card carries
+    the moment it was actually drawn, bought or seeded.
+    """
+    return int(time.time())
+
+
+# What a quick sell pays.
+#
+# The value used to be `max(10, (rating - 40) ** 2 // 20)` -- a curve invented
+# here, whose only input was the rating. It paid 101 coins for an 85 whatever
+# the card was, so a Team of the Week and a common gold of the same rating were
+# worth the same, and both were worth a fraction of retail.
+#
+# These are FIFA 14's published values. Each tier states a rating span and, for
+# each class of card, the value at both ends of it; a card is interpolated
+# across the span. Retail's own tables are ranges rather than single numbers
+# for the same reason: a 75 and a 99 are both gold.
+#
+# The class comes from `rareflag` -- 0 on an ordinary card, 1 on a rare one, and
+# something else on every special (3 Team of the Week, 11 Team of the Season,
+# 12 Legend, 14 World Cup; see `server/fifa14_cards.json`). Every in-form shares
+# one value regardless of which family it belongs to, which is retail behaviour
+# and not a simplification made here.
+QUICK_SELL_PLAYER = (
+    #  rating span   ordinary       rare           in-form
+    ((40, 64), (12, 19), (30, 48), (800, 1280)),
+    ((65, 74), (98, 111), (228, 259), (4550, 5180)),
+    ((75, 99), (300, 396), (600, 792), (9150, 12078)),
+)
+
+# Contracts, fitness, healing, training. Positioning (38) and chemistry styles
+# (67) are gold-only and land inside the gold span anyway.
+QUICK_SELL_CONSUMABLE = (
+    ((0, 64), (3, 12)),
+    ((65, 74), (13, 37)),
+    ((75, 99), (32, 67)),
+)
+
+
+def _interpolate(span: tuple[int, int], ends: tuple[int, int], rating: int) -> int:
+    """One value from a band's two ends, by where the rating falls in the span."""
+    low, high = span
+    start, stop = ends
+    if high <= low:
+        return start
+    ratio = (min(max(rating, low), high) - low) / (high - low)
+    return int(round(start + (stop - start) * ratio))
+
+
+def discard_value(rating: int, rareflag: int = 0) -> int:
+    """What a quick sell pays for one player card."""
+    rating = int(rating or 0)
+    if rating <= 0:
+        return 0
+    for span, ordinary, rare, inform in QUICK_SELL_PLAYER:
+        if span[0] <= rating <= span[1]:
+            if rareflag not in (0, 1):
+                return _interpolate(span, inform, rating)
+            return _interpolate(span, rare if rareflag else ordinary, rating)
+    # Outside every stated span -- clamp to the nearest one rather than return
+    # nothing. A card the table does not describe is still a card.
+    span, ordinary, rare, inform = (
+        QUICK_SELL_PLAYER[-1] if rating > QUICK_SELL_PLAYER[-1][0][1] else QUICK_SELL_PLAYER[0]
+    )
+    if rareflag not in (0, 1):
+        return _interpolate(span, inform, rating)
+    return _interpolate(span, rare if rareflag else ordinary, rating)
+
+
+def consumable_discard_value(rating: int) -> int:
+    """What a quick sell pays for one consumable."""
+    rating = int(rating or 0)
+    for span, ends in QUICK_SELL_CONSUMABLE:
+        if span[0] <= rating <= span[1]:
+            return _interpolate(span, ends, rating)
+    return QUICK_SELL_CONSUMABLE[-1][1][1]
+
+
+# What each of the five stat slots means, settled on the console 17 August 2026.
+#
+# Distinct sentinels were written into every slot and one player bio named the
+# whole mapping at a glance -- 11/22/33/44/55 in `statsList`, 61..65 in
+# `lifetimeStats`, and the screen came back:
+#
+#     Games Played   61 ( 50 / 11 )
+#     Goals scored   62 ( 40 / 22 )
+#     Assists         0 (  0 /  0 )
+#     Yellow Cards   63 ( 30 / 33 )
+#     Red Cards      64 ( 20 / 44 )
+#
+# So `lifetimeStats[i]` is the total, `statsList[i]` is the "Your Club" column,
+# and "Other Clubs" is *computed* as the difference -- 61-11=50, 62-22=40, and
+# so on. Assists is the exception: it ignores these arrays entirely and reads
+# the `assists` / `lifetimeAssists` members, which is why it was the only row
+# that ever worked.
+#
+# This is what `goals` needed. There is no `goals` member in CardsDLL's JSON
+# name table, so a goal could never reach that row by name; it goes in slot 1.
+STAT_SLOT_GAMES = 0
+STAT_SLOT_GOALS = 1
+STAT_SLOT_YELLOW = 2
+STAT_SLOT_RED = 3
+
+
+def style_value(index: int) -> int:
+    """What goes into `playStyle` for a chemistry style.
+
+    The member is settled -- id 382, read by the card parser at 0x891B2698 --
+    and the value is not. The label the card draws comes from the disc, through
+    the key `FUT_PLAYSTYLE_%d` (module 0x01FE28), so whatever goes in here is
+    the number that key is built from. No style names exist anywhere in
+    CardsDLL, which is why serving them as locstrings did nothing: the strings
+    are in the game's own localisation data.
+
+    `index` is the catalogue's own 0-18, from the row's `amount`. Writing that
+    produced BASIC, which is the "no play style" case -- so either the disc
+    numbers its styles differently, or 0-18 lands somewhere with no string.
+
+    **Settled from the code, 2026-08-17.** The parser does not store this
+    member: it passes the value through 0x891AE3F8 first, alone among the
+    members around it, and that function begins
+
+        addi   r11, r3, -0xfa      ; value - 250
+        cmplwi r11, 0x17           ; must be <= 23
+        bgt    ...                 ; otherwise abandon it
+
+    So the only values it accepts are **250-273** -- the subtype ids. The
+    catalogue's 0-18 and the 1-19 that followed both fell outside the range and
+    were discarded, which is why the card kept drawing BASIC: not a member the
+    client ignores, a value it rejects.
+
+    That range is also 24 slots against 19 outfield styles, and a goalkeeper's
+    five -- Basic, Wall, Shield, Cat, Glove -- account for the rest. **The GK
+    styles are 269-273**, a range neither this catalogue nor the PC revival's
+    contains.
+
+    `FIFA14_STYLE_VALUE` keeps the rejected encodings a relaunch away:
+
+        (default)  250-268, the card's own subtype id
+        index      0-18, the catalogue's numbering -- rejected by the range
+        offset1    1-19 -- likewise
+
+    A wrong value shows the wrong style name or none. Nothing is corrupted --
+    another style card overwrites it.
+    """
+    mode = os.environ.get("FIFA14_STYLE_VALUE", "").strip().lower()
+    if mode == "index":
+        return int(index)
+    if mode == "offset1":
+        return int(index) + 1
+    return CHEMISTRY_FIRST + int(index)
+
+
+def _stat_slots(*sentinels: int) -> list[dict]:
+    """Five index/value slots, zeroed unless the probe is armed.
+
+    `FIFA14_STAT_PROBE=1` puts a distinct sentinel in each one, which is how
+    the mapping above was read. Off, they start at zero and `sync_stat_slots`
+    fills them from the card's own counters.
+    """
+    probing = os.environ.get("FIFA14_STAT_PROBE", "").strip().lower() in {"1", "true", "yes"}
+    return [
+        {"index": index, "value": (sentinels[index] if probing else 0)}
+        for index in range(5)
+    ]
+
+
+def sync_stat_slots(card: dict) -> None:
+    """Publish a card's counters into the two arrays the bio reads.
+
+    `statsList` is what the club did and `lifetimeStats` is the career total.
+    Nothing here has a career before this club, so the two carry the same
+    number and the screen's computed "Other Clubs" column comes out at zero --
+    which is the truth for a card that has only ever played for you.
+
+    Yellow and red cards stay at zero: the client's match-end payload reports
+    fitness, goals and assists per player and says nothing about bookings, so
+    there is no honest number to put in those slots.
+    """
+    values = {
+        STAT_SLOT_GAMES: int(card.get("gamesPlayed") or 0),
+        STAT_SLOT_GOALS: int(card.get("goals") or 0),
+    }
+    for member in ("statsList", "lifetimeStats"):
+        slots = card.get(member)
+        if not isinstance(slots, list):
+            continue
+        for slot in slots:
+            if isinstance(slot, dict) and slot.get("index") in values:
+                slot["value"] = values[slot["index"]]
+
+
+# Which pile a card sits in. Defined here rather than beside the consumable
+# helpers because `_player_item` carries a pile on every card and its default
+# is evaluated at definition time.
+PILE_TRANSFER = 5
+PILE_PURCHASED = 6
+PILE_CLUB = 7
 
 
 def _player_item(
@@ -221,6 +620,7 @@ def _player_item(
     attributes: list[int],
     position: str,
     item_state: str = "free",
+    pile: int = PILE_CLUB,
     nation: int = 0,
     league: int = 0,
     rarity: str = "",
@@ -248,22 +648,107 @@ def _player_item(
         "injuryType": "none",
         "suspension": 0,
         "training": 0,
+        # `style`, not `playStyle`. Read out of CardsDLL's own JSON name
+        # table on 16 August 2026: `style` is at 0x02FEB0, next to
+        # `styleAttribMods`, and **`playStyle` is not in the table at all** --
+        # the `playStyle` string in the binary sits at 0x013A24 beside
+        # `GetPlayStyleData` and `PLAY_STYLE_ID`, which are native bindings and
+        # not wire members. So every chemistry style this server applied was
+        # written into a member the client never reads, which is why a card
+        # carrying Hunter still drew BASIC.
+        # `playStyle`, id 382 -- and the card parser genuinely reads it, at
+        # 0x891B2698, in the same sequential run as `preferredPosition` (383)
+        # and `lifetimeAssists` (267). Renaming this to `style` on 16 August
+        # was wrong: `style` is id 506 and **nothing in the module compares
+        # against it**, nor against `styleAttribMods` (507). The rename came
+        # from a name-table scan bounded to 0x02A000-0x031700, and this string
+        # lives at 0x013A24, outside that window -- the id table points at
+        # strings scattered across the whole module, not one block.
+        #
+        # `style` is still sent beside it. It costs nothing (no reader consumes
+        # it) and it keeps the two spellings together for whoever reads this.
         "playStyle": play_style,
+        # Basic is 250, not 0. The converter at 0x891AE3F8 takes 250-273 and
+        # abandons anything else, so a card built with the icebreaker's raw
+        # play-style number lands outside the range and is discarded. Every
+        # card starts on Basic unless a style card says otherwise.
+        "playStyle": (
+            int(play_style)
+            if CHEMISTRY_FIRST <= int(play_style or 0) <= CHEMISTRY_FIRST + 23
+            else CHEMISTRY_FIRST
+        ),
+        # Appearances. `gamesPlayed` is in the table (0x030BE0) and nothing
+        # here ever wrote it, so the bio read 0 matches for a player who had
+        # just won a cup.
+        "gamesPlayed": 0,
         # A quick sell pays this. Zero everywhere meant selling a card returned
         # nothing, which is also how the balance first showed up wrong.
-        "discardValue": max(10, (rating - 40) ** 2 // 20) if rating else 0,
+        "discardValue": discard_value(rating, rare),
+        # "Bought For" reads `-` and "Number Of Owners" reads 0 on a card that
+        # never names an owner, which is how every packed card looked. One
+        # owner and no sale price is what the bio renders as "First Owner".
+        "owners": 1,
         "lastSalePrice": 0,
-        "timestamp": 1,
+        "timestamp": issued_now(),
         "untradeable": True,
+        # Every card says which pile it is in. Kyro's canonical payload carries
+        # `pile` on every item; this server sent it only on a transfer-list
+        # entry, so a card the client had already cached from a pack or the club
+        # carried no pile at all -- and the standalone Transfer List screen,
+        # which offers "Press (A) to list this item", had nothing on the cached
+        # record to act against.
+        "pile": pile,
         "rareflag": rare,
         "cardsubtypeid": 1 if rare else 0,
         "assists": 0,
         "lifetimeAssists": 0,
+        # The aliases Kyro's canonical payload carries after the native block.
+        #
+        # `itemId` above all: every card in that build has both `id` and
+        # `itemId`, and this server sent only `id`. The standalone Transfer
+        # List screen renders such a card and reads its state -- it prints
+        # "This item is not currently listed" -- and then builds no action menu
+        # for it, which is what an unresolvable item id looks like from
+        # outside. `POST /auctionhouse` names the card as `itemData.id`, so
+        # nothing on the wire ever needed `itemId` before and its absence went
+        # unnoticed.
+        #
+        # The rest are the same shape: `rareFlag` and `teamId` are capitalised
+        # spellings of members already sent, `definitionId` and `playerId` are
+        # the base asset, and `morale`, `loyaltyBonus` and `resourceGameYear`
+        # are values the build sends on every card. Kyro's file warns that
+        # "FIFA 14's player parser is sensitive to this stream" and keeps the
+        # native-critical members first with these aliases after, which is the
+        # order kept here.
+        "itemId": item_id,
+        "teamId": team_id,
+        "rareFlag": rare,
+        "definitionId": asset_id,
+        "playerId": asset_id,
+        "morale": 99,
+        "loyaltyBonus": 1,
+        "resourceGameYear": 2014,
         "attributeList": [
             {"index": index, "value": value} for index, value in enumerate(attributes)
         ],
-        "statsList": [{"index": index, "value": 0} for index in range(5)],
-        "lifetimeStats": [{"index": index, "value": 0} for index in range(5)],
+        # The five index/value slots, and what they mean is unknown.
+        #
+        # The player bio has exactly five stat rows -- Games Played, Goals,
+        # Assists, Yellow Cards, Red Cards -- and these two arrays have exactly
+        # five entries each, which is suggestive and is not proof. What is
+        # certain is that **there is no `goals` member in CardsDLL's JSON name
+        # table** (checked 16 August 2026 against the module itself), so the
+        # goals a match writes cannot be reaching that row by name. `assists`
+        # and `lifetimeAssists` are in the table and do render, which is why
+        # assists is the only row that ever worked.
+        #
+        # `FIFA14_STAT_PROBE=1` fills every slot with a distinct sentinel so a
+        # single look at the bio names the whole mapping -- which index feeds
+        # which row, and which array feeds the "Other Clubs" column against the
+        # "Your Club" one. Guessing an index costs a relaunch each; this costs
+        # one, and it writes to nothing but a display array.
+        "statsList": _stat_slots(11, 22, 33, 44, 55),
+        "lifetimeStats": _stat_slots(61, 62, 63, 64, 65),
     }
 
 
@@ -377,6 +862,7 @@ class Persona:
 
 
 PERSONA = TenantView("persona")
+CLUB_RECORD = TenantView("record")
 
 
 class ClubIdentity:
@@ -437,6 +923,19 @@ def first_run() -> bool:
     return os.environ.get("FIFA14_FIRST_RUN", "").strip().lower() in {"1", "true", "yes"}
 
 
+CLUB_ITEM_TYPES = frozenset({"kit", "stadium", "ball", "custom"})
+
+
+def _repeats(item: dict) -> bool:
+    """Whether a second copy of this card is a duplicate rather than a stack.
+
+    Players and club items repeat. Consumables accumulate: a club is meant to
+    pile up contracts, and offering to quick-sell the second one is wrong.
+    """
+    kind = item.get("itemType")
+    return kind == "player" or kind in CLUB_ITEM_TYPES
+
+
 def card_signature(item: dict):
     """What makes two cards the same card.
 
@@ -455,12 +954,42 @@ def card_signature(item: dict):
 
     `rarity` is what names the version here -- "Rare Gold", "Team of the Week",
     "iMOTM" -- and the rating separates two cards of one player inside a single
-    family. Two genuinely identical cards agree on all three.
+    family.
+
+    And the **club**, because a player transferred mid-season has a card at
+    each one and they are not the same card. Eddie Johnson is asset 46727, Rare
+    Silver, 72 at D.C. United and again at Sounders; Jermaine Jones is 112847,
+    Non-Rare Gold, 77 at New England and at Schalke. Falcao, Mata, Vidic,
+    Fabregas, Lewandowski and Di Maria are all Rare Gold at two clubs. Without
+    the club, 2,395 pairs in the catalogue collide -- with it, three do, and
+    those three agree on the club as well and are genuinely the same card.
+
+    This became reachable only once the scraper stopped collapsing transfers
+    (see `tools/fetch_wefut_cards.py`). Before that only one card of each pair
+    was in the catalogue, so no pack could ever hold both.
+
+    The club is read as `teamid`, which is what `_player_item` writes, falling
+    back to the `teamId` alias `_fill_card_aliases` adds to saved cards. A card
+    with no club at all normalises to 0, so two of those still match each other
+    rather than being told apart by an absence.
+
+    Two genuinely identical cards agree on all four.
     """
+    # A club item is identified by its resource, not its asset. Every kit in
+    # the catalogue holds asset 14 -- the art follows the resourceId -- so
+    # keying on the asset would make all 861 kits the same card and report the
+    # second kit you ever packed as a duplicate of the first.
+    if item.get("itemType") in CLUB_ITEM_TYPES:
+        return ("club", item.get("itemType"), item.get("resourceId"))
+
+    club = item.get("teamid")
+    if club is None:
+        club = item.get("teamId")
     return (
         item.get("assetId"),
         (item.get("rarity") or "").strip().lower(),
         item.get("rating"),
+        int(club or 0),
     )
 
 
@@ -593,6 +1122,64 @@ def _bounded_club(items: list[dict]) -> list[dict]:
     return kept
 
 
+def stack_consumables(items: list[dict]) -> list[dict]:
+    """Collapse identical consumables into one card carrying a count.
+
+    Retail stacks them: a club holding two Player Fitness cards shows one card
+    with a **2** on it and `+20 Fitness` underneath, not two cards. This server
+    held 261 consumables across 143 distinct kinds and served all 261 as
+    separate cards, each with `count` 1, so a club that had opened a few packs
+    scrolled for pages through repeats of the same contract.
+
+    Only consumables stack, and only ones that are genuinely the same card --
+    keyed on `resourceId`, which is the card's own database id, so a +13
+    contract and a +99 contract stay apart. Players and club items never stack:
+    a second Barcelona kit is a duplicate to be sold, not a quantity.
+
+    Done on the way out rather than in the club itself. The stack borrows the
+    first card's id, and every route that acts on a consumable addresses it by
+    `resourceId` -- `POST /item/resource/<id>` is the apply -- so nothing
+    downstream needs to know the difference. The club still holds the real
+    cards, which is what keeps quick sell, apply and the save honest.
+    """
+    stacked: list[dict] = []
+    seen: dict[int, dict] = {}
+    for item in items:
+        if item.get("itemType") not in CONSUMABLE_TYPES:
+            stacked.append(item)
+            continue
+        resource = int(item.get("resourceId") or 0)
+        held = seen.get(resource)
+        if held is None:
+            entry = dict(item)
+            _set_stack_size(entry, 1)
+            seen[resource] = entry
+            stacked.append(entry)
+        else:
+            _set_stack_size(held, int(held.get("count") or 1) + 1)
+    return stacked
+
+
+# The members a stack size goes out under.
+#
+# `count` alone was not it: the club was served thirteen contract cards with
+# counts of 5, 10, 37 and so on, and every card on screen still read **1**. So
+# the badge reads a different member, and `count` is either for something else
+# or read somewhere else.
+#
+# These are the candidates CardsDLL's table actually carries -- `quantity`,
+# `untradeableCount` and `useCount` are all in it, alongside `count`. None is
+# an invented name, which is what makes sending them together reasonable rather
+# than the shotgun that froze this login twice: every one is a member the
+# binary can name.
+STACK_SIZE_MEMBERS = ("count", "quantity", "untradeableCount")
+
+
+def _set_stack_size(item: dict, size: int) -> None:
+    for member in STACK_SIZE_MEMBERS:
+        item[member] = size
+
+
 class ClubInventory:
     """Every card the club owns, plus the squad that starts."""
 
@@ -609,9 +1196,27 @@ class ClubInventory:
         if not seeded:
             packs = []
 
+        # The four captain packs hold the *same* twenty-three players.
+        #
+        # Measured 2026-08-16: 92 squad entries across the four, 23 distinct,
+        # every one of them appearing four times -- four Messis, four Falcaos,
+        # four Neuers. Seeding all four therefore did not stock the club with
+        # spares, it stocked it with quadruplicates, and that is where a
+        # player's "why do I have so many Falcaos" comes from. Packs add their
+        # own repeats on top, and none of it is visible as a duplicate on Xbox:
+        # the pack screen asks CardsDLL, which answers from its own state, so no
+        # server response can mark them (`docs/DUPLICATES.md`).
+        #
+        # Seeding one of each asset keeps whatever genuine spares the data has
+        # -- if a pack ever does carry a different squad, its extra players
+        # still come through -- while refusing to mint copies of one that does.
+        seeded_assets: set[int] = set()
         for pack_index, pack in enumerate(packs):
             attributes = [pack[f"Attribute{n}"] for n in range(1, 7)]
             for slot, asset_id in enumerate(pack["squad"]):
+                if asset_id in seeded_assets:
+                    continue
+                seeded_assets.add(asset_id)
                 item = _player_item(
                     item_id=next_id,
                     asset_id=asset_id,
@@ -678,7 +1283,7 @@ class ClubInventory:
                 item.get("name", ""),
             )
 
-        items = sorted(self.items, key=order)
+        items = stack_consumables(sorted(self.items, key=order))
 
         if query:
 
@@ -704,7 +1309,13 @@ class ClubInventory:
                     if kind in ("consumable", "consumables"):
                         if item.get("itemType") not in CONSUMABLE_TYPES:
                             return False
-                    elif item.get("itemType") != kind:
+                    # A badge goes out as `custom`, which is the retail family
+                    # and what made it render in My Club at all -- but the club
+                    # search still asks for `type=badge`, so comparing the two
+                    # directly matched nothing and the badge tab was empty
+                    # while the club held five. The wire name and the search
+                    # name are simply not the same word.
+                    elif item.get("itemType") != CLUB_SEARCH_TYPES.get(kind, kind):
                         return False
                 if position and position not in ("any", ""):
                     if item.get("preferredPosition") != position:
@@ -854,10 +1465,22 @@ class ClubInventory:
         return squad_id
 
     def delete_squad(self, squad_id: int) -> bool:
+        """Drop a squad the club is not currently playing with.
+
+        The guard used to be `squad_id == 1`, on the reading that slot 1 is the
+        side the club fields. That stopped being true the moment a player built
+        a second squad and made it active: on 16 August a club with squad 3
+        active asked to delete squad 1 and this refused, while the route was
+        not wired at all, so the console got a 404.
+
+        The real constraint is the active squad, whatever its number -- delete
+        that and the club has nothing to field. The last remaining squad is
+        held for the same reason.
+        """
         squads = self._squads()
-        # Slot 1 is the side the club plays with; deleting it would leave the
-        # club with nothing to field.
-        if squad_id == 1 or squad_id not in squads:
+        if squad_id not in squads or len(squads) <= 1:
+            return False
+        if squad_id == self.active_squad_id():
             return False
         del squads[squad_id]
         return True
@@ -945,8 +1568,8 @@ class ClubInventory:
                 "rating": rating,
                 "changed": False,
                 "players": players,
-                "manager": [],
-                "actives": _presentation_items(),
+                "manager": squad_manager(),
+                "actives": _presentation_items(self),
             },
             separators=(",", ":"),
         ).encode()
@@ -998,8 +1621,8 @@ class ClubInventory:
                 "rating": rating,
                 "changed": False,
                 "players": players,
-                "manager": [],
-                "actives": _presentation_items(),
+                "manager": squad_manager(),
+                "actives": _presentation_items(self),
             },
             separators=(",", ":"),
         ).encode()
@@ -1026,6 +1649,9 @@ AUCTION_WINDOW = 86400
 def _now() -> int:
     return int(time.time())
 
+
+# What the club calls itself as a seller on its own auctions.
+SELLER_NAME = "Fondateur FUT"
 
 MARKET_ITEM_ID_BASE = 1_800_000_000
 MARKET_TRADE_ID_BASE = 1_900_000_000
@@ -1161,6 +1787,61 @@ def _price_for(rating: int, rareflag: int, card: dict | None = None) -> int:
     return _round_price(base * jitter)
 
 
+# The market's consumable tabs.
+#
+# The transfer market screen has PLAYERS, CONSUMABLES, CLUB ITEMS and STAFF
+# across the top, and the consumable tab filters by type and by the exact
+# change -- "Position Change / LF >> LW" is a search the client builds. It has
+# always been able to ask; this server only ever answered with players, so
+# every one of those searches came back with footballers or nothing.
+#
+# The console names the tab in the query it sends:
+#
+#     type=player                     the players tab
+#     type=training&cat=position      position modifiers
+#     type=clubInfo&cat=badge         club items
+#     type=staff&cat=manager          staff
+#
+# `cat` is the family, in the same vocabulary `CONSUMABLE_CATEGORIES` already
+# maps for the Apply Consumable picker, so the two screens agree on what a
+# category means.
+MARKET_CONSUMABLE_TYPES = {"development", "training"}
+
+
+def _market_consumable_price(card: dict) -> int:
+    """What a consumable asks on the market.
+
+    Anchored on the quick-sell value the game itself pays, so a card is never
+    worth less to buy than to sell -- multiplied up, because a market that
+    priced at the discard value would be a way to launder coins rather than a
+    place to shop.
+    """
+    discard = consumable_discard_value(int(card.get("rating") or 0))
+    return max(200, int(discard) * 5)
+
+
+def market_consumables(query: dict[str, str]) -> list[dict]:
+    """Every consumable the market should offer for this search.
+
+    Drawn from the same catalogue packs use, minus the families held out of it
+    -- there is no sense selling a card that cannot be looked at.
+    """
+    wanted = (query.get("cat") or "").strip().lower()
+    family = CONSUMABLE_CATEGORIES.get(wanted)
+    rows = []
+    for card in _consumable_catalogue():
+        kind = card["itemType"]
+        if kind in UNDRAWN_CONSUMABLE_TYPES:
+            continue
+        if wanted and family is not None:
+            if not family or kind != family:
+                continue
+        elif wanted and wanted not in CONSUMABLE_TYPES:
+            continue
+        rows.append(card)
+    return rows
+
+
 class CardCatalogue:
     """Every card in the game, searchable."""
 
@@ -1248,6 +1929,9 @@ class CardCatalogue:
         return matches[start : start + count], len(matches)
 
     def auctions(self, query: dict[str, str], coins: int | None = None) -> bytes:
+        kind = (query.get("type") or "").strip().lower()
+        if kind in MARKET_CONSUMABLE_TYPES:
+            return self.consumable_auctions(query, coins)
         page, total = self.search(query)
         listings = []
         try:
@@ -1328,7 +2012,6 @@ class CardCatalogue:
                     "offers": 0,
                     "watched": False,
                     "bidState": "none",
-                    "tradeOwner": False,
                     "sellerName": _market_seller(card, index),
                     "sellerEstablished": 2013,
                     "sellerId": 1 + (_market_key(card) + index) % 999999,
@@ -1347,6 +2030,67 @@ class CardCatalogue:
         if coins is not None:
             document.update({"credits": coins, "totalCredits": coins, "coins": coins})
         return json.dumps(document, separators=(",", ":")).encode()
+
+    def consumable_auctions(
+        self, query: dict[str, str], coins: int | None = None
+    ) -> bytes:
+        """The consumables tab of the transfer market.
+
+        One listing per catalogue card, so the tab shows what exists rather
+        than what a random draw happened to produce. A player hunting a single
+        ST -> CF modifier can buy it instead of opening packs until one falls
+        out, which is what the screen is for.
+        """
+        rows = market_consumables(query)
+
+        def number(key: str, fallback: int) -> int:
+            try:
+                return int(query.get(key) or fallback)
+            except (TypeError, ValueError):
+                return fallback
+
+        start = max(0, number("start", 0))
+        count = max(1, min(50, number("num", 20)))
+        total = len(rows)
+        page = rows[start:start + count]
+
+        listings = []
+        for card in page:
+            CardCatalogue._issued += 1
+            item_id = MARKET_ITEM_ID_BASE + CardCatalogue._issued
+            item = _consumable_item(card, item_id)
+            price = _market_consumable_price(card)
+            trade_id = MARKET_TRADE_ID_BASE + CardCatalogue._issued
+            listing = {
+                "tradeId": trade_id,
+                "itemData": item,
+                "tradeState": "active",
+                "startingBid": max(150, int(price * 0.8)),
+                "buyNowPrice": price,
+                "currentBid": 0,
+                "offers": 0,
+                "watched": False,
+                "bidState": "none",
+                "expires": AUCTION_DURATION,
+                "sellerName": "",
+                "sellerEstablished": 2013,
+                "sellerId": 0,
+                "confidenceValue": 100,
+            }
+            self.served[trade_id] = listing
+            listings.append(listing)
+
+        return json.dumps(
+            {
+                "auctionInfo": listings,
+                "duplicateItemIdList": [],
+                "total": total,
+                "credits": coins or 0,
+                "totalCredits": coins or 0,
+                "coins": coins or 0,
+            },
+            separators=(",", ":"),
+        ).encode()
 
     def status_for(self, trade_ids: list[int], coins: int) -> bytes:
         """Answer /trade/status?tradeIds=... with those auctions.
@@ -1413,6 +2157,11 @@ class CardCatalogue:
         item = listing.get("itemData") if won else None
         if won and isinstance(item, dict) and item.get("assetId"):
             self.sold.add(int(item["assetId"]))
+            # What it went for, and that it has changed hands. Without these
+            # the bio said "Bought For: -" over a card bought a minute ago,
+            # and the owner count never moved off the seller's.
+            item["lastSalePrice"] = int(amount)
+            item["owners"] = int(item.get("owners") or 1) + 1
         return json.dumps(listing, separators=(",", ":")).encode(), item
 
 
@@ -1429,16 +2178,7 @@ class CardCatalogue:
 # at the top level is skipped, so naming all three costs nothing and a wrapper
 # would have broken the parse, as {"userInfo":{...}} did.
 
-# What a club that has never played starts with.
-#
-# A hundred million rather than a million, and the reason is what this server
-# is for. There is no economy to protect here: no auction house full of real
-# sellers, no market to inflate, nobody's grind to devalue. The coins exist so
-# that every screen a player wants to look at -- the store, the market, packs,
-# consumables -- actually opens instead of refusing. A club that has to farm
-# before it can see the transfer market is a club that spends its first hour
-# proving the server works rather than playing.
-STARTING_COINS = 100_000_000
+STARTING_COINS = 1_000_000
 
 
 class Wallet:
@@ -1533,15 +2273,48 @@ class Wallet:
                 "established": 2013 if club_name else 0,
                 "divisionOffline": 10,
                 "divisionOnline": 10,
-                "won": 0,
-                "draw": 0,
-                "loss": 0,
+                # The club's record, and this is where the dashboard reads it.
+                #
+                # These three were flat zeros -- so a club that had just won a
+                # cup still showed 0-0-0 beside its badge, and the search went
+                # looking in `club/stats/year` when the answer was already in
+                # this document under the parser's own member names (`won`
+                # 0x02F9D4, `draw` 0x030E54, `loss` 0x0308D8, read off
+                # CardsDLL on 16 August 2026).
+                "won": CLUB_RECORD.won,
+                "draw": CLUB_RECORD.draw,
+                "loss": CLUB_RECORD.lost,
+                "gamesPlayed": CLUB_RECORD.played,
                 "seasonTicket": False,
                 "fifaPointsFromLastYear": 0,
                 "fifaPointsTransferredStatus": 0,
-                # Aliases some of the UI binders read instead.
+                # `totalCredits` is the member CardsDLL's JSON table actually
+                # carries (0x02FD90); `credits` and `coins` ride along because
+                # an unrecognised sibling at the top level is skipped. It was
+                # missing here alone -- `with_balance` adds it to every other
+                # response that carries a balance, and this document builds
+                # itself, so it never got one. The header reads this document
+                # at login and the store's own fetch is what filled it in
+                # afterwards.
+                "totalCredits": self.coins,
                 "coins": self.coins,
                 "credits": self.coins,
+                # `funds` and `finalFunds`, at the top level.
+                #
+                # Measured 16 August 2026: with `won`/`draw`/`loss` wired up,
+                # the header printed the record correctly **and still printed
+                # zero coins** -- from the same document, in the same reply. So
+                # this document is parsed and its members are read; `credits`,
+                # `totalCredits` and `coins` are simply not the one the coin
+                # field binds to.
+                #
+                # These two are what is left in CardsDLL's JSON table for a
+                # balance (0x030C08, 0x030C94), and this server had only ever
+                # sent them nested inside the `currencies` array of
+                # `user/credits` -- a document the client does not fetch during
+                # login at all.
+                "funds": self.coins,
+                "finalFunds": self.coins,
                 "points": 0,
                 "fifaPoints": 0,
             },
@@ -1574,31 +2347,31 @@ class Wallet:
 PACK_SPECS: dict[int, dict] = {
     103: {"name": "Bronze Pack", "tier": "bronze", "coins": 400, "points": 0,
           "count": 12, "rares": 1, "players": 3, "premium": False,
-          "group": "Packs Bronze"},
+          "group": "Bronze Packs"},
     104: {"name": "Premium Bronze Pack", "tier": "bronze", "coins": 750,
           "points": 0, "count": 12, "rares": 3, "players": 3, "premium": True,
-          "group": "Packs Bronze"},
+          "group": "Bronze Packs"},
     203: {"name": "Silver Pack", "tier": "silver", "coins": 2500, "points": 50,
           "count": 12, "rares": 1, "players": 3, "premium": False,
-          "group": "Packs Argent"},
+          "group": "Silver Packs"},
     204: {"name": "Premium Silver Pack", "tier": "silver", "coins": 3750,
           "points": 75, "count": 12, "rares": 3, "players": 3, "premium": True,
-          "group": "Packs Argent"},
+          "group": "Silver Packs"},
     303: {"name": "Gold Pack", "tier": "gold", "coins": 5000, "points": 100,
           "count": 12, "rares": 1, "players": 3, "premium": False,
-          "group": "Packs Or"},
+          "group": "Gold Packs"},
     304: {"name": "Premium Gold Pack", "tier": "gold", "coins": 7500,
           "points": 150, "count": 12, "rares": 3, "players": 3, "premium": True,
-          "group": "Packs Or"},
+          "group": "Gold Packs"},
     305: {"name": "Jumbo Gold Pack", "tier": "gold", "coins": 10000,
           "points": 0, "count": 24, "rares": 7, "players": 8, "premium": True,
-          "group": "Packs Or"},
+          "group": "Gold Packs"},
     306: {"name": "Gold Players Pack", "tier": "gold", "coins": 15000,
           "points": 0, "count": 12, "rares": 1, "players": 12,
-          "premium": False, "group": "Packs Or"},
+          "premium": False, "group": "Gold Packs"},
     307: {"name": "Premium Gold Players Pack", "tier": "gold", "coins": 25000,
           "points": 0, "count": 12, "rares": 3, "players": 12, "premium": True,
-          "group": "Packs Or"},
+          "group": "Gold Packs"},
 
     # Packs this server adds. Retail FIFA 14 had no consumables-only pack and
     # nothing above 25 000, so these are not reconstructions of anything --
@@ -1611,32 +2384,32 @@ PACK_SPECS: dict[int, dict] = {
     # Team of the Year instead.
     108: {"name": "Consumables Pack", "tier": "silver", "coins": 2000,
           "points": 0, "count": 12, "rares": 2, "players": 0, "premium": False,
-          "group": "Consommables"},
+          "group": "Consumables"},
     109: {"name": "Premium Consumables Pack", "tier": "gold", "coins": 6000,
           "points": 0, "count": 24, "rares": 8, "players": 0, "premium": True,
-          "group": "Consommables"},
+          "group": "Consumables"},
     308: {"name": "Rare Gold Pack", "tier": "gold", "coins": 100000,
           "points": 0, "count": 12, "rares": 12, "players": 12, "premium": True,
-          "group": "Packs Or"},
+          "group": "Gold Packs"},
     309: {"name": "Team of the Week Pack", "tier": "gold", "coins": 50000,
           "points": 0, "count": 12, "rares": 12, "players": 12, "premium": True,
           "guaranteed": 1, "families": {"team of the week": 1.0},
-          "group": "Packs Speciaux"},
+          "group": "Special Packs"},
     310: {"name": "Team of the Season Pack", "tier": "gold", "coins": 250000,
           "points": 0, "count": 12, "rares": 12, "players": 12, "premium": True,
           "guaranteed": 2,
           "families": {"team of the season": 70.0, "team of the year": 12.0,
                        "record breaker": 6.0, "team of the week": 12.0},
-          "group": "Packs Speciaux"},
+          "group": "Special Packs"},
 }
 
 # The order the store lists its groups in, cheapest first.
 GROUP_ORDER = {
-    "Packs Bronze": 0,
-    "Packs Argent": 1,
-    "Packs Or": 2,
-    "Consommables": 3,
-    "Packs Speciaux": 4,
+    "Bronze Packs": 0,
+    "Silver Packs": 1,
+    "Gold Packs": 2,
+    "Consumables": 3,
+    "Special Packs": 4,
 }
 
 GOLD_PACK_ID = 304
@@ -1709,10 +2482,14 @@ RARE_BAND_MULTIPLIER = {(84, 86): 1.2, (87, 89): 1.45, (90, 99): 1.8}
 
 # The chance a pack holds a special at all, and a second one having held the
 # first. A second is deliberately much rarer than the first.
+# Nudged up across the board on 17 August 2026, at the player's request.
+# These are a house choice, not a measurement -- the binary names the fields
+# and says nothing about what a pack should pay -- and a single-player club
+# with nobody to trade against can carry a kinder pack than retail did.
 SPECIAL_CHANCE = {
-    103: 0.006, 104: 0.012,
-    203: 0.015, 204: 0.03,
-    303: 0.08, 304: 0.16, 305: 0.25, 306: 0.20, 307: 0.35,
+    103: 0.010, 104: 0.020,
+    203: 0.025, 204: 0.045,
+    303: 0.11, 304: 0.20, 305: 0.30, 306: 0.25, 307: 0.40,
     # The added packs. 108 and 109 hold no players at all, so their chance
     # is nought by construction; 308 is all rare golds and pays for it.
     308: 0.45, 309: 1.0, 310: 1.0,
@@ -1751,15 +2528,109 @@ def _pack_identity(card: dict) -> tuple:
 # unknown -- an unknown card on the pack screen is how screens freeze. Raise
 # it deliberately, with the console in front of you.
 SPECIAL_FAMILY_WEIGHTS = {
-    "team of the week": 58.0,
-    "team of the season": 14.0,
+    # Team of the Week gives up some of its share so the rarer families are
+    # worth opening a pack for. It is still what a special usually is.
+    "team of the week": 48.0,
+    "team of the season": 15.0,
+    # World Cup Ultimate Team is a different mode, and this server does not
+    # model it. Its 1077 cards were the largest special family in the
+    # catalogue and every one of them carried a confederation instead of a
+    # club -- blank crest on the console, and no club or league chemistry with
+    # anyone. `tools/worldcup_cards.py split` moved them out to
+    # `server/fifa14_cards_worldcup.json`; `restore` puts them back.
+    #
+    # The weight stays. A family with no cards is skipped by `_draw_special`,
+    # which selects on `cards and weight > 0`, so this line costs nothing while
+    # they are out and is correct again the moment they return.
     "world cup": 10.0,
-    "motm": 8.0,
-    "imotm": 5.0,
-    "team of the year": 3.0,
-    "record breaker": 1.0,
-    "legend": 0.0,
+    # The orange and green cards move furthest. There are 35 MOTM and 60
+    # iMOTM in the catalogue against 768 Team of the Week, and at the old
+    # weights a player could open a hundred packs without meeting either.
+    "motm": 14.0,
+    "imotm": 10.0,
+    "team of the year": 4.0,
+    "record breaker": 1.5,
+    # Was 0.0, on the grounds that no Legend had ever been drawn here and
+    # whether the card renders on a 360 was unknown -- and an unknown card on
+    # the pack screen is how screens freeze.
+    #
+    # Settled on the console, 2026-08-16: a Legend was bought off the transfer
+    # market and rendered correctly, art and all. FUT Legends were an Xbox
+    # exclusive, so this build has them and they work.
+    #
+    # Held low rather than opened up. The evidence covers the market and club
+    # renderers; the pack reveal screen is a different one, and it is the one
+    # that freezes. 2.0 puts a Legend just above a Record Breaker and below a
+    # Team of the Year -- rare enough to be an event, common enough that the
+    # remaining question gets answered.
+    #
+    # Raised to 3.0 with the rest, and deliberately by less than the orange and
+    # green cards: a Legend should stay the rarest card anyone actually pulls.
+    "legend": 3.0,
 }
+
+
+def store_pack_descriptions() -> bytes:
+    """The English text behind `FUT_STORE_PACK_<id>_DESC`.
+
+    The store's pack tiles carry that key and it resolves against
+    `packs/loc/storepackdescriptions.<locale>.xml`, which this server answered
+    with an empty table -- so every tile fell back to its group heading and the
+    detail pane read "Gold Packs / Gold Packs".
+
+    The document format is CardsDLL's own: `trans-unit` elements keyed by
+    `resname` with a `source` body. Those three names sit together in the module
+    beside the `packs/loc/storepackdescriptions.` path itself, which is what
+    says this is the right document rather than a guess at one.
+
+    Whether the console binds it is not yet confirmed on hardware. It is the
+    correctly named document for these keys, which is more than could be said
+    for the cup-name attempt, but the same caveat applies until it is seen.
+    """
+    lines = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        "<localization>",
+    ]
+    for pack_id, spec in sorted(PACK_SPECS.items()):
+        players = int(spec.get("players", 0))
+        count = int(spec.get("count", 12))
+        rares = int(spec.get("rares", 0))
+        if players >= count:
+            body = f"{count} players, {rares} rare."
+        elif players:
+            body = (
+                f"{count} items, {players} of them players, {rares} rare."
+            )
+        else:
+            body = f"{count} consumable and club items, {rares} rare."
+        text = f"{spec['name']}. {body}"
+        lines.append(
+            f'  <trans-unit resname="FUT_STORE_PACK_{pack_id}_DESC">'
+            f"<source>{_xml_text(text)}</source></trans-unit>"
+        )
+    # The cup names go in this document too.
+    #
+    # `TOURNY_LOC_%d` has been served in the leaderboards document since the
+    # tiles first drew a bare `*`, and the tiles still draw `*`. This document
+    # is fetched 243 times in a session against that one's 40, which is what a
+    # general string table looks like rather than a screen-specific one -- so
+    # the key may simply have been in the wrong file all along.
+    #
+    # Costs nothing to find out: the pack descriptions in this same document
+    # are themselves untested on hardware, so one launch judges both.
+    for cup, title in sorted(TOURNAMENT_NAMES.items()):
+        lines.append(
+            f'  <trans-unit resname="TOURNY_LOC_{cup}">'
+            f"<source>{_xml_text(title)}</source></trans-unit>"
+        )
+    lines.append("</localization>")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _xml_text(value: str) -> str:
+    return (
+        value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
 
 
 def store_catalogue(timestamp: int = 2147483647) -> bytes:
@@ -2015,6 +2886,9 @@ class PackShop:
             rares = [card for card in pool if card.get("rareflag")] or pool
             commons = [card for card in pool if not card.get("rareflag")] or pool
             drawn = []
+            # One per pack, like the shop draw: a starter pack should not hand
+            # out the same kit twice either.
+            already: set = set()
             for slot, kind in enumerate(self._slot_kinds(spec, rng)):
                 rare_slot = slot < int(spec["rares"])
                 item_id = PACK_ITEM_ID_BASE + 900_000 + drawn_total
@@ -2022,7 +2896,7 @@ class PackShop:
                 # striker, so the starter packs carry the same nine non-player
                 # slots the shop packs do.
                 if kind == "extra":
-                    item = _draw_extra(spec["tier"], rare_slot, item_id, rng)
+                    item = _draw_extra(spec["tier"], rare_slot, item_id, rng, already)
                     if item is not None:
                         drawn.append(item)
                         drawn_total += 1
@@ -2038,6 +2912,7 @@ class PackShop:
                     attributes=card.get("attributes", [0] * 6),
                     position=card.get("position") or FALLBACK_POSITION,
                     item_state="new",
+                    pile=PILE_PURCHASED,
                     nation=card.get("nationId", 0),
                     league=card.get("leagueId", 0),
                     rarity=card.get("rarity", ""),
@@ -2126,7 +3001,7 @@ class PackShop:
             # A rare slot promises a rare card whatever kind of card it holds.
             rare_slot = slot < int(spec["rares"])
             if kind == "extra":
-                item = _draw_extra(tier, rare_slot, item_id, rng)
+                item = _draw_extra(tier, rare_slot, item_id, rng, already)
                 if item is not None:
                     drawn.append(item)
                     continue
@@ -2185,6 +3060,7 @@ class PackShop:
                 attributes=card.get("attributes", [0] * 6),
                 position=card.get("position") or FALLBACK_POSITION,
                 item_state="new",
+                pile=PILE_PURCHASED,
                 nation=card.get("nationId", 0),
                 league=card.get("leagueId", 0),
                 rarity=card.get("rarity", ""),
@@ -2239,16 +3115,21 @@ class PackShop:
             pools.append(self.inventory.items)
         for pool in pools:
             for item in pool:
-                if item.get("itemType") != "player":
+                if not _repeats(item):
                     continue
                 owned.setdefault(self._signature(item), item["id"])
         pairs: list[dict] = []
         for item in drawn:
-            # Only players duplicate. A second contract card is not a repeat
-            # of the first, it is a second contract -- consumables stack, and
-            # marking one as a duplicate offers to quick-sell a card the club
-            # is meant to accumulate.
-            if item.get("itemType") != "player":
+            # Players and club items duplicate; consumables do not. A second
+            # contract card is not a repeat of the first, it is a second
+            # contract -- consumables stack, and marking one as a duplicate
+            # offers to quick-sell a card the club is meant to accumulate.
+            #
+            # A second Barcelona home kit is a different matter: you either own
+            # a kit or you do not, and the second copy is worth its quick-sell
+            # value and nothing else. With 1570 club items in the draw the
+            # player will meet plenty of repeats, and the screen should say so.
+            if not _repeats(item):
                 continue
             key = self._signature(item)
             existing = owned.get(key)
@@ -2336,6 +3217,16 @@ CONSUMABLE_WIRE_TYPE = {
     "position": "development",
     "training": "training",
     "playStyle": "training",
+    # Squad Training: subtype 232, six cards on art 43, which the console draws
+    # as "Squad Training -- Boost attributes for the next match". They were
+    # filed under `position`, which is why they turned up in the position
+    # modifier tab, and their art does not resolve any more than the training
+    # block's does.
+    "squadTraining": "training",
+    # Subtypes 121-136 on art 35, which the console draws as "Formation
+    # Modifier -- Manager, 3-4-1-2" and cannot resolve the art for. Art 34
+    # beside them renders fine, so this is the id and not the family.
+    "formationManager": "development",
 }
 
 # The families themselves, as `tools/build_consumables.py` names them. Used to
@@ -2354,9 +3245,35 @@ def consumable_family(item: dict) -> str:
     return row.get("itemType", "") if row else ""
 
 
-PILE_TRANSFER = 5
-PILE_PURCHASED = 6
-PILE_CLUB = 7
+
+# The console names the pile, it does not number it: every `PUT /item` this
+# server has ever received carries `"pile": "club"` or `"pile": "trade"`,
+# never 5 or 7. Measured across a four-hour session on 17 August 2026 -- 198
+# "club" and 15 "trade", no integer at all.
+#
+# This mattered more than a spelling. The old code did `int(pile)` inside a
+# try, and fell back to PILE_CLUB when it raised -- so `int("trade")` threw
+# ValueError and every card sent to the transfer list was quietly filed in the
+# club instead. Fifteen cards went that way in one session, and the player
+# reported them as disappearing: they were never on the transfer list to be
+# seen, and they were in a club too big to notice one more card in.
+#
+# Numbers are still accepted. Nothing observed sends them, but a fallback that
+# silently means "club" is what caused this, so an unrecognised pile is
+# refused rather than guessed at.
+PILE_NAMES = {"club": PILE_CLUB, "trade": PILE_TRANSFER, "purchased": PILE_PURCHASED}
+
+
+def _pile_number(value: object) -> int | None:
+    """The pile a move is asking for, or None if it cannot be read."""
+    if isinstance(value, str):
+        return PILE_NAMES.get(value.strip().lower())
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number in set(PILE_NAMES.values()) else None
+
 
 
 # -- applying a consumable --------------------------------------------------
@@ -2374,26 +3291,19 @@ PILE_CLUB = 7
 # carries. The blocks come from `tools/build_consumables.py`, which reads them
 # out of `cards_ng_db.db`.
 CONTRACT_PLAYER, CONTRACT_MANAGER = 201, 202
-# Chemistry styles and position modifiers, as the title itself draws them.
-#
-# 91-110 was served as the outfield chemistry styles for weeks, on the strength
-# of the member CardsDLL counts it under. That was wrong, and the title said
-# so on 20 August: three probes from the block came back drawn as "Modificateur
-# de poste" -- "AVD >> AD", "DLG >> DG" -- and were refused on players whose
-# position did not match.
-#
-# The real outfield styles are 250-273, which had been sitting in the excluded
-# pile with the manager cards and were never served at all. Two probes came
-# back as "Style joueur", badged "DE BASE" and "MOT", under the chemistry tabs
-# "De base" and "Milieu"; the block is exactly 24 subtypes, and FIFA 14 has
-# exactly 24 outfield chemistry styles.
-#
-# 121-136 is still read as the keeper's styles -- 16 subtypes, and nothing from
-# it draws on an outfield player, which reads as the screen filtering what a
-# keeper cannot use. Not yet seen on a keeper.
-POSITION_MODIFIER = (91, 110)
-PLAY_STYLE_OUTFIELD = (250, 273)
+# Chemistry styles, split the way CardsDLL counts them: outfield players under
+# `consumablesTrainingPlayerPlayStyle`, goalkeepers under
+# `consumablesTrainingGkPlayStyle`.
+PLAY_STYLE_OUTFIELD = (91, 110)
 PLAY_STYLE_GK = (121, 136)
+
+# The real chemistry styles. Nineteen of them, Basic through Shadow, added by
+# `tools/chemistry_styles.py`. The style written onto a card is the row's
+# `amount` -- 0 to 18 in subtype order -- and not the subtype: `FUT_PLAYSTYLE_%d`
+# in the binary says the style is keyed by an integer in some range, and this is
+# the range. See `docs/CONSUMABLES.md`.
+CHEMISTRY_FIRST = 250
+CHEMISTRY_LAST = 268
 HEALING_FIRST, HEALING_ANY = 211, 218
 FITNESS_PLAYER, FITNESS_SQUAD = 219, 220
 
@@ -2589,40 +3499,14 @@ class ConsumableRack:
             where = "all six" if index is None else f"attribute {index}"
             return [target], f"training {where} +{amount}"
 
-        if (
-            PLAY_STYLE_OUTFIELD[0] <= subtype <= PLAY_STYLE_OUTFIELD[1]
-            or PLAY_STYLE_GK[0] <= subtype <= PLAY_STYLE_GK[1]
-        ):
-            return self._play_style(target, subtype)
+        if CHEMISTRY_FIRST <= subtype <= CHEMISTRY_LAST:
+            return self._chemistry_style(target, row)
 
-        # A position modifier, and refused rather than applied.
-        #
-        # The card changes a player from one position to another, and the pair
-        # is not in the database -- the title draws "AVD >> AD" from its own
-        # copy and enforces it, refusing a card whose source position does not
-        # match the player. This server cannot check that, so applying one
-        # would burn the card and write nothing true.
-        #
-        # It did exactly that on 20 August: the server accepted an apply, set
-        # `playStyle: 105` on a CDM, and the screen said "cet élément ne peut
-        # être appliqué" at the same moment. A card gone, a false value in the
-        # club, and the two sides no longer agreeing. Refusing is the honest
-        # answer until the position pairs are known.
-        if POSITION_MODIFIER[0] <= subtype <= POSITION_MODIFIER[1]:
-            self.refused.append(
-                {
-                    "resourceId": row.get("definitionId"),
-                    "cardsubtypeid": subtype,
-                    "itemType": row.get("itemType"),
-                    "targetId": target.get("id"),
-                    "targetPosition": target.get("preferredPosition"),
-                    "reason": "position pair unknown",
-                }
-            )
-            raise ConsumableRefused(
-                f"subtype {subtype} is a position modifier and this server "
-                "does not know which positions it maps between"
-            )
+        if PLAY_STYLE_OUTFIELD[0] <= subtype <= PLAY_STYLE_OUTFIELD[1] and row.get("to"):
+            return self._position_modifier(target, row)
+
+        if PLAY_STYLE_OUTFIELD[0] <= subtype <= PLAY_STYLE_GK[1]:
+            return self._play_style(target, subtype, row)
 
         # The position block (232). What each card in it does is contested:
         # this server's catalogue called it a position change, the PC
@@ -2643,47 +3527,162 @@ class ConsumableRack:
                 "itemType": row.get("itemType"),
                 "targetId": target.get("id"),
                 "targetPosition": target.get("preferredPosition"),
-                "targetPlayStyle": target.get("playStyle"),
+                "targetPlayStyle": target.get("style"),
             }
         )
         raise ConsumableRefused(
             f"subtype {subtype} has no established effect on this platform"
         )
 
-    def _play_style(self, target: dict, subtype: int) -> tuple[list[dict], str]:
-        """A chemistry style, written onto the card's own `playStyle`.
+    def _position_modifier(self, target: dict, row: dict) -> tuple[list[dict], str]:
+        """Move a player from one position to the next, per the card.
 
-        Which subtypes these are was settled by the title, not by reasoning
-        about CardsDLL's member names -- that reasoning gave 91-110, and the
-        title drew those as position modifiers. Serving one card from each
-        candidate block and reading the screen gave:
+        Only reachable for a card whose catalogue row carries a `to` --
+        `tools/position_modifiers.py add` writes those from the transitions the
+        PC revival's catalogue names. Without one the card falls through to the
+        refusal below, which is the state this block was in from the moment it
+        was identified until the transitions arrived: knowing that 91-110 are
+        position modifiers does not tell you where any single one of them moves
+        a player.
 
-            250-273  outfield styles, "Style joueur", badged "DE BASE", "MOT"
-            121-136  the keeper's, on the same reading, not yet seen on a
-                     keeper
+        The guard is retail's rule. A card names a `from` as well as a `to`, so
+        `CM->CAM` goes on a CM and nothing else; anywhere else it is refused and
+        the card is not spent. Enforcing it matters more here than in retail,
+        because this server is the only thing standing between a mis-click and
+        a permanently repositioned card.
 
-        `playStyle` is a member every player card already carries. `playStyle` is a member every player card already
-        carries, and it has sat at 0 on every card in the club since the club
-        existed.
-
-        What is *not* established is the numbering: the value written is the
-        card's own `cardsubtypeid`, on the reading that the style is the
-        subtype. If that enumeration turns out to be offset, the visible
-        consequence is one card showing the wrong style name -- another style
-        card puts it right, which is not true of a wrongly written position.
-
-        The goalkeeper split is enforced. A GK style on an outfield player is
-        the one mistake the ranges make obvious, and spending the card on it
-        would be the player's loss.
+        Nothing else on the player changes. A position modifier moves the
+        position and leaves the rating, the attributes and the club, league and
+        nation that drive chemistry exactly as they were.
         """
-        keeper = (target.get("preferredPosition") or "").upper() == "GK"
-        for_keeper = PLAY_STYLE_GK[0] <= subtype <= PLAY_STYLE_GK[1]
-        if for_keeper and not keeper:
-            raise ConsumableRefused("a goalkeeper style needs a goalkeeper")
-        if not for_keeper and keeper:
-            raise ConsumableRefused("an outfield style cannot go on a goalkeeper")
-        target["playStyle"] = subtype
-        return [target], f"play style {subtype}"
+        wanted = str(row.get("from") or "").strip().upper()
+        becomes = str(row.get("to") or "").strip().upper()
+        current = str(target.get("preferredPosition") or "").strip().upper()
+        if wanted and current != wanted:
+            raise ConsumableRefused(
+                f"a {wanted}-{becomes} card needs a {wanted}; that player is a "
+                f"{current or 'unknown position'}"
+            )
+        target["preferredPosition"] = becomes
+        return [target], f"position {wanted} to {becomes}"
+
+    def _chemistry_style(self, target: dict, row: dict) -> tuple[list[dict], str]:
+        """A real chemistry style, written onto the card's own `playStyle`.
+
+        The value is the catalogue row's `amount`, which runs 0-18 across the
+        nineteen styles in subtype order -- Basic 0, Sniper 1, Finisher 2, and
+        so on to Shadow 18. Writing the *subtype* here, as the old play-style
+        path did, would put 250-268 into a member the client reads as a style
+        index and show the wrong style on every card.
+
+        **These nineteen are the outfield set, and a keeper cannot wear them.**
+        FIFA 14 gives goalkeepers their own five -- Basic, Wall, Shield, Cat,
+        Glove -- and not one of those names appears here: 250-268 runs Basic,
+        Sniper, Finisher, Deadeye ... Shadow. Sniper on a goalkeeper is not a
+        choice retail offers.
+
+        Basic is the exception, and it is deliberate. It is the style every
+        card starts on, outfield and keeper alike, so 250 is the one member of
+        this range that means something on a goalkeeper: it puts him back to
+        default.
+
+        Where the other four GK styles live is **not known**. The block at
+        121-136 carries the binary's own member name for them,
+        `consumablesTrainingGkPlayStyle`, which is as close to an answer as
+        anything here gets -- but it holds sixteen entries against five styles,
+        every one with `amount` 0 and no name in either this catalogue or the
+        PC revival's. Sixteen cards, five styles and no index between them is
+        not a mapping, and this block has already been guessed at twice. It
+        stays refused until something names it.
+        """
+        style = int(row.get("amount", 0) or 0)
+        keeper = str(target.get("preferredPosition") or "").strip().upper() == "GK"
+        if keeper and style != 0:
+            name = str(row.get("name") or f"style {style}").title()
+            raise ConsumableRefused(
+                f"{name} is an outfield chemistry style; a goalkeeper takes "
+                "Basic, Wall, Shield, Cat or Glove"
+            )
+        target["playStyle"] = style_value(style)
+        target["style"] = style_value(style)
+        # `styleAttribMods`, probed.
+        #
+        # `style` alone is sent and ignored: a card carrying Hunter still draws
+        # BASIC, and taking it out of the squad and back does not change that,
+        # so it is not a stale card. The only other style member in CardsDLL's
+        # JSON table is `styleAttribMods` (0x02FEA0), and a chemistry style in
+        # FUT *is* a set of attribute modifiers -- so the label may be derived
+        # from the mods rather than from an id.
+        #
+        # `FIFA14_STYLE_PROBE=1` writes an unmistakable pattern: +25 on the
+        # first attribute and nothing elsewhere, in the index/value shape
+        # `attributeList` already uses on the same card. One look answers two
+        # questions at once -- whether the client reads this member at all
+        # (does the first attribute jump by 25?) and whether writing it is what
+        # makes a style name appear.
+        if os.environ.get("FIFA14_STYLE_PROBE", "").strip().lower() in {"1", "true", "yes"}:
+            target["styleAttribMods"] = [
+                {"index": index, "value": (25 if index == 0 else 0)}
+                for index in range(6)
+            ]
+        name = str(row.get("name") or f"style {style}").title()
+        return [target], f"chemistry style {name}"
+
+    def _play_style(self, target: dict, subtype: int, row: dict) -> tuple[list[dict], str]:
+        """91-136 are **not** chemistry styles, and are refused again.
+
+        This block was refused for weeks, then applied from 12 August on the
+        strength of the member CardsDLL counts the cards under:
+
+            91-110   consumablesTrainingPlayerPlayStyle
+            121-136  consumablesTrainingGkPlayStyle
+
+        That reading is wrong, and two independent sources say so.
+
+        **The console.** Asked for chemistry styles, the game showed position
+        modifiers. The client resolves a consumable's name and art from its own
+        data, so that is the disc's answer to what these cards are, not ours.
+
+        **The PC revival's catalogue** names all twenty of 91-110 as explicit
+        transitions -- `LWB->LB`, `RM->RW`, `CM->CAM`, `CDM->CM`, `CAM->CF`,
+        `ST->CF` -- under a `Positioning` category. Nothing in that list is a
+        play style under any reading. It files 121-136 as an internal GK block
+        it does not support either.
+
+        And it carries the decisive detail: its own row for subtype 91 records
+        `sourceMember: consumablesTrainingPlayerPlayStyle` *while categorising
+        the card as Positioning*. So the member name -- the single piece of
+        evidence this server changed its mind on -- is a counter the binary
+        groups these under, not a statement of what they do.
+
+        The real chemistry styles are subtypes 250-268 (Basic, Sniper, Hawk,
+        Shadow, Engine, Anchor and the rest). This catalogue does not contain
+        them, which is the actual reason a player can never find one.
+
+        So `playStyle` was being written from a position card, and the card was
+        spent doing it. Refused and recorded, which is where this block was
+        before and what `docs/CONSUMABLES.md` argued for: a refusal costs
+        nothing, a wrong write costs a card and corrupts a real player.
+        """
+        self.refused.append(
+            {
+                "resourceId": row.get("definitionId"),
+                "cardsubtypeid": subtype,
+                "itemType": row.get("itemType"),
+                "targetId": target.get("id"),
+                "targetPosition": target.get("preferredPosition"),
+                "targetPlayStyle": target.get("style"),
+            }
+        )
+        family = (
+            "a goalkeeper block with no established effect"
+            if PLAY_STYLE_GK[0] <= subtype <= PLAY_STYLE_GK[1]
+            else "a position modifier, not a chemistry style"
+        )
+        raise ConsumableRefused(
+            f"subtype {subtype} is {family}; chemistry styles are 250-268 and "
+            "are not in this catalogue"
+        )
 
     def _heal(self, target: dict, subtype: int, amount: int) -> tuple[list[dict], str]:
         games = int(target.get("injuryGames", 0) or 0)
@@ -2711,6 +3710,336 @@ class ConsumableRack:
                 ATTRIBUTE_CEILING, int(player.get("fitness", 0)) + amount
             )
         return squad
+
+
+# How a listed card finds a buyer.
+#
+# Nothing settled a listing. A card went up, `expires` never moved, `currentBid`
+# stayed 0, and no amount of waiting sold anything -- the market was a shop you
+# could buy from and never sell to. There are no other players here, so a buyer
+# has to be modelled.
+#
+# The model is the PC revival's (`KyroGeorge2/FIFA-14-Local-FUT`), which has
+# this working, adapted from its SQLite tables to the structures here. Its
+# shape, kept because each part earns its place:
+#
+#   * **price against value decides everything.** At or under the cheapest
+#     listing a card goes almost at once; at or under its market value it goes
+#     soon; up to about 110% of value it goes late; above that it never sells,
+#     which is what makes pricing a decision rather than a formality.
+#   * **the delay is deterministic**, mixed from the trade id and the resource.
+#     The client polls `trade/status` and `tradePile` constantly -- 134 times in
+#     one session here -- and a listing that re-rolled its fate on every poll
+#     would flicker between sold and unsold.
+#   * **EA's tax comes off the proceeds.** Retail took 5%; a market without it
+#     makes listing strictly better than quick-selling at every price.
+#
+# One thing in that build is a scar worth respecting: a sold card **stays in the
+# transfer pile**. Its note records that deleting it crashed the retail parser,
+# "FIFA 14's trade-pile parser dereferences the item even for a closed auction".
+# So a sale here closes the listing and leaves the card in place.
+MARKET_SELL_TAX = 0.05
+
+# (ceiling as a multiple of value, base delay, spread) -- in that order, first
+# match wins. The delays are short by retail standards on purpose: this is a
+# single-player club, and an auction nobody else can see has no reason to make
+# a player wait an hour to find out it worked.
+SALE_TIERS = (
+    (0.85, 18, 28),
+    (1.00, 40, 55),
+    (1.10, 75, 100),
+)
+
+
+def _listing_value(listing: dict) -> int:
+    item = listing.get("itemData")
+    if not isinstance(item, dict):
+        return 0
+    return _price_for(
+        int(item.get("rating") or 0), int(item.get("rareflag") or 0), item
+    )
+
+
+def _sale_delay(listing: dict) -> int | None:
+    """Seconds from listing to sale, or None if nobody ever takes it."""
+    value = _listing_value(listing)
+    try:
+        asking = int(listing.get("buyNowPrice") or 0)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0 or asking <= 0:
+        return None
+    ratio = asking / value
+    for ceiling, base, span in SALE_TIERS:
+        if ratio <= ceiling:
+            trade_id = int(listing.get("tradeId") or 0)
+            item = listing.get("itemData") or {}
+            resource = int(item.get("resourceId") or item.get("assetId") or 0)
+            mixed = (trade_id * 1103515245 + resource * 12345) & 0x7FFFFFFF
+            return base + (mixed % max(1, span))
+    return None
+
+
+def _bid_ladder(listing: dict, elapsed: int, delay: int | None) -> tuple[int, int]:
+    """The bidding so far: what stands, and how many bids have been made.
+
+    Bids climb from the starting bid towards the buy-now on the way to a sale.
+    A listing nobody wants gets none, which is the difference a player should be
+    able to see before it expires rather than after.
+    """
+    if delay is None or elapsed <= 0:
+        return 0, 0
+    starting = max(0, int(listing.get("startingBid") or 0))
+    buy_now = max(starting, int(listing.get("buyNowPrice") or 0))
+    progress = min(1.0, elapsed / max(1, delay))
+    offers = min(4, int(progress * 4) + (1 if progress > 0.05 else 0))
+    if not offers:
+        return 0, 0
+    step = (buy_now - starting) / 4 if buy_now > starting else 0
+    return int(starting + step * (offers - 1)), offers
+
+
+# Members this server sends on an auction that CardsDLL has no name for.
+#
+# -- getting a sold card into the SOLD ITEMS pile ---------------------------
+#
+# The transfer list draws two stacks, SOLD ITEMS and LISTED ITEMS, and for
+# weeks a sold card rendered under LISTED with a relist prompt -- the sale had
+# happened, the coins were paid, and the card would not leave the list.
+#
+# The answer came from Kyro's build (`runtime/kyro/local_identity.py`), which
+# renders the sold stack correctly on the console. Two things it does that this
+# server did not:
+#
+#   1. The tradePile document carries top-level counts -- `sold`, `selling`,
+#      `soldCount`, `activeCount`, `transferListCount`. The stacks are sized
+#      from these; without them the client cannot split the piles and shows
+#      everything as listed. This is the load-bearing part.
+#   2. A sold listing keeps a **positive** `expires` and the sibling time
+#      members (`EXPIRE_TIME`, `expireTime`, `startTime`, `endtime`). This
+#      server sent `expires: -1`, which reads as an auction that lapsed
+#      unsold -- exactly the relist state that was showing.
+#
+# `soldFor` is still not sent -- Kyro carries the sale price in `currentBid`,
+# which the client reads, and keeps no `soldFor` on the wire either. `bidState`
+# stays `none`: Kyro sets it none on every auction, sold ones included.
+#
+# The switch that used to cycle guessed shapes (pileType, saleType, ...) is
+# retired; the shape is known now.
+SOLD_EXPIRES_SECONDS = 3600
+
+
+def _mark_sold(listing: dict, price: int) -> None:
+    """Stamp a listing as sold, in the shape Kyro's build proves renders."""
+    listing["tradeState"] = "closed"
+    listing["currentBid"] = price
+    listing["soldFor"] = price  # internal only; stripped from the wire
+    listing["bidState"] = "none"
+    listing["offers"] = 0
+    # Positive, not -1. A closed auction with expires -1 reads as lapsed-unsold.
+    listing["expires"] = SOLD_EXPIRES_SECONDS
+    listing["EXPIRE_TIME"] = SOLD_EXPIRES_SECONDS
+    listing["expireTime"] = SOLD_EXPIRES_SECONDS
+    listing["startTime"] = 0
+    listing["endtime"] = 2147483647
+    item = listing.get("itemData")
+    if isinstance(item, dict):
+        # Left in the pile deliberately: the retail trade-pile parser
+        # dereferences the item even for a closed auction, and both the PC
+        # revival and Kyro's build record an access violation from deleting it.
+        item["itemState"] = "sold"
+        item["lastSalePrice"] = price
+
+
+# `soldFor` alone. Kyro sends `tradeOwner`, so it is no longer stripped -- the
+# previous removal was wrong, and a member the working reference sends stays.
+UNNAMED_AUCTION_MEMBERS = ("soldFor",)
+
+
+def _on_the_wire(listing: dict) -> dict:
+    return {k: v for k, v in listing.items() if k not in UNNAMED_AUCTION_MEMBERS}
+
+
+# -- listing a card from the standalone Transfer List screen ----------------
+#
+# The screen says "This item is not currently listed. Press (A) to list this
+# item." -- so it knows the card is unlisted and it offers the action. Pressing
+# A sends **no request at all**, so the client aborts before the network: it is
+# refusing to open the price dialog on the data it has.
+#
+# The entry already matches Kyro's build field for field, so the remaining
+# candidates are things Kyro does not send either. Read per request from
+# `runtime/unlisted-shape.txt`, so a candidate can be tried by backing out of
+# the screen and re-entering rather than relaunching. `tools/unlisted_shape.py`
+# drives it.
+UNLISTED_SHAPE_FILE = (
+    Path(__file__).resolve().parent.parent / "runtime" / "unlisted-shape.txt"
+)
+
+
+def unlisted_shape() -> str:
+    override = os.environ.get("FIFA14_UNLISTED_SHAPE")
+    if override:
+        return override.strip().lower()
+    try:
+        return UNLISTED_SHAPE_FILE.read_text().strip().lower() or "plain"
+    except OSError:
+        return "plain"
+
+
+# -- the trade id an unlisted card is given ---------------------------------
+#
+# Measured on the console, 20 August 2026. A card on the transfer list that was
+# never listed needs **two** things before FUT HUB > TRANSFER LIST will act on
+# it, and neither works without the other:
+#
+#   a real `tradeId`     `GetCardIdFromTradeId` is a native binding in
+#                        CardsDLL's ION_CardInventory table, beside
+#                        `GetTradePileResults`, `GetCardOptions` and
+#                        `GetCardIDsForPile` (registration table at 0x89221040).
+#                        That is how the screen gets from the row under the
+#                        cursor to a card. With `tradeId` 0 -- which every
+#                        unlisted row carried for two months -- the row resolves
+#                        to no card at all, and `GetCardOptions` is asked about
+#                        nothing. Given an id, the row stops being a bare card
+#                        and becomes an auction the screen can describe: the
+#                        panel changed from "This item is not currently listed"
+#                        to Start Price / Buy Now / Current Bid / Time Remaining
+#                        on that change alone.
+#
+#   `tradeState`         ...but still with no actions, because the panel reads
+#   `expired`            the clock and the *actions* read the state, and
+#                        `inactive` is not a state this screen has actions for.
+#                        `expired` is: an auction that lapsed can be relisted.
+#                        With both, the button bar went from `B / RS / RS` to
+#                        `A List on Transfer Market / B Back / X Actions /
+#                        RB Relist All / RS Views`, and a card was listed and
+#                        its sale collected from that screen end to end.
+#
+# The ids come from a block above the real listings (2_000_000_000+) and the
+# market (1_900_000_000+), so a pseudo id can never be mistaken for either, and
+# `withdraw` keys on that boundary to tell the two apart. They are stable for as
+# long as the server is up, because the screen re-reads the pile on every poll
+# and a row whose id moved under it is a row it cannot keep selected.
+#
+# What this costs: the row is presented as a lapsed auction. The card draws in
+# the maroon expired tint, the panel says "No buyer was found for this item",
+# and Time Remaining reads Expired -- none of which is true of a card that was
+# never listed. Whether another state in CardsDLL's table (`free`, `forSale`,
+# `invalid`) binds the same actions without the claim is open, and testable
+# through the overlay below without a relaunch.
+UNLISTED_TRADE_ID_BASE = 2_100_000_000
+_unlisted_trade_ids: dict[int, int] = {}
+
+
+def _pseudo_trade_id(item_id: int) -> int:
+    """A stable, non-zero trade id for one card awaiting listing."""
+    if item_id not in _unlisted_trade_ids:
+        _unlisted_trade_ids[item_id] = (
+            UNLISTED_TRADE_ID_BASE + len(_unlisted_trade_ids) + 1
+        )
+    return _unlisted_trade_ids[item_id]
+
+
+# -- candidates that cost no relaunch ---------------------------------------
+#
+# The named candidates below are code, so adding one means restarting the
+# server -- and restarting the server means relaunching the title, because the
+# account state is rewritten from the title's own session within seconds of
+# being cleared. One relaunch per idea is a bad rate for a screen that is being
+# bisected.
+#
+# So a candidate can also be written as data, in `runtime/unlisted-shapes.json`:
+#
+#     {"nosaleprice": {"base": "asitwas",
+#                      "entry": {"set": {"startingBid": 150}},
+#                      "item":  {"remove": ["lastSalePrice"]}}}
+#
+# `base` names a coded candidate to build on, and may be omitted. The file is
+# read per request like the switch itself, so a candidate written this way is
+# live the moment it is saved.
+UNLISTED_SHAPES_FILE = (
+    Path(__file__).resolve().parent.parent / "runtime" / "unlisted-shapes.json"
+)
+
+
+def custom_unlisted_shapes() -> dict:
+    """Candidates written as data, or {} if there are none to read."""
+    try:
+        loaded = json.loads(UNLISTED_SHAPES_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _overlay(entry: dict, spec: dict) -> dict:
+    """Apply one data-written candidate to an entry, on the way out."""
+    entry = dict(entry)
+    item = dict(entry["itemData"])
+    entry["itemData"] = item
+    for name, node in (("entry", entry), ("item", item)):
+        block = spec.get(name)
+        if not isinstance(block, dict):
+            continue
+        for member in block.get("remove") or ():
+            node.pop(member, None)
+        for member, value in (block.get("set") or {}).items():
+            node[member] = value
+    return entry
+
+
+def _apply_unlisted_shape(entry: dict, shape: str) -> dict:
+    """One candidate shape for a card awaiting listing.
+
+    The coded candidates are retired. Ten of them were cycled against the
+    console -- `prices`, `forsale`, `itemid`, `duration`, `club`, `listinglike`,
+    `asitwas`, `barecard`, `emptystate`, `tradeid` -- and the answer they were
+    looking for is in `_unlisted_entry` now, so `plain` is the measured shape
+    rather than the control it used to be. What remains is the overlay, because
+    the presentation is still open: see docs/TRADE_PILE.md.
+
+    Applied on the way out; nothing held is mutated, so a candidate that fails
+    leaves nothing to undo.
+    """
+    custom = custom_unlisted_shapes().get(shape)
+    if isinstance(custom, dict):
+        base = custom.get("base")
+        if isinstance(base, str) and base != shape:
+            entry = _apply_unlisted_shape(entry, base)
+        return _overlay(entry, custom)
+    return entry
+
+
+def _fill_card_aliases(card: dict) -> bool:
+    """Give one saved card the alias members `_player_item` now sends.
+
+    Returns whether anything was added. Absent members only -- a value already
+    on the card is its own.
+    """
+    if card.get("itemType") != "player":
+        return False
+    item_id = card.get("id") or card.get("itemId")
+    asset = card.get("assetId")
+    if not item_id:
+        return False
+    defaults = {
+        "itemId": item_id,
+        "teamId": card.get("teamid"),
+        "rareFlag": card.get("rareflag"),
+        "definitionId": asset,
+        "playerId": asset,
+        "morale": 99,
+        "loyaltyBonus": 1,
+        "resourceGameYear": 2014,
+        "owners": 1,
+        "pile": PILE_CLUB,
+    }
+    added = False
+    for member, value in defaults.items():
+        if member not in card and value is not None:
+            card[member] = value
+            added = True
+    return added
 
 
 class CardActions:
@@ -2748,10 +4077,13 @@ class CardActions:
     def move(self, document: dict) -> bytes:
         """PUT /item -- send to club, or to the transfer list.
 
-        The body is {"itemData":[{"id":N,"pile":7}, ...]} and each entry has to
-        be acknowledged individually. Answering with a club search, which is
-        what the old fixture did, acknowledges nothing: the card stays in the
-        pack screen and the button appears dead.
+        The body is {"itemData":[{"id":N,"pile":"club","swap":0,"tradeId":0}]}
+        and each entry has to be acknowledged individually. Answering with a
+        club search, which is what the old fixture did, acknowledges nothing:
+        the card stays in the pack screen and the button appears dead.
+
+        The pile is a **name**, not the number this docstring used to claim --
+        "club" or "trade". See PILE_NAMES for what reading it as a number cost.
         """
         entries = document.get("itemData") if isinstance(document, dict) else None
         results = []
@@ -2762,16 +4094,43 @@ class CardActions:
                 item_id = int(entry.get("id") or entry.get("itemId") or 0)
             except (TypeError, ValueError):
                 continue
-            pile = entry.get("pile", PILE_CLUB)
-            try:
-                pile = int(pile)
-            except (TypeError, ValueError):
-                pile = PILE_CLUB
+            pile = _pile_number(entry.get("pile", PILE_CLUB))
+            if pile is None:
+                # A pile this server cannot name. Refusing is deliberate: the
+                # old code defaulted to the club here, and that default is
+                # precisely what swallowed fifteen transfer-list moves without
+                # anyone being able to see it happen.
+                self.unmatched.append(item_id)
+                results.append(
+                    {
+                        "id": item_id,
+                        "success": False,
+                        "reason": "unknown pile",
+                        "errorCode": 461,
+                        "pile": entry.get("pile"),
+                    }
+                )
+                continue
             item = self._take_pending(item_id)
             if item is None:
                 for index, owned in enumerate(self.club):
                     if owned["id"] == item_id:
                         item = self.club.pop(index)
+                        break
+            if item is None:
+                # And the transfer list. This was missing, and it went unnoticed
+                # for as long as the standalone Transfer List screen offered no
+                # actions: a card already on the list could only be moved from
+                # the item screen, which reaches it through the club. The moment
+                # that screen bound its menu, "Send to Club" on a listed-but-not
+                # -sold card answered 461 and the card stayed where it was.
+                #
+                # Not popped: both branches below manage transfer membership
+                # themselves, and popping here would make the transfer-to-
+                # transfer case drop the card.
+                for held in self.transfer:
+                    if held["id"] == item_id:
+                        item = held
                         break
             if item is not None:
                 if pile == PILE_TRANSFER:
@@ -2780,11 +4139,16 @@ class CardActions:
                     # inventory too, or the card shows in both places at once,
                     # which is what looked like a duplicate.
                     item["itemState"] = "forSale"
+                    item["pile"] = PILE_TRANSFER
                     self._forget(item_id)
                     if not any(held["id"] == item_id for held in self.transfer):
                         self.transfer.append(item)
                 else:
                     item["itemState"] = "free"
+                    item["pile"] = PILE_CLUB
+                    self.transfer[:] = [
+                        held for held in self.transfer if held["id"] != item_id
+                    ]
                     self._keep(item)
             if item is None:
                 # An id neither pending nor already held. This used to be
@@ -2953,17 +4317,32 @@ class CardActions:
             "bidState": "none",
             "tradeOwner": True,
             "expires": duration,
-            "sellerName": "Fondateur FUT",
+            # When it went up, and for how long. Without these a listing had no
+            # clock at all: `expires` was a number that never moved and nothing
+            # could tell a fresh auction from one that had run its course.
+            "listedAt": int(time.time()),
+            "duration": duration,
+            "sellerName": SELLER_NAME,
             "sellerEstablished": 2013,
             "sellerId": 0,
             "confidenceValue": 100,
         }
         self.listings[trade_id] = listing
-        for pool in (self.transfer, self.club):
-            for index, owned in enumerate(pool):
-                if owned["id"] == item_id:
-                    pool.pop(index)
-                    break
+        if isinstance(listing["itemData"], dict):
+            listing["itemData"]["pile"] = PILE_TRANSFER
+        self.transfer[:] = [
+            held for held in self.transfer if held["id"] != item_id
+        ]
+        self._take_pending(item_id)
+        # `_forget`, not a pop from `self.club`.
+        #
+        # `self.club` and `self.inventory.items` are two lists holding the same
+        # cards -- `_keep` appends to both -- and popping only the first left
+        # the card in the club for every screen that reads the inventory. All
+        # thirteen cards sold in the session of 17 August 2026 were still in
+        # the club afterwards, which is what "the card stays in my club" was,
+        # and it is also why sold cards came back as duplicates.
+        self._forget(item_id)
         return json.dumps(listing, separators=(",", ":")).encode()
 
     def _unlisted_entry(self, item: dict) -> dict:
@@ -2977,16 +4356,49 @@ class CardActions:
         symptom is reported against the PC revival, where unlisted pile-5 cards
         were disappearing from the Transfer List.
 
-        Every member here already goes out on a real listing; only the values
-        differ. `tradeId` 0 and `expires` -1 are what say "not up for sale",
-        and the screen needs the entry to exist at all before it can offer to
-        list it.
+        `tradeId` 0 is the native "no auction yet" sentinel. The state is
+        `inactive` because Kyro's build tags an unlisted pile card that way. The
+        card carries `pile` 5 and `itemState` free so the screen knows it is on
+        the list and available.
+
+        This docstring used to add that "with an empty state the transfer-list
+        screen would not act on the card at all -- pressing A did nothing over a
+        card the player had sent there to list", and that claim is withdrawn. It
+        was written five hours after unlisted rows first reached that screen at
+        all, it was never measured against the console, and the player reports
+        the press **working** in exactly the window it describes as broken --
+        18 August 09:45 to 14:49, between `_pile_number` and this change.
+
+        So the change this docstring belongs to is a live suspect for breaking
+        the press it was named for. `asitwas` in `_apply_unlisted_shape` puts
+        the window back; see docs/TRADE_PILE.md.
         """
+        card = dict(item)
+        card["pile"] = PILE_TRANSFER
+        card["itemState"] = "free"
+        # `tradeable` True is what lets the screen act on the card: pressing A
+        # over an unlisted transfer-list card did nothing without it. Kyro's
+        # build sets both, and this server sent untradeable False but never the
+        # positive `tradeable`, so the List Item action was never offered.
+        card["untradeable"] = False
+        card["tradeable"] = True
+        # Field-for-field what Kyro's build sends, because deviating from it is
+        # what kept this card inert. Two deviations mattered enough to name:
+        #
+        #   no `id`   Kyro's auction carries `tradeId` and no `id`. This sent
+        #             `"id": 0` on every unlisted entry, so ten cards arrived
+        #             sharing one identifier -- and a screen that keys entries
+        #             by `id` cannot act on any of them.
+        #   endtime   2147483647, not 0. A zero end time reads as an auction
+        #             already over, which is not a card awaiting listing.
+        #
+        # The seller fields are the club's own, not blanks: this card belongs to
+        # the player, and `sellerId` 0 with an empty name is not a seller the
+        # screen recognises as you.
         return {
-            "tradeId": 0,
-            "id": 0,
-            "itemData": item,
-            "tradeState": "",
+            "tradeId": _pseudo_trade_id(card.get("id") or 0),
+            "itemData": card,
+            "tradeState": "expired",
             "startingBid": 0,
             "buyNowPrice": 0,
             "currentBid": 0,
@@ -2995,29 +4407,118 @@ class CardActions:
             "bidState": "none",
             "tradeOwner": True,
             "expires": -1,
-            "sellerName": "",
-            "sellerEstablished": 0,
-            "sellerId": 0,
-            "confidenceValue": 0,
+            "EXPIRE_TIME": 0,
+            "expireTime": 0,
+            "startTime": 0,
+            "endtime": 2147483647,
+            "sellerName": SELLER_NAME,
+            "sellerEstablished": 2013,
+            "sellerId": PERSONA.id,
+            "confidenceValue": 100,
         }
 
+    def settle_market(self) -> list[dict]:
+        """Advance every live listing, and sell the ones a buyer would take.
+
+        Called from the routes the client already polls -- `tradePile` and
+        `trade/status` -- rather than from a timer, because there is no timer
+        here and the client asks constantly anyway.
+
+        Returns what sold, so the caller can credit the wallet and journal it.
+        Nothing is credited in here: this object does not own the coins.
+        """
+        now = int(time.time())
+        sold: list[dict] = []
+        for listing in self.listings.values():
+            if listing.get("tradeState") != "active":
+                continue
+            listed_at = int(listing.get("listedAt") or 0)
+            if not listed_at:
+                listing["listedAt"] = listed_at = now
+            duration = max(1, int(listing.get("duration") or 3600))
+            elapsed = max(0, now - listed_at)
+            delay = _sale_delay(listing)
+
+            if delay is not None and elapsed >= delay:
+                price = max(0, int(listing.get("buyNowPrice") or 0))
+                net = max(0, int(round(price * (1.0 - MARKET_SELL_TAX))))
+                # The shape of a sold listing, taken from Kyro's build, which
+                # renders the SOLD ITEMS pile correctly on the console. See
+                # `_mark_sold` and `docs/TRADE_PILE.md` -- this is a reference
+                # match, not a guess. The switch that used to guess it is gone.
+                _mark_sold(listing, price)
+                sold.append({"listing": listing, "price": price, "net": net})
+                continue
+
+            remaining = duration - elapsed
+            if remaining <= 0:
+                # Ran its course with no buyer. The card comes back rather than
+                # vanishing -- a listing that expires into nothing is how cards
+                # were lost before.
+                listing["tradeState"] = "expired"
+                listing["expires"] = -1
+                item = listing.get("itemData")
+                if isinstance(item, dict):
+                    item["itemState"] = "free"
+                    if item not in self.transfer:
+                        self.transfer.append(item)
+                continue
+
+            listing["expires"] = int(remaining)
+            bid, offers = _bid_ladder(listing, elapsed, delay)
+            if bid:
+                listing["currentBid"] = bid
+                listing["offers"] = offers
+                listing["bidState"] = "none"
+        return sold
+
+
     def trade_pile(self, coins: int) -> bytes:
-        """The transfer list: what is up for sale, and what is merely on it."""
+        """The transfer list: what is up for sale, and what is merely on it.
+
+        Sorted the way Kyro's build sorts it -- active first, then closed
+        (sold), then everything else -- and carrying the top-level counts the
+        SOLD ITEMS and LISTED ITEMS stacks are sized from. Without those counts
+        the client cannot tell the two piles apart, which is why every sold
+        card sat under LISTED.
+        """
+        order = {"active": 0, "closed": 1}
+        entries = sorted(
+            self.listings.values(),
+            key=lambda l: (order.get(l.get("tradeState"), 2), l.get("tradeId") or 0),
+        )
         listed = {
             listing["itemData"].get("id")
             for listing in self.listings.values()
             if isinstance(listing.get("itemData"), dict)
         }
-        entries = list(self.listings.values()) + [
-            self._unlisted_entry(item)
+        shape = unlisted_shape()
+        entries += [
+            _apply_unlisted_shape(self._unlisted_entry(item), shape)
             for item in self.transfer
             if item.get("id") not in listed
         ]
+
+        active = sum(1 for l in self.listings.values() if l.get("tradeState") == "active")
+        sold = sum(1 for l in self.listings.values() if l.get("tradeState") == "closed")
+        unlisted = len(entries) - len(self.listings)
         return json.dumps(
             {
-                "auctionInfo": entries,
+                "auctionInfo": [_on_the_wire(entry) for entry in entries],
                 "duplicateItemIdList": [],
                 "total": len(entries),
+                # The counts the stacks are drawn from. Every alias Kyro sends,
+                # because which one this console binds to is not established and
+                # they are harmless together.
+                "selling": active,
+                "sold": sold,
+                "available": unlisted,
+                "unlisted": unlisted,
+                "activeCount": active,
+                "soldCount": sold,
+                "transferListCount": len(entries),
+                "tradePileCount": len(entries),
+                "tradePileItems": len(entries),
                 "credits": coins,
                 "totalCredits": coins,
                 "coins": coins,
@@ -3026,18 +4527,107 @@ class CardActions:
         ).encode()
 
     def withdraw(self, trade_id: int) -> bytes:
-        """Pull a listing back; the card returns to the transfer pile."""
+        """Remove a listing from the transfer list.
+
+        Two cases, the way Kyro's build splits them:
+
+          sold (`closed`)  the card is gone -- the coins were credited when it
+                           settled, and "remove from Transfer List" just clears
+                           the sold card. It is never resurrected into the club;
+                           returning it to the transfer pile, as this used to do
+                           for every listing, is how a card you had sold came
+                           back as a phantom you could list again.
+          active           an unsold withdrawal: the card goes back to the
+                           transfer pile so it can be relisted or sent to club.
+
+        The reply carries `tradeId` as well as `id`; the collect route reads it.
+        """
+        if trade_id >= UNLISTED_TRADE_ID_BASE:
+            # A card that was never listed: the trade id is the one this server
+            # invented so the screen could resolve the row. There is no auction
+            # to withdraw, so "remove from the transfer list" means what it says
+            # -- the card goes back to the club rather than staying on a list it
+            # has just been taken off, which is how it read before.
+            for held in list(self.transfer):
+                if _pseudo_trade_id(held["id"]) == trade_id:
+                    held["itemState"] = "free"
+                    held["pile"] = PILE_CLUB
+                    self.transfer.remove(held)
+                    self._keep(held)
+                    break
+            return json.dumps(
+                {"id": trade_id, "tradeId": trade_id}, separators=(",", ":")
+            ).encode()
+
         listing = self.listings.pop(trade_id, None)
         if listing and isinstance(listing.get("itemData"), dict):
             item = listing["itemData"]
-            # `id`, not `assetId`. The guard is "is this a card at all", and
-            # `assetId` stopped answering that the moment a consumable started
-            # carrying `cardassetid` instead -- withdrawing a listed contract
-            # dropped it on the floor, silently, exactly the way the lost pack
-            # cards used to go.
-            if item.get("id"):
-                self.transfer.append(item)
-        return json.dumps({"id": trade_id}, separators=(",", ":")).encode()
+            if listing.get("tradeState") == "closed":
+                # Sold and collected. Nothing returns.
+                pass
+            elif item.get("id"):
+                # `id`, not `assetId`: the guard is "is this a card at all", and
+                # `assetId` stopped answering that once a consumable carried
+                # `cardassetid` instead.
+                item["itemState"] = "free"
+                item["pile"] = PILE_TRANSFER
+                if not any(held["id"] == item["id"] for held in self.transfer):
+                    self.transfer.append(item)
+        return json.dumps(
+            {"id": trade_id, "tradeId": trade_id}, separators=(",", ":")
+        ).encode()
+
+    def restamp_cards(self) -> int:
+        """Add the alias members to cards saved before they were sent.
+
+        A card written by an older build carries `id` and no `itemId`, and the
+        standalone Transfer List screen builds no action menu for such a card --
+        it renders it and reads its state, then offers nothing. Every card the
+        club holds is brought up to the current shape on load, so a card saved
+        months ago behaves like one packed today.
+
+        Only fills what is absent. A card that already carries a member keeps
+        its own value, so nothing a match or a consumable wrote is overwritten.
+        """
+        repaired = 0
+        pools = [self.club, self.transfer, self.shop.pending]
+        if self.inventory is not None:
+            pools.append(self.inventory.items)
+        for listing in self.listings.values():
+            item = listing.get("itemData")
+            if isinstance(item, dict):
+                pools.append([item])
+        seen: set[int] = set()
+        for pool in pools:
+            for card in pool:
+                if not isinstance(card, dict):
+                    continue
+                key = id(card)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if _fill_card_aliases(card):
+                    repaired += 1
+        return repaired
+
+    def restamp_sold(self) -> None:
+        """Re-apply the sold shape to listings loaded from an older save.
+
+        A card sold before the SOLD-pile fix was saved with `expires: -1` and
+        without the sibling time members, so on load it read as an auction that
+        lapsed unsold and stayed under LISTED while a freshly sold card moved to
+        SOLD. This brings the old ones up to the shape `_mark_sold` writes, so
+        every sold card sits in the sold stack regardless of when it sold.
+        """
+        for listing in self.listings.values():
+            if listing.get("tradeState") == "closed":
+                price = int(
+                    listing.get("soldFor")
+                    or listing.get("currentBid")
+                    or listing.get("buyNowPrice")
+                    or 0
+                )
+                _mark_sold(listing, price)
 
 
 # -- everything a club owns that is not a player ---------------------------
@@ -3048,23 +4638,70 @@ class CardActions:
 
 CLUB_ITEM_ID_BASE = 1_750_000_000
 
+# Club item ids come from the family and the asset, never from a running
+# counter. This is not tidiness, it is a save-compatibility rule.
+#
+# The seed used to number every club item in sequence, so the ids depended on
+# how many of each family happened to exist. Expanding badges from four to 556
+# moved stadium and ball down by four -- and a save written before the change
+# carried `changed` entries for 1750000269 and 1750000273, which were a stadium
+# and a ball then and would have been a ball and a badge after. `ClubSave.load`
+# verifies the type before overwriting, so nothing would have been corrupted,
+# but the player's activated stadium and ball would have gone quietly missing.
+#
+# With a block per family, adding a card to one family cannot renumber another,
+# and a stadium keeps its id for as long as its asset id means the same thing.
+#
+# Consumables keep the running counter from CLUB_ITEM_ID_BASE. There are 261 of
+# them, they come out of the card database in a fixed order, and every id in a
+# real save's `sold` list is one of theirs.
+CLUB_ITEM_BLOCKS = {
+    "kit": 1_000_000,
+    "stadium": 2_000_000,
+    "ball": 3_000_000,
+    "badge": 4_000_000,
+}
+
+
+def club_item_id(kind: str, asset_id: int) -> int:
+    """The stable item id for one club item."""
+    return CLUB_ITEM_ID_BASE + CLUB_ITEM_BLOCKS[kind] + int(asset_id)
+
+
+# The probe sweep gets a block of its own, well clear of everything real, so a
+# probe run can never be mistaken for a club item in a save.
+PROBE_ID_BASE = 1_790_000_000
+
+
+def _probe_resource(kind: str, asset: int) -> int:
+    """The resourceId a probe card must carry to render.
+
+    A badge's crest resolves from its **resourceId**, not its asset id -- the
+    same asset 241 rendered FC Barcelona at resourceId 6000000 and drew NOT
+    FOUND at 6900241, 18 August 2026. The first probe put every club item at
+    PROBE_RESOURCE_BASE + asset (6_900_000+), outside the badge resource range,
+    so all ten showed NOT FOUND and hid the working club behind them.
+
+    So a probe carries the family's **real** resource formula and varies only
+    the asset. For a badge that is BADGE_RESOURCE_BASE + club id, exactly what
+    the normal seed sends. For kit, stadium and ball it is the family's base
+    counted from its first asset -- their art may resolve from the asset or the
+    resource, and this leaves that the only variable in the sweep.
+    """
+    if kind == "badge":
+        return BADGE_RESOURCE_BASE + asset
+    for name, first_asset, first_resource, _count in CLUB_ITEM_KINDS:
+        if name == kind:
+            return first_resource + (asset - first_asset)
+    return PROBE_RESOURCE_BASE + asset
+
 # The consumables come out of the game's own card database -- see
 # tools/build_consumables.py. They used to be invented here: three grades per
 # family with asset ids counted up from 1000, which drew NOT FOUND art on every
 # card, named all of them "Entraînement equipe" and applied nothing. The title
 # looks a consumable up by its subtype and draws it by its asset id, so neither
 # is ours to choose.
-# The catalogue, overridable by environment so a probe build can be swapped in
-# without editing the file the real club is served from. `docs/CONSUMABLES.md`
-# explains what a probe is for: the database says which cards exist and says
-# nothing about which family each block of subtypes belongs to, so the only
-# source for that is the title itself, which renders each card from its own
-# copy of the database. Serving it a deliberate mixture and reading the screen
-# is how that gets settled.
-CONSUMABLE_FILE = Path(
-    os.environ.get("FIFA14_CONSUMABLES")
-    or Path(__file__).resolve().parent / "fifa14_consumables.json"
-)
+CONSUMABLE_FILE = Path(__file__).resolve().parent / "fifa14_consumables.json"
 
 # Contracts and fitness are what a club actually runs out of, so it carries a
 # stack of each; one of everything else is enough to apply it.
@@ -3077,14 +4714,71 @@ def _consumable_catalogue() -> list[dict]:
     except (OSError, ValueError, KeyError):
         return []
 
+# The four families whose art ids are known to resolve on the console.
+#
+# Kits 14-17, badges 241-244, stadiums 6-8 and balls 23-25 were each seen
+# rendering with their own artwork -- "Stade Gerland" on a stadium card,
+# 17 August 2026 -- so these asset ids address something real.
 CLUB_ITEM_KINDS = [
     ("kit", 14, 6300000, 4),
-    ("badge", 241, 6000000, 4),
     ("stadium", 6, 6200000, 3),
     ("ball", 23, 8120091, 3),
+]
+
+# Managers and staff, which are NOT in the draw or the seed.
+#
+# Their asset ids were invented here like every other club item's, but unlike
+# the four above nothing has ever confirmed they resolve -- and on 17 August
+# 2026 a Premium Gold Pack handed out asset 4, staff index 2, and it drew the
+# grey FIFA 14 card back with no front at all. The two ranges overlap at asset
+# 2, which is on its own enough to say nobody chose them against a table.
+#
+# A blank card is not merely ugly. The pack reveal is the screen with the
+# freeze history in this project, and an unrenderable card is the shape that
+# caused it. These stay out until a real table names them; the club held none
+# anyway, and `squad_manager()` already declines to field one for the same
+# reason (see `manager_slot`).
+CLUB_ITEM_KINDS_UNVERIFIED = [
     ("manager", 1, 6100000, 2),
     ("staff", 2, 6150000, 3),
 ]
+
+
+# Training cards draw NOT FOUND, and their art ids are the only outliers.
+#
+# Every consumable family that renders uses an id in a narrow band -- contracts
+# 7 and 8, healing 9, fitness 10, position 34/35/43, chemistry styles 50.
+# Training uses **1 and 3**, and training is the only family drawing the green
+# placeholder. `tools/build_consumables.py` took those two out of
+# `fcc_trainingcards`, which carries a card art id and no name, and its own note
+# says which block is which is "NOT established".
+#
+# `FIFA14_TRAINING_ASSET_SWEEP=N` gives each training card a different art id
+# counting up from N, so one pass over the Apply Consumable picker reads 42 ids
+# at once. A card that renders has a real id; the rest stay NOT FOUND, which
+# they already are, so the sweep cannot make the screen worse than it is.
+#
+# The club-item method: an id the game does not know draws a placeholder, so
+# the placeholder is the measurement.
+def training_asset_sweep() -> int:
+    try:
+        return max(0, int(os.environ.get("FIFA14_TRAINING_ASSET_SWEEP", "0")))
+    except ValueError:
+        return 0
+
+
+_TRAINING_SWEEP_SEEN: dict[int, int] = {}
+
+
+def _training_asset(card: dict) -> int:
+    """The art id a training card goes out with, swept if a sweep is armed."""
+    first = training_asset_sweep()
+    if not first or card.get("itemType") != "training":
+        return card["assetId"]
+    resource = int(card["definitionId"])
+    if resource not in _TRAINING_SWEEP_SEEN:
+        _TRAINING_SWEEP_SEEN[resource] = first + len(_TRAINING_SWEEP_SEEN)
+    return _TRAINING_SWEEP_SEEN[resource]
 
 
 def _consumable_item(card: dict, item_id: int, item_state: str = "free") -> dict:
@@ -3120,7 +4814,7 @@ def _consumable_item(card: dict, item_id: int, item_state: str = "free") -> dict
         "id": item_id,
         "itemId": item_id,
         "resourceId": card["definitionId"],
-        "cardassetid": card["assetId"],
+        "cardassetid": _training_asset(card),
         "cardsubtypeid": card["cardsubtypeid"],
         "rating": card["rating"],
         "rareflag": rare,
@@ -3131,9 +4825,9 @@ def _consumable_item(card: dict, item_id: int, item_state: str = "free") -> dict
         "amount": card["amount"],
         "itemType": CONSUMABLE_WIRE_TYPE.get(card["itemType"], "development"),
         "itemState": item_state,
-        "discardValue": 0,
+        "discardValue": consumable_discard_value(card["rating"]),
         "lastSalePrice": 0,
-        "timestamp": 1,
+        "timestamp": issued_now(),
         "owners": 1,
         "untradeable": False,
         "tradeable": True,
@@ -3163,44 +4857,147 @@ def _consumable_item(card: dict, item_id: int, item_state: str = "free") -> dict
 
 def _club_item(
     kind: str, asset_id: int, resource_id: int, item_id: int,
-    item_state: str = "free",
+    item_state: str = "free", quality: int = 0,
+    rating: int | None = None, rare: int | None = None,
+    discard: int | None = None,
 ) -> dict:
-    """One kit, badge, stadium, ball, manager or staff card."""
-    return {
+    """One kit, badge, stadium or ball card.
+
+    Each kind carries members of its own, and sending only `assetId` and
+    `resourceId` is why My Club drew grey placeholders where the badges and
+    kits should be. The stadiums rendered on the same screen because a stadium
+    resolves from its asset alone; nothing else does.
+
+    The extra members follow the PC revival's proven envelope:
+
+        stadium   stadiumid, StadiumId, category 4
+        badge     badgeDBid, badge, badgeId, badgeResourceId,
+                  badgeDefinitionId -- and itemType `custom`
+        kit       category, teamkittypetechid (0 home, 1 away)
+
+    `category` is 4 for a stadium and 0 otherwise, which is that build's own
+    default rather than a number chosen here.
+    """
+    wire = BADGE_WIRE_TYPE if kind == "badge" else kind
+    # A card with no rating has no tier, and the card screen draws a card with
+    # no tier as the lowest one -- which is why every kit and badge in the club
+    # read bronze non-rare. `quality` indexes CLUB_ITEM_QUALITY.
+    if rating is None or rare is None:
+        rating, rare = CLUB_ITEM_QUALITY[int(quality) % len(CLUB_ITEM_QUALITY)]
+    if discard is None:
+        discard = club_discard_value(rating, rare)
+    item = {
         "id": item_id,
         "assetId": asset_id,
         "resourceId": resource_id,
-        "rating": 0,
-        "itemType": kind,
+        "rating": rating,
+        "itemType": wire,
         "itemState": item_state,
-        "discardValue": 0,
+        "discardValue": discard,
         "lastSalePrice": 0,
-        "timestamp": 1,
+        "timestamp": issued_now(),
         "untradeable": False,
-        "rareflag": 0,
+        "rareflag": rare,
     }
+    if kind == "stadium":
+        item["category"] = 4
+        item["stadiumid"] = asset_id
+        item["StadiumId"] = asset_id
+    elif kind == "badge":
+        item["category"] = 0
+        item["badgeDBid"] = resource_id
+        item["badge"] = asset_id
+        item["badgeId"] = asset_id
+        item["badgeResourceId"] = resource_id
+        item["badgeDefinitionId"] = resource_id
+    elif kind == "kit":
+        item["category"] = 0
+        # Home is the slot the club fields first; away is everything else.
+        item["teamkittypetechid"] = 0 if item_state == "activeHomeKit" else 1
+    return item
 
 
 def _club_extras() -> list[dict]:
-    """Consumables, kits, badges, stadiums, balls and staff."""
+    """Consumables, kits, badges, stadiums and balls."""
     items: list[dict] = []
     next_id = CLUB_ITEM_ID_BASE
 
     for card in _consumable_catalogue():
-        # A card may ask for its own count. Nothing in the shipped catalogue
-        # does; a probe build uses it to encode which block a card came from
-        # in the one field the screen shows plainly -- the quantity badge --
-        # so a single screenshot identifies every card in the list.
-        copies = card.get("copies") or CONSUMABLE_COPIES.get(card["itemType"], 1)
-        for _ in range(copies):
+        if card["itemType"] in UNSEEDED_CONSUMABLE_TYPES:
+            continue
+        for _ in range(CONSUMABLE_COPIES.get(card["itemType"], 1)):
             items.append(_consumable_item(card, next_id))
             next_id += 1
 
-    for kind, asset, resource, count in CLUB_ITEM_KINDS:
-        for index in range(count):
-            items.append(_club_item(kind, asset + index, resource + index, next_id))
-            next_id += 1
+    probe = _club_item_probe()
+    if probe:
+        # FIFA14_CLUB_ITEM_PROBE: seed the roster instead of the club items, so
+        # the club tab is a numbered sweep of asset ids and what renders can be
+        # read straight off the screen. Kept out of packs deliberately -- see
+        # tools/club_item_probe.py for why the club screen is the safe one.
+        # Each roster entry is an (assetId, resourceId) pair. The pair matters:
+        # a club item's ART RESOLVES FROM ITS resourceId, not its asset -- asset
+        # 241 rendered FC Barcelona at resource 6000241 and drew NOT FOUND at
+        # 6900241, same asset, one resource apart. So a sweep varies the
+        # resource and holds the asset at a known-good one.
+        #
+        # The item id counts up rather than deriving from the asset, because a
+        # resource sweep holds the asset constant and derived ids would collide.
+        for kind, pairs in sorted(probe.items()):
+            for index, (asset, resource) in enumerate(pairs):
+                items.append(
+                    _club_item(kind, asset, resource,
+                               PROBE_ID_BASE + CLUB_ITEM_BLOCKS[kind] + index,
+                               quality=3)
+                )
+        return items
+
+    # The club starts with the five items it presents with, and nothing else.
+    #
+    # Everything else -- 1570 kits, badges, stadiums and balls -- comes out of
+    # packs. Seeding the lot would hand the player every item on day one and
+    # leave the club tab 78 pages deep in kits with nothing to collect.
+    #
+    # These five are the same cards `PRESENTATION_ACTIVES` dresses the club in,
+    # so what the club owns and what it wears are one set rather than two that
+    # can disagree.
+    for kind, asset, resource in CLUB_STARTER_ITEMS:
+        items.append(
+            _club_item(kind, asset, resource, club_item_id(kind, asset),
+                       rating=84, rare=1)
+        )
+
     return items
+
+
+PROBE_RESOURCE_BASE = 6_900_000
+PROBE_FILE = Path(__file__).resolve().parent.parent / "work" / "club-item-probe.json"
+
+
+def _club_item_probe() -> dict[str, list[int]]:
+    """The asset-id sweep to seed instead of the club items, if one is armed."""
+    if not os.environ.get("FIFA14_CLUB_ITEM_PROBE"):
+        return {}
+    try:
+        roster = json.loads(PROBE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    def pairs(kind: str, entries: list) -> list[tuple[int, int]]:
+        """Roster entries, as (asset, resource). A bare int keeps the old
+        meaning -- sweep the asset, derive the resource from the family."""
+        out = []
+        for entry in entries:
+            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                out.append((int(entry[0]), int(entry[1])))
+            else:
+                out.append((int(entry), _probe_resource(kind, int(entry))))
+        return out
+
+    return {
+        kind: pairs(kind, entries)
+        for kind, entries in roster.items()
+        if kind in {"kit", "stadium", "ball", "badge"} and entries
+    }
 
 
 # -- what a pack hands out that is not a player -----------------------------
@@ -3214,9 +5011,12 @@ def _club_extras() -> list[dict]:
 # across the 124 templates would be wrong: there are 42 training cards and 13
 # contracts, so an even draw hands out three times more training than contract
 # and a club still runs out of contracts. Retail is the other way round.
+# Position modifiers are drawable now. They were absent from this table
+# entirely, so `position` had no weight and never came out of a pack -- the only
+# ones a club ever had were the ones it was seeded with.
 CONSUMABLE_DRAW_WEIGHT = {
     "contract": 40, "fitness": 22, "healing": 12, "playStyle": 10,
-    "training": 8,
+    "training": 8, "position": 6,
 }
 
 # Subtype 232 is not drawn, and it is not a position modifier either.
@@ -3235,28 +5035,97 @@ CONSUMABLE_DRAW_WEIGHT = {
 #
 # This server's catalogue calls the family `position` and the PC revival's
 # calls it "Internal Position". Both are wrong.
-UNDRAWN_CONSUMABLE_TYPES = {"position"}
+# Held out of the pack draw.
+#
+# `position` is gone from this set: position modifiers render correctly on the
+# console and were being kept out of packs for no stated reason, so the only
+# ones a club ever had were its seeded ones.
+#
+# `squadTraining` takes its place, and for a reason: art id 43 draws NOT FOUND,
+# so packing one hands the player a card that cannot be looked at. It stays out
+# until the id is known -- the same treatment manager and staff got.
+UNDRAWN_CONSUMABLE_TYPES = {"squadTraining", "formationManager"}
 
-# Kits, badges, stadiums and balls have no rating and so no tier of their own.
-# They are drawn in any pack. Managers and staff are the valuable end of the
-# non-player draw and are kept scarce.
+# And out of the club seed, so the tab it was polluting is clean.
+UNSEEDED_CONSUMABLE_TYPES = {"squadTraining", "formationManager"}
+
+# Kits, badges, stadiums and balls carry a rating now (CLUB_ITEM_QUALITY) and
+# so respect a tier. Manager and staff are absent: they are not in
+# CLUB_ITEM_KINDS, so there is nothing to weight.
 CLUB_ITEM_DRAW_WEIGHT = {
-    "kit": 30, "badge": 30, "stadium": 12, "ball": 18, "manager": 4,
-    "staff": 6,
+    "kit": 30, "badge": 30, "stadium": 12, "ball": 18,
 }
 
 # How the non-player slots divide.
 #
-# One, for now: consumables only. Kits, badges, balls and stadiums carry
-# resource ids invented in this file -- 6000000 and up -- because no table in
-# `cards_ng_db` or `fifa_ng_db` names them. Consumables have real ids and the
-# real ids resolve; the invented ones drew blank card backs on the pack screen,
-# two of them in a single Premium Gold Pack.
+# Three quarters consumables, one quarter club items.
 #
-# The club is still seeded with kits and badges, which is where they came from
-# and where the club screen expects them. Lower this once their identities
-# come from the game's own data rather than from a counter.
-PACK_CONSUMABLE_SHARE = 1.0
+# This was 1.0 -- consumables only -- because kits, badges, balls and stadiums
+# drew blank card backs on the pack screen, two of them in a single Premium
+# Gold Pack. Their resource ids are still invented here (6000000 and up; no
+# table in `cards_ng_db` or `fifa_ng_db` names them), but the blank card was
+# never about the id: they were being sent as a bare envelope. With the
+# per-kind members each family needs -- and badges under the retail `custom`
+# family rather than `badge` -- they render, confirmed on the console
+# 17 August 2026.
+#
+# So they are back in the draw. A quarter rather than a half, because a club
+# needs contracts more than it needs a fourth ball.
+PACK_CONSUMABLE_SHARE = 0.75
+
+
+# What quality a club item is.
+#
+# Everything here was rating 0, which is no tier at all, and the card screen
+# draws a card with no tier as the lowest one -- so every kit and badge in the
+# club showed as bronze non-rare however good it looked.
+#
+# The ratings below are a **choice**, not a finding: nothing in the game's data
+# says which of four kits is the gold one, because this server invented their
+# identities in the first place. Spreading them across the three tiers is the
+# useful choice rather than the true one -- it gives bronze and silver packs
+# something of their own to hand out, and it stops the club looking like a
+# jumble sale.
+# What a club item quick-sells for, from the game's own tables.
+#
+#     bronze  13 rare / 3 normal
+#     silver  37 rare / 14 normal
+#     gold    60 rare / 31 normal
+#
+# Gold normal (31) is worth less than silver rare (37). That is the real table,
+# not a slip -- FIFA 14 pays for the rare flag more than for the tier.
+#
+# Balls carry one documented value, bronze normal at 15, and nothing for the
+# other grades; `fifa14_clubitems.json` uses it where it applies.
+CLUB_DISCARD = {
+    ("bronze", 0): 3, ("bronze", 1): 13,
+    ("silver", 0): 14, ("silver", 1): 37,
+    ("gold", 0): 31, ("gold", 1): 60,
+}
+
+
+CLUBITEM_FILE = Path(__file__).resolve().parent / "fifa14_clubitems.json"
+
+
+def _clubitem_catalogue() -> list[dict]:
+    """Every club item the console was seen to render.
+
+    1570 of them across four families, built by `tools/build_clubitems.py` from
+    the probe sessions of 18-19 August 2026. Before this the server invented
+    fourteen, which is why the same Barcelona third kit kept coming out of
+    packs -- four kits was nearly the whole pool.
+    """
+    try:
+        return json.loads(CLUBITEM_FILE.read_text())["clubitems"]
+    except (OSError, ValueError, KeyError):
+        return []
+
+
+def club_discard_value(rating: int, rare: int) -> int:
+    return CLUB_DISCARD.get((_extra_tier(rating), 1 if rare else 0), 3)
+
+
+CLUB_ITEM_QUALITY = ((65, 0), (72, 0), (80, 0), (84, 1))
 
 _PACK_EXTRAS: dict[tuple[str, str], list[dict]] | None = None
 
@@ -3266,6 +5135,24 @@ def _extra_tier(rating: int) -> str:
         if low <= int(rating) <= high:
             return tier
     return "gold"
+
+
+# A badge's crest resolves from its resourceId, and the resource is an index
+# into the game's own badge table: 6000000 is FC Barcelona, 6000001 Real
+# Madrid, 6000002 Bayern, 6000003 Manchester City, 6000600 Drogheda United.
+#
+# This used to map club ids onto that index -- "a badge asset id is a club id"
+# -- which was a coincidence. The four original badges carried resources
+# 6000000-6000003, indices 0 to 3, and Barcelona's clubId happens to be 241,
+# the asset sitting beside index 0. Two unrelated numbers lining up once.
+#
+# It made every badge's *name* wrong: the player activated what this server
+# called Blackburn Rovers, clubId 3, and the console drew Manchester City,
+# badge index 3. He said so at the time and was talked out of it.
+#
+# The catalogue in `fifa14_clubitems.json` carries the real indices, so club
+# ids are out of the badge path entirely.
+BADGE_RESOURCE_BASE = 6_000_000
 
 
 def pack_extras() -> dict[tuple[str, str], list[dict]]:
@@ -3294,23 +5181,30 @@ def pack_extras() -> dict[tuple[str, str], list[dict]]:
         template["_rare"] = bool(card["rare"])
         families.setdefault(("consumable", card["itemType"]), []).append(template)
 
-    for kind, asset, resource, count in CLUB_ITEM_KINDS:
-        for index in range(count):
-            template = _club_item(kind, asset + index, resource + index, 0,
-                                  item_state="new")
-            template.pop("id")
-            template.pop("itemId", None)
-            # No tier: a kit is a kit in any pack.
-            template["_tier"] = ""
-            template["_rare"] = False
-            families.setdefault(("club", kind), []).append(template)
+    # Every club item the console rendered, 1570 of them. The catalogue carries
+    # the tier and the quick-sell value, so nothing is decided here.
+    #
+    # A club item respects its tier: a silver kit came out of a Bronze Pack
+    # when they were rated 0, which is no tier at all.
+    for card in _clubitem_catalogue():
+        template = _club_item(
+            card["itemType"], card["assetId"], card["resourceId"], 0,
+            item_state="new", rating=card["rating"], rare=card["rare"],
+            discard=card["discardValue"],
+        )
+        template.pop("id")
+        template.pop("itemId", None)
+        template["_tier"] = card["tier"]
+        template["_rare"] = bool(card["rare"])
+        families.setdefault(("club", card["itemType"]), []).append(template)
 
     _PACK_EXTRAS = families
     return families
 
 
 def _draw_extra(
-    tier: str, rare: bool, item_id: int, rng: random.Random
+    tier: str, rare: bool, item_id: int, rng: random.Random,
+    taken: set | None = None,
 ) -> dict | None:
     """One non-player card for a pack slot.
 
@@ -3322,6 +5216,14 @@ def _draw_extra(
 
     An empty consumable catalogue -- the file is optional -- returns None, and
     the caller draws a player instead, which is what packs used to be.
+
+    `taken` is what this pack has already handed out, and it excludes club
+    items only. A Premium Gold Pack came out with the Barcelona third kit
+    twice, side by side, because there are four kits and the draw picked from
+    them with replacement -- and unlike a second contract, which is a second
+    contract, a second identical kit is nothing at all. Consumables are left
+    alone deliberately: they stack, and a pack that refused to hand out two
+    contracts would be worse than one that did.
     """
     pool = pack_extras()
     if not pool:
@@ -3335,14 +5237,36 @@ def _draw_extra(
     def in_tier(templates: list[dict]) -> list[dict]:
         return [t for t in templates if t["_tier"] in ("", tier)]
 
+    def available(key: tuple, templates: list[dict]) -> list[dict]:
+        """This family's cards of this tier that the pack has not used.
+
+        Club families are thin once a tier is applied -- one gold stadium, one
+        gold ball, two gold kits -- so "do not repeat inside a family" is not
+        enough on its own: drawing the stadium family twice in a gold pack has
+        nowhere to go. A family with nothing left is dropped from the choice
+        instead, and another family carries the slot.
+        """
+        got = in_tier(templates)
+        if key[0] != "club" or taken is None:
+            return got
+        return [t for t in got if ("club", t.get("assetId")) not in taken]
+
     choices = [
         (key, weights.get(key[1], 1))
         for key, templates in pool.items()
-        if key[0] == kind and in_tier(templates)
+        if key[0] == kind and available(key, templates)
     ]
     if not choices:
         # Nothing of this kind reaches this tier: the other kind carries the
         # slot rather than the slot handing out the wrong tier.
+        choices = [
+            (key, 1) for key, templates in pool.items()
+            if available(key, templates)
+        ]
+    if not choices:
+        # Every family is spent. Fall back to repeating rather than handing
+        # back a short pack: a pack that is the size it advertises matters
+        # more than a pack with no repeat in it.
         choices = [
             (key, 1) for key, templates in pool.items() if in_tier(templates)
         ]
@@ -3352,10 +5276,12 @@ def _draw_extra(
     family = rng.choices(
         [key for key, _ in choices], weights=[w for _, w in choices]
     )[0]
-    candidates = in_tier(pool[family])
+    candidates = available(family, pool[family]) or in_tier(pool[family])
     exact = [t for t in candidates if t["_rare"] == rare]
-    item = {k: v for k, v in rng.choice(exact or candidates).items()
-            if not k.startswith("_")}
+    chosen = rng.choice(exact or candidates)
+    if family[0] == "club" and taken is not None:
+        taken.add(("club", chosen.get("assetId")))
+    item = {k: v for k, v in chosen.items() if not k.startswith("_")}
     item["id"] = item_id
     if "cardassetid" in item:
         item["itemId"] = item_id
@@ -3386,17 +5312,29 @@ def _draw_extra(
 # division this table used to give four fixtures -- the result screen read
 # "MATCHS RESTANTS 9". It counts ten whatever is served, so serving fewer
 # leaves a fixture list that runs out four matches into a ten-match season.
+# (division, name, matches, points to promote, championship coins)
+#
+# Division 10 is measured: the retail screen reads 12 points to win the title,
+# **9** to clinch promotion, 1,900 coins for the title, 1,500 for promotion and
+# 300 for avoiding relegation. This server was sending 2 to promote, which is
+# three points fewer than a single win is worth.
+#
+# Ten matches at three points a win is a ceiling of 30, so 9 is three wins and
+# 12 is four. The other nine divisions are NOT measured -- no screenshot of
+# them exists here -- so they carry the same thresholds rather than invented
+# ones that would look authoritative. The coin awards keep their ladder, which
+# is what makes a higher division worth reaching.
 SEASON_DIVISIONS = [
-    (1, "Division 1", 10, 5, 5000),
-    (2, "Division 2", 10, 4, 3000),
-    (3, "Division 3", 10, 4, 2200),
-    (4, "Division 4", 10, 4, 1700),
-    (5, "Division 5", 10, 3, 1300),
-    (6, "Division 6", 10, 3, 1000),
-    (7, "Division 7", 10, 3, 800),
-    (8, "Division 8", 10, 2, 650),
-    (9, "Division 9", 10, 2, 500),
-    (10, "Division 10", 10, 2, 400),
+    (1, "Division 1", 10, 9, 5000),
+    (2, "Division 2", 10, 9, 3000),
+    (3, "Division 3", 10, 9, 2200),
+    (4, "Division 4", 10, 9, 1700),
+    (5, "Division 5", 10, 9, 1300),
+    (6, "Division 6", 10, 9, 1000),
+    (7, "Division 7", 10, 9, 800),
+    (8, "Division 8", 10, 9, 650),
+    (9, "Division 9", 10, 9, 500),
+    (10, "Division 10", 10, 9, 1900),
 ]
 
 # The cups. Every member name below is one CardsDLL carries: they were read
@@ -3418,9 +5356,9 @@ SEASON_DIVISIONS = [
 
 TOURNAMENT_ROUNDS = {
     # (round id, difficulty, reward multiplier, coins)
-    1: [(1, 1, 1, 150), (2, 1, 1, 200), (3, 2, 1, 300), (4, 2, 1, 500)],
-    2: [(1, 2, 1, 250), (2, 2, 1, 350), (3, 3, 1, 500), (4, 3, 2, 900)],
-    3: [(1, 3, 1, 400), (2, 3, 1, 600), (3, 4, 2, 900), (4, 4, 2, 1500)],
+    1: [(1, 1, 1, 500), (2, 1, 1, 750), (3, 2, 1, 1000), (4, 2, 1, 1500)],
+    2: [(1, 2, 1, 1500), (2, 2, 1, 2000), (3, 3, 1, 3000), (4, 3, 2, 4500)],
+    3: [(1, 3, 1, 3000), (2, 3, 1, 4000), (3, 4, 2, 6000), (4, 4, 2, 9000)],
 }
 
 # The trophy ids are the game's own. `cards0.big` carries 70 of them under
@@ -3514,11 +5452,79 @@ def trophy_item_response(resource_id: int, tier: str = TROPHY_TIER) -> bytes:
         separators=(",", ":"),
     ).encode()
 
+# What each cup is called.
+#
+# The tiles drew a bare `*` because the client builds its own localisation key
+# -- `TOURNY_LOC_%d`, in the module at 0x01DDC4 -- and nothing answered it.
+# `name` is not a member of the tournament document at all: it is absent from
+# CardsDLL's JSON table, and the PC revival keeps its cup names in source and
+# never sends them either.
+#
+# So these are served as locstrings, keyed by tournament id. They are a choice,
+# like the prizes and the round coins beside them: the binary names the fields,
+# it does not say what a cup should be called.
+TOURNAMENT_NAMES = {
+    1: "Founders Cup",
+    2: "Continental Cup",
+    3: "Legacy Champions Cup",
+}
+
+
+# A tournament id sweep, the way the club items were mapped.
+#
+# The tiles draw a bare `*` for a name and the screen is slow to open, and both
+# point the same way. `TOURNY_LOC_%d` is built by the client from the
+# tournament id, and `trophyResourceId` addresses trophy art the client fetches
+# by id -- `FUTTrophyImages`, `items/images/trophies/xbl2/` in the module. Ids
+# 1, 2, 3 and trophies 1100-1102 were invented here.
+#
+# The club-item work settled the same class of question by serving a numbered
+# sweep and reading the screen: a real id names itself, an invented one draws
+# NOT FOUND. A cup whose id the game knows should show its own name with no
+# locstring from us at all, exactly as a badge resource drew its own crest.
+#
+# FIFA14_TOURNAMENT_PROBE=1..N serves N cups with ids 1..N so the range can be
+# read off the tile list in one pass.
+def tournament_probe() -> tuple[int, int, int]:
+    """(count, first id, step) for the id sweep, or (0, 0, 0) when off.
+
+        FIFA14_TOURNAMENT_PROBE=12            ids 1..12
+        FIFA14_TOURNAMENT_PROBE=60:1:25       60 cups from id 1, step 25
+
+    Ids 1-12 all drew `*`, which does not mean the id space is the wrong idea
+    -- it means that range is. Retail shows fourteen single-player cups with
+    names baked into the disc, and nothing says their ids start at 1. The kit
+    range was found the same way: a coarse step over a wide span first, then a
+    fine pass on the edge.
+    """
+    raw = os.environ.get("FIFA14_TOURNAMENT_PROBE", "0").strip()
+    if not raw or raw == "0":
+        return (0, 0, 0)
+    parts = raw.split(":")
+    try:
+        count = max(0, min(60, int(parts[0])))
+        first = int(parts[1]) if len(parts) > 1 else 1
+        step = max(1, int(parts[2])) if len(parts) > 2 else 1
+    except ValueError:
+        return (0, 0, 0)
+    return (count, first, step)
+
+
 TOURNAMENTS = [
     # (id, teams, match length in minutes, final award, trophy resource)
-    (1, 16, 6, 500, 1100),
-    (2, 16, 6, 1200, 1101),
-    (3, 16, 8, 2500, 1102),
+    #
+    # The prizes are a choice, not a finding -- the binary names the fields, it
+    # does not say what a cup should pay (`docs/TOURNAMENTS.md`). These are the
+    # player's own: 15k, 50k, 100k, with the round coins carried up to match so
+    # the run pays on the way to the final rather than only at it.
+    # Trophies 1100-1102, and these are NOT invented -- `cards0.big` carries
+    # `trophy_<id>_<tier>` for 1100..1169, which is where TROPHY_FIRST and
+    # TROPHY_LAST come from. Kyro's build uses 7100001 and up; those are his
+    # own, for a PC client, and swapping to them here would have replaced a
+    # measured range with a guess. The test caught exactly that.
+    (1, 16, 6, 15000, 1100),
+    (2, 16, 6, 50000, 1101),
+    (3, 16, 8, 100000, 1102),
 ]
 
 # The AI opponents a cup is drawn from. Real EA club ids -- 1 Arsenal,
@@ -3573,7 +5579,11 @@ def _season_prize(level: str, threshold: int, coins: int = 0) -> dict:
 
 
 def _season_record(index: int, division: int, matches: int, promote: int, coins: int) -> dict:
-    title = 12 if int(division) == 10 else min(30, int(promote) + 3)
+    # Twelve to win the title, and it is measured rather than derived: the
+    # retail Division 10 screen reads 12. It used to be `promote + 3`, which
+    # made the title threshold move with the promotion one and is why nothing
+    # noticed the promotion value was wrong.
+    title = 12
     holding = 300 if int(division) == 10 else max(300, int(coins) // 5)
     promotion = 1500 if int(division) == 10 else max(500, int(coins) - 400)
     return {
@@ -3591,10 +5601,22 @@ def _season_record(index: int, division: int, matches: int, promote: int, coins:
         ],
         "elgOperation": "AND",
         "elgReq": [],
-        # -1, not 0. Zero is a real resource id as far as the client is
-        # concerned: with it the cup screen went and fetched
-        # /fut/items/xbl2/0.json once per entry. -1 is the "no trophy" value.
-        "trophyResourceId": -1,
+        # A real trophy, not -1 and not 0.
+        #
+        # Both sentinels were wrong in the same way. Zero sent the screen to
+        # fetch /fut/items/xbl2/0.json once per division; -1 was taken from a
+        # PC build as its "no trophy" value and did exactly the same thing here,
+        # ten lookups of /fut/items/xbl2/-1.json. `docs/SEASONS.md` records that
+        # as a confirmed mistake in the attempt that froze.
+        #
+        # `cards0.big` ships seventy trophies at 1100..1169. A division is given
+        # one of them so the id resolves to something the game actually has,
+        # which removes a known-bad variable before the reduction ladder starts
+        # -- there is no point bisecting a record that still carries a value
+        # already known to send the client hunting.
+        "trophyResourceId": TROPHY_FIRST + (int(division) - 1) % (
+            TROPHY_LAST - TROPHY_FIRST + 1
+        ),
         "trophyUseCount": 0,
         "visStartDays": 3650,
         "visEndDays": 3650,
@@ -3645,7 +5667,31 @@ def season_wire_mode() -> str:
     Each rung costs a server restart and one entry into the mode. Serving the
     whole record at once produces a freeze and no information.
     """
-    raw = os.environ.get("FIFA14_SEASON_MODE", "empty").strip().lower()
+    # `native` is the default now.
+    #
+    # It was `empty` -- `{"seasons": []}` -- because the full record froze the
+    # console on 13 August and empty was the only answer that had never broken
+    # anything. The ladder settled it on 20 August: `minimal` opened the mode,
+    # `prizes` filled the rewards, `matches` filled the fixture list, and
+    # `native` served both across all ten divisions without freezing.
+    #
+    # Leaving the default at `empty` after that meant every launch without the
+    # flag answered "les saisons ne sont pas disponibles" -- which is what the
+    # player hit the moment a command went out without it.
+    # `kyro-data` is the default, measured 21 August 2026: it is the only shape
+    # seen to resume a season on this console. See docs/SEASONS.md.
+    #
+    # `current` was the default and could not resume. It served one row sliced
+    # off a table ordered Division 1 first, so that row carried `id` 10, and
+    # `season/user` answered `seasonId` 10 -- an index off the end of a list of
+    # one. The record was never selected, so nothing it carried could be read,
+    # and every attempt to fix the reset by adding members to it was measured
+    # against a document the client was not looking at.
+    raw = os.environ.get("FIFA14_SEASON_MODE", "kyro-data").strip().lower()
+    if raw in {"current", "one"}:
+        return "current"
+    if raw == "default":
+        return "kyro-data"
     if raw in {"native", "full", "on"}:
         return "native"
     if raw in {"minimal", "min", "bare"}:
@@ -3654,6 +5700,14 @@ def season_wire_mode() -> str:
         return "prizes"
     if raw == "matches":
         return "matches"
+    if raw in {"kyro", "reference"}:
+        return "kyro"
+    if raw in {"kyro-div9", "kyrosafe", "kyro-safe"}:
+        return "kyro-div9"
+    if raw in {"kyro-data", "kyrodata"}:
+        return "kyro-data"
+    if raw in {"kyro-full", "kyrofull"}:
+        return "kyro-full"
     if raw in {"nouser", "listonly"}:
         return "nouser"
     if raw in {"user-id", "userid"}:
@@ -3689,11 +5743,55 @@ def seasons_response() -> bytes:
             SEASON_DIVISIONS, start=1
         )
     ]
+    if mode in ("kyro", "kyro-div9", "kyro-data", "kyro-full"):
+        # `offline_seasons_list` from KyroGeorge2/FIFA-14-Local-FUT.
+        #
+        # He serves all ten divisions, and his table is ordered Division 10
+        # first, so the record's `id` -- a 1-based position in the list -- comes
+        # out as 1 for Division 10 and 10 for Division 1. `divisionId` stays the
+        # division's own number. `offline_season_user` then says seasonId 1,
+        # divisionId 10, and all three agree.
+        #
+        # `current` reaches the same screen a different way: one row, sliced off
+        # the end of a table ordered the other way, which leaves that row
+        # carrying `id` 10 on a list of one. Same tile, but nothing agrees.
+        records = [
+            _season_record(index, division, matches, promote, coins)
+            for index, (division, _name, matches, promote, coins) in enumerate(
+                reversed(SEASON_DIVISIONS), start=1
+            )
+        ]
+        return json.dumps({"seasons": records}, separators=(",", ":")).encode()
+
+    if mode == "current":
+        # The club's own division, with both arrays.
+        #
+        # `native` serves all ten and the screen opens on the first tile --
+        # Division 1, the top of the table, which is where a club ends up and
+        # not where it starts. FUT begins every club in Division 10.
+        #
+        # Both arrays go out: the ladder proved each separately and then
+        # together, so there is nothing left to withhold. This is `native` with
+        # one row rather than a rung of the reduction.
+        records = records[-1:]
+        return json.dumps({"seasons": records}, separators=(",", ":")).encode()
+
     if mode != "native":
         # One rung of the ladder: a single division, and only the array the
         # rung is named for. Reducing is the only way through a freeze, which
         # gives no error to read.
-        records = records[:1]
+        # Division 10, not Division 1.
+        #
+        # `records[:1]` took the top of the table, which is where a club ends
+        # up rather than where it starts: FUT begins every club in Division 10
+        # and promotes upward. The rung was therefore testing the one division
+        # a new club can never be in, and `season/user` was answering with a
+        # different division again -- the list said 1, the user record said 9,
+        # and nothing reconciled them.
+        #
+        # `SEASON_DIVISIONS` is ordered 1..10, so the club's own division is the
+        # last entry.
+        records = records[-1:]
         keep_matches = mode == "matches"
         keep_prizes = mode == "prizes"
         for record in records:
@@ -3728,6 +5826,54 @@ def _season_matches_played(entry: dict) -> int:
     return max(0, int(entry.get("round") or 1) - 1)
 
 
+def served_season_index(division: int) -> int:
+    """`seasonId`: where a division sits in the list actually served.
+
+    NOT `divisionId`. The bisection recorded in `season_user_response` settles
+    that one separately: `divisionId` 0 renders a badge reading DIV 1, so it
+    indexes the *client's* table of ten divisions and Division 10 is 9. That is
+    unaffected by how many records this server sends.
+
+    `seasonId` is the one that depends on the list, and it is the one a reduced
+    rung breaks: every rung served a single record while this still answered
+    with the division's position in the full ten-row table, so `minimal` served
+    one season and pointed at season 10.
+
+    The recorded bisection in `season_user_response` narrowed the freeze to
+    `divisionId` and noted what its value also is: "on a list of ten, 10 is one
+    past the last index; on a list of one it is far past". That reading could
+    not be tested while every reduced rung served Division 1 -- the club's
+    division and the served record were different rows, so index and division
+    number could never be told apart.
+
+    Serving Division 10 as the single record makes them separable. A list of
+    one holding Division 10 needs index 1; a full list of ten needs index 10,
+    which is also the division number, which is why the two readings agreed on
+    `native` and disagreed nowhere it was looked at.
+
+    So the index is computed from what is served rather than assumed to be the
+    division.
+    """
+    # The record's OWN id, not its position in the page.
+    #
+    # A record built for Division 10 carries `id` 10 whether it is served
+    # alone or beside nine others -- `_season_record` takes the index from
+    # `SEASON_DIVISIONS`, and slicing the list to one row does not renumber it.
+    # So `seasonId` has to name the record, and the client agrees: it saves to
+    # `/season/10/division/10/user`, season ten, on a list holding exactly one
+    # season.
+    #
+    # This was changed to "index into the page" earlier on the reasoning that a
+    # one-row list could not hold a season 10. It can: the row *is* season 10.
+    # The client accepted the reduced rungs, played a match, saved round 2 --
+    # and then reset to round 1, because the document beside its progress named
+    # a season that was not there.
+    for position, row in enumerate(SEASON_DIVISIONS, start=1):
+        if row[0] == int(division):
+            return position
+    return 1
+
+
 def season_user_response(division: int = 10, played: int = 0) -> bytes:
     """Where the club currently stands, and nothing more.
 
@@ -3741,6 +5887,87 @@ def season_user_response(division: int = 10, played: int = 0) -> bytes:
     is now deliberately without.
     """
     mode = season_wire_mode()
+    if mode in ("kyro", "kyro-div9", "kyro-data", "kyro-full"):
+        # `offline_season_user` from KyroGeorge2/FIFA-14-Local-FUT, matched
+        # member for member. That build resumes a season; this one does not,
+        # and the differences are all here:
+        #
+        #   seasonId 1     not 10. Kyro's comment: "season/user is 1-based;
+        #                  native client stores id-1", so 1 selects the first
+        #                  record of a one-row list. `b0e4ca7` moved this to 10
+        #                  on the opposite reading and the reset survived it.
+        #   divisionId 10  not 9. The division's own number, not an index.
+        #   nothing else   no `data`, no `dataVersion`, no seasonGames* and no
+        #                  seasonCoins. Kyro calls those "unknown guessed
+        #                  progression members" and omits them deliberately.
+        #                  This server added `data` to fix this very reset, on
+        #                  the reasoning that a season without it "looked like
+        #                  one that had never started" -- and the reset stayed,
+        #                  so that reasoning did not hold. A working build not
+        #                  sending them is the evidence against it.
+        #
+        # This is evidence, not proof: Kyro's is the PC frontend and this is
+        # Xbox 360. Same caveat the cup-resume note carries.
+        saved = SEASON_PROGRESS.current()
+        played = 0
+        if saved is not None:
+            played = _season_matches_played(
+                SEASON_PROGRESS.entries.get(saved) or {}
+            )
+        # `kyro-div9` is the same document with the one value this console has
+        # already been seen to hang on held back.
+        #
+        # 13 August, bisecting this route: `{"seasonId": 1, "divisionId": 10}`
+        # opened the screen and then hung, while 0 and 9 both held. That is the
+        # exact pair `kyro` sends. Kyro runs it, but his is the PC frontend and
+        # the freeze was measured here -- and it was measured beside a one-row
+        # list, so it may have been the disagreement rather than the value.
+        #
+        # `kyro-div9` separates those: Kyro's list, Kyro's seasonId, and a
+        # divisionId already known to hold. If the season survives a match on
+        # it, the agreement was the fault and the value never mattered. Only
+        # then is `kyro` worth the risk of the freeze.
+        # 10 is Kyro's value and the one that agrees with the list: `seasonId`
+        # 1 selects row 1, and row 1 *is* Division 10, so a user document saying
+        # 9 names a different division from the record it points at. `kyro-div9`
+        # held that back to dodge the 13 August freeze and broke the agreement
+        # it was meant to test -- and that freeze does not apply here anyway: it
+        # was measured when the one-row list held Division **1** (`records[:1]`
+        # took the top of the table then), so the list and the user document
+        # named different divisions. That mismatch is the candidate for the
+        # hang, not the number.
+        #
+        # `_season_division_id` honours FIFA14_SEASON_DIVISION_ID, so the value
+        # can be varied against the console without another relaunch-per-idea.
+        document = {
+            "seasonId": 1,
+            "divisionId": _season_division_id(9 if mode == "kyro-div9" else 10),
+            "round": max(0, int(played)) + 1,
+        }
+        # `kyro-data` and `kyro-full` put back what Kyro omits, on top of the
+        # agreement that fixed the reset.
+        #
+        # 21 August: on `kyro-div9` the season survived a match -- the fixture
+        # list opened instead of the start prompt -- but the played match drew
+        # Score `-` and the list opened on it rather than on the next fixture.
+        # The season resumes; the progress inside it does not.
+        #
+        # The scores are in the client's own blob, which Kyro never returns and
+        # this server used to. That was judged useless before, but it was judged
+        # against a document whose `seasonId` pointed off the end of the list --
+        # the record was never being selected at all, so nothing it carried
+        # could have shown. Worth one more measurement now that it is.
+        #
+        # `data` before `dataVersion`, always: the version branch decodes using
+        # registers the data branch fills. See `cup_resume_mode`.
+        entry = SEASON_PROGRESS.entries.get(saved) or {} if saved else {}
+        if mode in ("kyro-data", "kyro-full") and entry.get("data"):
+            document["data"] = entry["data"]
+            document["dataVersion"] = entry.get("dataVersion", 1)
+        if mode == "kyro-full":
+            # And the header numbers, the last of the five.
+            document.update(_season_record_members(entry))
+        return json.dumps(document, separators=(",", ":")).encode()
     if mode.startswith("user-"):
         # The halving `nouser` earned: the same minimal list opened the mode
         # when this document was `{}` and froze it when it carried all three
@@ -3757,12 +5984,19 @@ def season_user_response(division: int = 10, played: int = 0) -> bytes:
             # What 10 also is, on a list of ten, is one past the last index;
             # on a list of one it is far past. FIFA14_SEASON_DIVISION overrides
             # it so the reading can be tested rather than argued.
-            try:
-                document["divisionId"] = int(
-                    os.environ.get("FIFA14_SEASON_DIVISION", division)
-                )
-            except ValueError:
-                document["divisionId"] = int(division)
+            # `divisionId` indexes the client's own table, zero-based, so
+            # Division 10 is 9. Ten hung the screen because it is one past the
+            # last index of a table of ten -- see the note in the full record
+            # below. FIFA14_SEASON_DIVISION still overrides for testing.
+            override = os.environ.get("FIFA14_SEASON_DIVISION")
+            if override:
+                try:
+                    document["divisionId"] = int(override)
+                except ValueError:
+                    document["divisionId"] = _season_division_id(int(division) - 1)
+            else:
+                document["divisionId"] = _season_division_id(int(division) - 1)
+            document["seasonId"] = served_season_index(division)
         if mode == "user-round":
             document["round"] = 1
         return json.dumps(document, separators=(",", ":")).encode()
@@ -3789,14 +6023,12 @@ def season_user_response(division: int = 10, played: int = 0) -> bytes:
         entry = SEASON_PROGRESS.entries.get(saved) or {}
         division = saved_division
         played = _season_matches_played(entry)
-    index = next(
-        (
-            position
-            for position, row in enumerate(SEASON_DIVISIONS, start=1)
-            if row[0] == division
-        ),
-        1,
-    )
+    # The position in the list actually served, not in the full ten-row table.
+    # A reduced rung serves one record, and this answered with the division's
+    # place in all ten -- so `minimal` offered one season and pointed at season
+    # ten, which is exactly the out-of-range shape the divisionId bisection
+    # found hanging the screen one member over.
+    index = served_season_index(division)
     return json.dumps(
         {
             "seasonId": index,
@@ -3819,7 +6051,17 @@ def season_user_response(division: int = 10, played: int = 0) -> bytes:
             # `SEASON_DIVISIONS` is ordered to agree, so this is both the
             # division's number minus one and its position in the list served
             # above.
-            "divisionId": _season_division_id(index - 1),
+            # From the division, not from `index`. Those were the same while
+            # every rung served the full ten-row list; now that a reduced rung
+            # serves Division 10 alone, `index` is 1 and would send 0 -- a
+            # different division's id on a record that is not that division.
+            #
+            # What the member *means* is still open: the shield reads DIV 1 for
+            # both 0 and 9, so it does not follow the member, and
+            # `_season_division_id` carries the experiment that would settle
+            # it. What is settled is the range -- 10 hangs the screen, 0 and 9
+            # both hold -- and division minus one stays inside it.
+            "divisionId": _season_division_id(int(division) - 1),
             "round": max(0, int(played)) + 1,
             # The season's own blob, and the version that decodes it.
             #
@@ -3848,10 +6090,17 @@ def season_user_response(division: int = 10, played: int = 0) -> bytes:
 def _season_division_id(computed: int) -> int:
     """`FIFA14_SEASON_DIVISION_ID` overrides what goes out, for one question.
 
-    The seasons shield reads **DIV 1** whether `divisionId` is 0 or 9, so it
-    does not follow the member and proves nothing about what the member means.
-    One value separates the readings still standing, and the shield is the
-    only place to read the answer:
+    Settled, 21 August 2026: **the shield is not ours.** It read DIV 1 for
+    `divisionId` 0, for 9, and now for 10 -- three values, one of them the
+    division the club is actually in, all rendering the same badge. Of the
+    three readings below it is the third that stands; the first two are out.
+
+    The member still matters, just not for the badge. It has to name the same
+    division as the list row `seasonId` selects: with the row at Division 10,
+    sending 9 left the season unresumable and sending 10 resumed it. So it
+    identifies the record, and the shield is drawn from somewhere else.
+
+    The readings, kept for the record:
 
         served 5  ->  shield 6   the client adds one
         served 5  ->  shield 5   the client subtracts from ten
@@ -3905,13 +6154,19 @@ def _season_record_members(entry: dict) -> dict:
 FOREVER = 2147483647
 
 
-def tournament_entry(identifier: int) -> dict:
-    """One cup, in the shape the native parser reads."""
-    teams, match_length, award, trophy = next(
+def tournament_entry(identifier: int, trophy: int | None = None) -> dict:
+    """One cup, in the shape the native parser reads.
+
+    `trophy` overrides the trophy resource, which the id sweep uses to read the
+    trophy id space and the tournament id space in a single pass.
+    """
+    teams, match_length, award, default_trophy = next(
         (row[1:] for row in TOURNAMENTS if row[0] == identifier),
         TOURNAMENTS[0][1:],
     )
-    rounds = TOURNAMENT_ROUNDS[identifier]
+    if trophy is None:
+        trophy = default_trophy
+    rounds = TOURNAMENT_ROUNDS.get(identifier) or TOURNAMENT_ROUNDS[1]
     return {
         "id": identifier,
         "type": "offline",
@@ -3948,11 +6203,39 @@ def tournament_entry(identifier: int) -> dict:
         "visStart": 3650,
         "visEnd": 3650,
         "trophyResourceId": trophy,
+        # `prize` is in the module's member table and this server has never
+        # sent it. The tile shows a Tournament Bonus figure -- 500 Coins on the
+        # retail Starter Cup -- and `awardSet` alone was carrying that.
+        "prize": award,
         "trophyUserCount": 0,
     }
 
 
 def tournaments_response() -> bytes:
+    count, first, step = tournament_probe()
+    if count:
+        # Each cup carries its own id as its trophy, so one pass reads the
+        # tournament id space and the trophy id space together. A tile that
+        # names itself has an id the disc knows; a tile drawing `*` does not.
+        ids = [first + step * n for n in range(count)]
+        # A real trophy on every probe tile.
+        #
+        # The sweep used to set trophy = id, which for ids 1-12 is nowhere near
+        # the 1100-1169 range `cards0.big` actually ships -- so those tiles had
+        # no trophy art and the sweep was silently testing a dead trophy id at
+        # the same time as the name. Cycling through the real range keeps the
+        # trophy honest so a blank tile means the *name* is missing and nothing
+        # else.
+        span = TROPHY_LAST - TROPHY_FIRST + 1
+        return json.dumps(
+            {
+                "tournament": [
+                    tournament_entry(n, trophy=TROPHY_FIRST + (i % span))
+                    for i, n in enumerate(ids)
+                ]
+            },
+            separators=(",", ":"),
+        ).encode()
     return json.dumps(
         {"tournament": [tournament_entry(row[0]) for row in TOURNAMENTS]},
         separators=(",", ":"),
@@ -4162,7 +6445,21 @@ class TournamentProgress:
             return {"tournamentId": identifier, "round": played, "roundCoins": 0,
                     "prize": 0, "settled": False}
 
-        if entry:
+        # A run that is over leaves no run behind.
+        #
+        # Winning the final, losing, or walking out all set the next round to
+        # 1 -- and the entry was kept, so `tournament/user/list` went on naming
+        # the cup as entered and the tile read EN COURS over a cup that had
+        # been won. Reported from the console on 16 August: Cup 2 completed,
+        # trophy paid, still showing in progress.
+        #
+        # Dropping the entry is what says "not entered": a cup with no saved
+        # run answers `{"tournamentId": id}` and the screen offers it fresh.
+        # It also retires the stale bracket blob, which is the thing a resume
+        # would otherwise try to reload.
+        if nxt == 1 and result in ("WIN", "LOSS", "QUIT", "DNF"):
+            self.entries.pop(identifier, None)
+        elif entry:
             entry = dict(entry)
             entry["round"] = nxt
             self.entries[identifier] = entry
@@ -4609,7 +6906,8 @@ def apply_match_items(inventory: "ClubInventory", items: list) -> dict:
     than written to on a guess about which index means what.
     """
     by_id = {item["id"]: item for item in inventory.items if item.get("id")}
-    touched = {"fitness": 0, "goals": 0, "assists": 0, "unknown": []}
+    touched = {"fitness": 0, "goals": 0, "assists": 0, "played": 0,
+               "contracts": 0, "unknown": []}
     for entry in items or []:
         if not isinstance(entry, dict):
             continue
@@ -4617,6 +6915,31 @@ def apply_match_items(inventory: "ClubInventory", items: list) -> dict:
         if card is None:
             touched["unknown"].append(entry.get("id"))
             continue
+        # An appearance. Every card the client reports on at the final whistle
+        # was on the pitch, so the `items` array is the team sheet -- and
+        # `gamesPlayed` is a member CardsDLL's name table carries (0x030BE0)
+        # that nothing here had ever written. The bio read 0 matches for a
+        # club that had just won a cup.
+        card["gamesPlayed"] = int(card.get("gamesPlayed") or 0) + 1
+        touched["played"] += 1
+        # And one match off the contract.
+        #
+        # The client reports fitness, goals and assists per player at the
+        # whistle and says **nothing** about contracts -- checked across every
+        # captured `/match/end` body -- so if this server does not count them
+        # down, nothing does. Every card sat at 99 for ever, which left the
+        # contract cards with nothing to restore and made the commonest
+        # consumable in the game decoration. Reported from the console
+        # 17 August 2026: a striker with a cup run behind him still on 99.
+        #
+        # It stops at zero rather than going negative. Retail will not field a
+        # player on an expired contract; this server does not enforce that yet,
+        # and a negative number would only make the eventual rule harder to
+        # write.
+        contract = int(card.get("contract") or 0)
+        if contract > 0:
+            card["contract"] = contract - 1
+            touched["contracts"] += 1
         if "fitness" in entry:
             try:
                 card["fitness"] = max(0, min(99, int(entry["fitness"])))
@@ -4634,6 +6957,11 @@ def apply_match_items(inventory: "ClubInventory", items: list) -> dict:
             if lifetime:
                 card[lifetime] = int(card.get(lifetime) or 0) + scored
             touched[member] += scored
+        # And publish them where the bio actually reads them. The counters
+        # above are members the parser has no name for -- `goals` is not in the
+        # table at all -- so a match that updated only those wrote numbers
+        # nothing would ever display.
+        sync_stat_slots(card)
     return touched
 
 
@@ -4778,17 +7106,46 @@ def totw_response(catalogue: "CardCatalogue", size: int = 23) -> bytes:
     ).encode()
 
 
-def hub_response(inventory: "ClubInventory", listings: int) -> bytes:
-    """The My Club and transfer tiles read their counts from here.
+def hub_response(
+    inventory: "ClubInventory", market: int, selling: int, sold: int,
+    unlisted: int = 0,
+) -> bytes:
+    """The transfer and My Club tiles read their counts from here.
 
-    Both were fixed numbers -- 92 players and no auctions -- so the club tile
-    never moved as cards arrived and the market tile always read zero.
+    Three tiles, three counts, and they are not the same number:
+
+      TRANSFER MARKET  `auctionCount` -- how many auctions are live to browse.
+                       This is the *market*, not the club's own listings.
+                       Feeding it the club's listing count is why the tile read
+                       "13 LIVE TRANSFERS" when 13 was the player's own sold
+                       cards and the market had thousands. Kyro's build makes
+                       the same point in the same words.
+      TRANSFER LIST    `selling` and `sold` -- the club's own active and sold
+                       listings, and `transferListCount` for the tile's item
+                       total. These were absent, so the tile read 0/0 over a
+                       list that held thirteen.
+      MY CLUB          `clubPlayers`.
+
+    `market` already includes the club's own live listings from the caller, so
+    a card the player lists appears on the market tile as well as the list one.
     """
     players = sum(
         1 for item in inventory.items if item.get("itemType") == "player"
     )
+    # Everything on the transfer list: active listings, sold-awaiting-collect,
+    # and cards sent to the list but not yet listed. The tile read "0 ITEMS"
+    # over ten unlisted cards because these were left out.
+    user_total = selling + sold + unlisted
     return json.dumps(
-        {"auctionCount": listings, "clubPlayers": players},
+        {
+            "auctionCount": market,
+            "clubPlayers": players,
+            "selling": selling,
+            "sold": sold,
+            "transferListCount": user_total,
+            "tradePileCount": user_total,
+            "tradePileItems": user_total,
+        },
         separators=(",", ":"),
     ).encode()
 
@@ -4828,6 +7185,17 @@ CONSUMABLE_FALLBACKS = {
     "consumablesTrainingManager": "training",
     "consumablesTrainingManagerLeagueModifier": "training",
     "consumablesFormationManager": "position",
+    # `consumablesPosition` was carried by the six subtype-232 cards alone, and
+    # those are out of the club now -- they drew NOT FOUND in the position
+    # modifier tab, which is what the player reported. Reporting the position
+    # family's own count keeps the Apply Consumable popup offering the
+    # thirty-six cards that do render, instead of refusing on a zero.
+    #
+    # A fallback rather than a relabel: the catalogue files those thirty-six
+    # under the play-style members, and rewriting that to fix a counter would
+    # zero the goalkeeper style counter in exchange. The counts are what the
+    # popup reads; the members stay as the catalogue has them.
+    "consumablesPosition": "position",
 }
 
 # The three the game also asks for in aggregate. Each is its family's count
@@ -4926,7 +7294,7 @@ def club_stats_response(inventory: "ClubInventory") -> bytes:
         {"key": 2, "value": count("staff") + count("manager")},
         {"key": 3, "value": count("stadium")},
         {"key": 4, "value": count("kit")},
-        {"key": 5, "value": count("badge")},
+        {"key": 5, "value": count("badge") + count(BADGE_WIRE_TYPE)},
         {"key": 6, "value": count("ball")},
         {"key": 7, "value": 0},
     ]
@@ -5003,6 +7371,11 @@ def consumables_response(
             # everything: a wrong list reads as a working screen.
             continue
         items.append(item)
+    # Stacked, like the club list. This is the route the Apply Consumable
+    # picker actually reads -- `/club/consumables/contracts` and its siblings --
+    # and it was serving every card individually while `/club` served them
+    # collapsed, so the club tab stacked and the picker did not.
+    items = stack_consumables(items)
     return json.dumps(
         {
             "itemData": items,
@@ -5182,6 +7555,68 @@ def club_save_path(persona_id: int) -> Path:
     return SAVE_FILE.parent / "clubs" / f"{int(persona_id)}.json"
 
 
+class ClientData:
+    """What the client stores with the server and reads back.
+
+    `PUT /ut/game/fifa14/clientdata/userHubData` carries the counters the
+    Transfers hub tiles are drawn from -- the client works them out itself and
+    keeps them here:
+
+        {"entries":[{"key":0,"value":3},{"key":1,"value":2},
+                    {"key":2,"value":0},{"key":3,"value":0}]}
+
+    `GET` of the same route answered a hardcoded `{}`, so every session started
+    by telling the client its own counters were nothing, and TRANSFER LIST read
+    "0 ITEMS / Selling: 0 / Sold: 0" over a pile holding twenty-seven.
+
+    What goes back is the document the client sent, byte for byte. That matters
+    here more than anywhere: this parser is one of the two that **freeze the
+    login** on an object carrying a member they do not know -- adding a coin
+    balance to this route stopped the fan-out dead, and it is written up beside
+    the balance work. Echoing the client's own shape cannot introduce an unknown
+    member, because the client wrote every member in it.
+
+    Only names the client has actually written are answered from here. The
+    fixtures for `pileSize`, `tutorialpopups` and `managerquest` are deliberate
+    and are left alone.
+    """
+
+    def __init__(self) -> None:
+        self.stored: dict[str, str] = {}
+
+    def save(self, name: str, body: bytes | None) -> bool:
+        """Keep one client-written document. Returns whether it was kept."""
+        if not body:
+            return False
+        try:
+            document = json.loads(body)
+        except ValueError:
+            return False
+        # An object with an `entries` list is the shape every clientdata route
+        # uses. Anything else is not something to hand back.
+        if not isinstance(document, dict) or not isinstance(
+            document.get("entries"), list
+        ):
+            return False
+        self.stored[name] = json.dumps(document, separators=(",", ":"))
+        return True
+
+    def read(self, name: str) -> bytes | None:
+        held = self.stored.get(name)
+        return held.encode() if held else None
+
+    def state(self) -> dict:
+        return dict(self.stored)
+
+    def restore(self, saved: dict | None) -> None:
+        self.stored = {
+            str(k): v for k, v in (saved or {}).items() if isinstance(v, str)
+        }
+
+
+CLIENT_DATA = ClientData()
+
+
 class ClubSave:
     """The club's own state, written to disk and reloaded."""
 
@@ -5267,10 +7702,30 @@ class ClubSave:
             if not isinstance(item, dict):
                 continue
             for held in inventory.items:
-                if held["id"] == item.get("id"):
+                if held["id"] != item.get("id"):
+                    continue
+                # Only overwrite a card the saved entry actually describes.
+                #
+                # Item ids are handed out in catalogue order, so adding cards
+                # to the catalogue shifts every id after them. A `changed`
+                # entry then names an id that now belongs to a different card,
+                # and overwriting in place silently replaces it. On 16 August
+                # nineteen chemistry styles were added and nineteen saved kit
+                # entries landed exactly on them: a fresh club held all
+                # nineteen, a loaded one held none, and the picker told the
+                # player none was found.
+                #
+                # A saved entry that disagrees with the seed about what kind of
+                # card this is, is describing the old numbering. Skipping it
+                # loses whatever change it recorded -- which is the smaller
+                # loss, and the only one that does not corrupt the club.
+                if (
+                    item.get("itemType") == held.get("itemType")
+                    and item.get("cardsubtypeid") == held.get("cardsubtypeid")
+                ):
                     held.clear()
                     held.update(item)
-                    break
+                break
         known = {item["id"] for item in actions.shop.pending}
         for item in saved.get("pending", []):
             if item["id"] not in known:
@@ -5278,8 +7733,23 @@ class ClubSave:
         if tasks is not None:
             for key, value in (saved.get("tasks") or {}).items():
                 tasks.complete(int(key), int(value))
-        for key, value in (saved.get("squads") or {}).items():
-            inventory._squads()[int(key)] = value
+        # The saved squads are the whole set, not additions to it.
+        #
+        # This merged them in, so a deleted squad came back on the next launch:
+        # the seed rebuilds its own, the save had no way to say "this one is
+        # gone", and `delete_squad` looked like it had failed. Reported from the
+        # console 17 August 2026 -- deleted in the squad selector, present again
+        # after a relaunch.
+        #
+        # A save with no `squads` at all is left alone: that is an old save, or
+        # a club that has never touched a squad, and the seed's own is right.
+        saved_squads = saved.get("squads")
+        if saved_squads:
+            squads = inventory._squads()
+            squads.clear()
+            for key, value in saved_squads.items():
+                squads[int(key)] = value
+        current_tenant().record.adopt(saved.get("record"))
         if saved.get("activeSquad"):
             inventory.set_active(int(saved["activeSquad"]))
         if saved.get("squad"):
@@ -5288,13 +7758,35 @@ class ClubSave:
         actions.listings = {
             int(key): value for key, value in saved.get("listings", {}).items()
         }
+        # Bring listings sold before the SOLD-pile fix up to the current shape,
+        # so every sold card sits in the sold stack rather than only the ones
+        # sold this session.
+        actions.restamp_sold()
+        # Cards saved before the alias members existed carry `id` and no
+        # `itemId`, and the transfer-list screen builds no action menu for one.
+        actions.restamp_cards()
         TOURNAMENT_PROGRESS.restore(saved.get("tournaments"))
         SEASON_PROGRESS.restore(saved.get("seasons"))
+        CLIENT_DATA.restore(saved.get("clientData"))
         CLUB_IDENTITY.restore(saved.get("club"))
         return True
 
     def save(self, inventory: "ClubInventory", wallet: "Wallet",
              actions: "CardActions", tasks: "ManagerTasks | None" = None) -> None:
+        # A probe run never writes the save.
+        #
+        # The probe replaces the club-item seed with a numbered sweep, and the
+        # save is a diff against that seed: every real kit, badge, stadium and
+        # ball would read as "acquired" and be written into the club
+        # permanently, while the probe cards themselves would look seeded. One
+        # investigative launch would have quietly rewritten a club of a
+        # thousand cards.
+        #
+        # Read-only is the right mode for a probe anyway -- nothing it shows is
+        # meant to be kept.
+        if _club_item_probe():
+            return
+
         starting = ClubInventory()
         original = {item["id"] for item in starting.items}
         current = {item["id"] for item in inventory.items}
@@ -5304,10 +7796,37 @@ class ClubSave:
         # was spent (the consumable is in `sold`) and the contract it bought
         # was forgotten on the next launch.
         seeded = {item["id"]: item for item in starting.items}
+
+        # `timestamp` is excluded from the comparison, and that exclusion is
+        # load-bearing.
+        #
+        # It is `issued_now()`, so a seeded card differs from a freshly built
+        # one by its issue date **every single time**, whatever else is true of
+        # it. Comparing whole items therefore put the entire seed into
+        # `changed` -- 305 entries, and a save that grew from 42 KB to 575 KB.
+        #
+        # The damage was worse than the size. `changed` is applied by id and
+        # overwrites in place, so a frozen copy of the seed shadows the real
+        # one on every load: the nineteen chemistry styles added to the
+        # catalogue on 16 August landed on ids the old seed already occupied,
+        # and were replaced by the cards that used to hold them. A player
+        # looking for a chemistry style was told none was found while nineteen
+        # sat in a fresh club.
+        #
+        # A seeded card's issue date is rebuilt with the seed and is not worth
+        # persisting. A real change -- a contract applied, a position moved --
+        # differs in a member that is not the clock, and is still caught.
+        def altered(item: dict, origin: dict) -> bool:
+            if item == origin:
+                return False
+            left = {k: v for k, v in item.items() if k != "timestamp"}
+            right = {k: v for k, v in origin.items() if k != "timestamp"}
+            return left != right
+
         changed = [
             item
             for item in inventory.items
-            if item["id"] in seeded and item != seeded[item["id"]]
+            if item["id"] in seeded and altered(item, seeded[item["id"]])
         ]
         document = {
             "coins": wallet.coins,
@@ -5321,6 +7840,7 @@ class ClubSave:
             "pending": actions.shop.pending,
             "squad": [item["id"] for item in inventory.squad],
             "tasks": {str(k): v for k, v in tasks.completed.items()} if tasks else {},
+            "record": current_tenant().record.document(),
             "activeSquad": inventory.active_squad_id(),
             "squads": {
                 str(key): value for key, value in inventory._squads().items()
@@ -5330,6 +7850,7 @@ class ClubSave:
             "tournaments": TOURNAMENT_PROGRESS.state(),
             "seasons": SEASON_PROGRESS.state(),
             "club": CLUB_IDENTITY.state(),
+            "clientData": CLIENT_DATA.state(),
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(document, separators=(",", ":")))
@@ -5428,6 +7949,92 @@ def shared_catalogue_cards(path: Path) -> list[dict]:
         return cards
 
 
+class ClubRecord:
+    """The club's won-drawn-lost, across every match it has ever played.
+
+    Nothing kept this. `/ut/game/fifa14/club/stats/year` answered a static
+    `{"entries":[]}` -- an empty list -- so the hub header read 0-0-0 over a
+    club that had just won a cup. The season counters are separate and only
+    move in a season; a cup match moved nothing at all.
+
+    Reported 16 August 2026 by a player who won Cup 2 in four matches and
+    found his record unchanged.
+    """
+
+    __slots__ = ("won", "draw", "lost")
+
+    def __init__(self) -> None:
+        self.won = 0
+        self.draw = 0
+        self.lost = 0
+
+    @property
+    def played(self) -> int:
+        return self.won + self.draw + self.lost
+
+    def settle(self, result: str) -> None:
+        """One finished match. A result nobody recognises moves nothing."""
+        if result == "WIN":
+            self.won += 1
+        elif result == "DRAW":
+            self.draw += 1
+        elif result == "LOSS":
+            self.lost += 1
+
+    def document(self) -> dict:
+        return {"won": self.won, "draw": self.draw, "lost": self.lost}
+
+    def adopt(self, saved: object) -> None:
+        if not isinstance(saved, dict):
+            return
+        for member in ("won", "draw", "lost"):
+            try:
+                setattr(self, member, max(0, int(saved.get(member) or 0)))
+            except (TypeError, ValueError):
+                continue
+
+
+def club_year_response(record: "ClubRecord") -> bytes:
+    """What the hub header reads for the club's record.
+
+    The slot numbers are a **reading, not a certainty** -- the same caveat
+    `club_stats_response` carries for its own counters, and for the same
+    reason: the screen displays them, no document names them. Played, won,
+    drawn, lost in that order is the arrangement to check first.
+
+    One look at the header settles it. If the numbers land in the wrong boxes
+    the mapping moves; nothing here writes to a card, so a wrong slot costs a
+    glance rather than a club.
+    """
+    return json.dumps(
+        {
+            "entries": [
+                {"key": 0, "value": record.played},
+                {"key": 1, "value": record.won},
+                {"key": 2, "value": record.draw},
+                {"key": 3, "value": record.lost},
+            ],
+            # And the same three by name, which beats guessing a slot.
+            #
+            # `won` (0x02F9D4), `draw` (0x030E54) and `loss` (0x0308D8) are all
+            # in CardsDLL's own JSON name table, read off the module on
+            # 16 August 2026 -- so these are members the parser can resolve,
+            # unlike the key/value arrangement above, which is recovered from
+            # what the screen displays. `gamesPlayed` (0x030BE0) is the same
+            # member a player card uses for appearances.
+            #
+            # Both shapes go out together on purpose: an unrecognised sibling
+            # at the top level is skipped, so the one the header does not read
+            # costs nothing, and whichever it does read is right.
+            "won": record.won,
+            "draw": record.draw,
+            "loss": record.lost,
+            "gamesPlayed": record.played,
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
 class Tenant:
     """One player's club, and everything that belongs to it alone."""
 
@@ -5450,6 +8057,7 @@ class Tenant:
         self.tasks = ManagerTasks()
         self.tournaments = TournamentProgress()
         self.seasons = SeasonProgress()
+        self.record = ClubRecord()
         # The cup, and the season, a match in flight belongs to. Read when the
         # match ends and written when it is created, so neither can be a local.
         self.active_tournament: int | None = None

@@ -23,3 +23,9 @@ from pathlib import Path
 
 _SCRATCH = Path(tempfile.mkdtemp(prefix="fifa14-tests-")) / "club-save.json"
 os.environ["FIFA14_CLUB_SAVE"] = str(_SCRATCH)
+
+# The live experiment switches read a file under `runtime/`, which is whatever
+# the player's console session last set. A test asserting the served shape must
+# not depend on that -- the suite failed the moment a candidate was armed for a
+# console look. Tests run the control shape unless one of them says otherwise.
+os.environ.setdefault("FIFA14_UNLISTED_SHAPE", "plain")
