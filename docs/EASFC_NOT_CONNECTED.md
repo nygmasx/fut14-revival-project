@@ -199,3 +199,99 @@ Les deux pistes qui restent, et elles ne sont plus dans le réseau :
 
 Ce qui reste vrai depuis le début : c'est cosmétique pour jouer. FUT se
 connecte, le club charge, le marché fonctionne, les pochettes s'ouvrent.
+
+
+## La garde, trouvée : 24 août 2026
+
+Le module ne compose pas parce qu'une garde à trois termes n'est jamais
+satisfaite, et il n'en manque qu'un.
+
+`tools/xbox360_xbdm_dump.py --module powdllzf` sort `.rdata`, `.text` et
+`.data` -- 670 Ko, séquentiels, lecture seule ; ce n'est pas le balayage de tas
+qui fait tomber la console, et elle n'a pas bronché. Tout ce qui suit est lu
+hors ligne.
+
+### Le prédicat
+
+Une fonction en `0x89758D08`, répliquée en ligne à quatre autres endroits
+(`0x897334C4`, `0x8973356C`, `0x897335BC`, `0x89733620`) :
+
+```text
+0x89758D08  lwz    r11, 0x80(r3)      l'état de connexion
+0x89758D0C  cmpwi  r11, 1
+0x89758D10  bne    -> retourne 0
+0x89758D14  lbz    r11, 0x48c(r3)     POW_IS_ON
+0x89758D18  cmplwi r11, 0
+0x89758D1C  beq    -> retourne 0
+0x89758D20  lbz    r11, 0x84(r3)      un troisième drapeau
+0x89758D24  cmplwi r11, 0
+```
+
+`POW_IS_ON` est un booléen de configuration, lu une seule fois en `0x89748ED8`
+avec **défaut à 1**, et le constructeur l'écrit à 1 en `0x89774040`. Il n'est
+donc pas le blocage, et notre serveur n'a pas à le servir.
+
+### L'objet, lu sur la console
+
+Le singleton s'obtient par l'accesseur `0x897745C0`, qui lit le pointeur global
+`0x897C6E24`. Sur le titre vivant, à l'écran FOOTBALL CLUB :
+
+```text
+objet 0xBF701E40
+  +0x080 = 2      <- la garde exige 1
+  +0x084 = 1      satisfait
+  +0x48C = 1      POW_IS_ON, satisfait
+```
+
+**Un seul terme sur trois manque, et c'est l'état de connexion.**
+
+### Ce que vaut « 2 »
+
+Neuf sites comparent `+0x80` à 1, un seul à 2, et c'est celui-ci :
+
+```text
+0x89768034  lwz    r11, 0x80(r31)
+0x89768038  cmpwi  r11, 2
+0x8976803C  bne    -> sort
+0x89768040  ld     r11, 0x3a90(r31)      un handle 64 bits
+0x89768044  cmpldi r11, 0
+0x89768048  mr     r11, r29              (r29 = 1)
+0x8976804C  bne    0x89768054
+0x89768050  mr     r11, r30              (r30 = 0)
+0x89768054  clrlwi. r11, r11, 0x18
+0x89768058  beq    -> sort               <- on sort ici
+0x8976805C  mftb   ...                   l'échéance, jamais atteinte
+```
+
+L'état 2 est donc une **attente de reconnexion**, et la suite lit le compteur
+de temps pour comparer à une échéance en `+0x3AA8`. Mais la branche teste
+`+0x3A90` **avant** l'horloge, et sur la console ce champ est nul :
+
+```text
++0x080  = 2                      stable sur trois relevés à dix secondes
++0x3A90 = 0x0000000000000000
++0x3AA8 = 46689531059            l'échéance, jamais consultée
+```
+
+Avec un champ nul, `r11` prend r30 = 0 et la branche sort immédiatement. Elle
+n'atteint jamais l'horloge, donc jamais la tentative. C'est cohérent avec la
+mesure du crochet XAM : zéro appel à `connect`, jamais.
+
+Et la seule écriture 64 bits sur ce champ dans tout le module écrit **zéro**
+(`0x89768088  std r30, 0x3A90(r31)`). Aucune écriture 32 bits sur `0x3A90` ni
+`0x3A94`. Ce qui le remplit n'est donc pas visible sous ce déplacement : très
+probablement une écriture par un pointeur intérieur, ou une copie de structure.
+C'est le prochain fil à tirer.
+
+### Ce que ça vaut
+
+La chaîne est complète, des tuiles grisées jusqu'à un handle nul :
+
+    +0x3A90 nul -> la branche « état 2 » sort avant l'horloge
+                -> aucune tentative de connexion, jamais
+                -> l'état reste 2
+                -> la garde (état == 1) échoue
+                -> Catalogue, Classements, Alertes et Infos amis restent gris
+
+Il n'y a plus d'hypothèse réseau à tester, et il n'y en a jamais eu. Ce qui
+reste est un champ à remplir, et l'identité de ce qui devrait le remplir.
