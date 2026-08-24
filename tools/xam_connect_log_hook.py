@@ -50,7 +50,21 @@ Un compteur, puis un anneau de seize entrées de 0x20 octets :
     +0x04  LR de l'appelant       <- la réponse cherchée
     +0x08  handle de socket
     +0x0C  longueur du sockaddr
-    +0x10  les seize premiers octets du sockaddr, ou zéro s'il est nul
+    +0x10  les seize premiers octets du sockaddr, ou zéro s'il est invalide
+
+**Quels registres, et pourquoi pas ceux de la signature.** Mesuré le 24 août en
+posant une première version : le titre n'appelle pas l'export directement. Il
+passe par son propre shim d'import, `0x824CA450`, qui décale lui aussi les
+arguments d'un rang et met `r3 = 1`, un index de module, avant de brancher sur
+la table de thunks en `0x83C82A64` -- laquelle branche sur l'export **sans
+lien**, ce qui est la raison pour laquelle LR porte encore l'appelant d'origine
+et non un maillon de la chaîne.
+
+Donc à l'entrée de l'export, les arguments ont déjà glissé : `r3` est l'index
+de module, `r4` le socket, `r5` le sockaddr, `r6` la longueur. La première
+version lisait `r3`/`r4`/`r5` comme la signature publique et rapportait un
+socket à 1, une longueur de 0xBD2CB870 et un sockaddr vide. Rien n'était faux
+dans le crochet : la supposition l'était.
 
 Il ne change aucun argument, aucune valeur de retour, aucun drapeau. Il exécute
 l'instruction déplacée et reprend. C'est le sens de `log` dans le nom -- et dans
@@ -72,6 +86,7 @@ zéro dans l'entrée plutôt que de risquer la lecture.
 
     tools/xam_connect_log_hook.py 192.168.1.25 apply
     tools/xam_connect_log_hook.py 192.168.1.25 read
+    tools/xam_connect_log_hook.py 192.168.1.25 reset
     tools/xam_connect_log_hook.py 192.168.1.25 restore
     tools/xam_connect_log_hook.py 192.168.1.25 apply --dry-run
 """
@@ -118,16 +133,21 @@ COUNTER = 0x83C8FB00
 SLOTS_BASE = 0x83C8FB20              # après le compteur, pour que l'entrée 0 ne l'écrase pas
 SLOTS = 16
 SLOT_SIZE = 0x20
-# `bc BO, BI, cible`. BO = 12 saute si le bit testé est **vrai**, BO = 4 s'il
-# est faux. La garde doit sauter la copie quand le sockaddr est nul, c'est-à-dire
-# quand CR0[EQ] est vrai : BO = 12.
+# `bc BO, BI, cible`. BO = 4 saute si le bit testé est **faux**, BO = 12 s'il
+# est vrai.
 #
-# Écrit avec BO = 4 au premier essai, ce qui donnait un `bne` : la copie était
-# sautée quand le pointeur était valide et exécutée quand il était nul. La garde
-# faisait précisément ce qu'elle existait pour empêcher. Vu au désassemblage,
-# jamais sur la console.
-BRANCH_IF_TRUE = 12
-CONDITION_EQUAL = 2                  # bit CR0[EQ]
+# La garde saute la copie quand le sockaddr n'est **pas** une adresse virtuelle
+# plausible, c'est-à-dire quand `cmpwi` le trouve positif ou nul : toute adresse
+# valide sur cette console a le bit de poids fort à un, donc se compare comme un
+# nombre négatif. Un seul test écarte à la fois le pointeur nul et une petite
+# valeur parasite, et une faute de lecture ici n'affiche pas d'erreur -- elle
+# éteint la console.
+#
+# Écrit d'abord comme un `bne` sur zéro : la copie était sautée quand le
+# pointeur était valide et exécutée quand il était nul, soit précisément ce que
+# la garde existait pour empêcher. Vu au désassemblage, jamais sur la console.
+BRANCH_IF_FALSE = 4
+CONDITION_LESS = 0                   # bit CR0[LT]
 
 
 def ori(ra: int, rs: int, immediate: int) -> int:
@@ -188,21 +208,21 @@ def build_stub() -> list[int]:
         stw(11, 12, 0x00),           # numéro d'ordre
         0x7D4802A6,                  # mflr r10 -- lit LR sans y toucher
         stw(10, 12, 0x04),           # l'appelant : toute la question est là
-        stw(3, 12, 0x08),            # handle de socket
-        stw(5, 12, 0x0C),            # longueur du sockaddr
+        stw(4, 12, 0x08),            # handle de socket
+        stw(6, 12, 0x0C),            # longueur du sockaddr
     ]
 
-    # Le sockaddr, sous garde. Un pointeur nul est légal à l'appel et ferait
-    # fauter la copie ; une faute dans XAM emmène la console.
+    # Le sockaddr, sous garde. Voir BRANCH_IF_FALSE : la copie n'a lieu que si
+    # le pointeur ressemble à une adresse virtuelle de cette console.
     copy: list[int] = []
     for offset in (0x00, 0x04, 0x08, 0x0C):
-        copy += [lwz(10, 4, offset), stw(10, 12, 0x10 + offset)]
+        copy += [lwz(10, 5, offset), stw(10, 12, 0x10 + offset)]
     guard_at = STUB + 4 * (len(words) + 1)
     words += [
-        cmpwi(4, 0),
+        cmpwi(5, 0),
         conditional_branch(
             guard_at, guard_at + 4 + 4 * len(copy),
-            BRANCH_IF_TRUE, CONDITION_EQUAL,
+            BRANCH_IF_FALSE, CONDITION_LESS,
         ),
     ]
     words += copy
@@ -262,7 +282,8 @@ def describe(caller: int) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("host")
-    parser.add_argument("action", choices=("apply", "read", "restore", "state"))
+    parser.add_argument("action",
+                        choices=("apply", "read", "reset", "restore", "state"))
     parser.add_argument("--dry-run", action="store_true",
                         help="montrer ce qui serait écrit, sans rien écrire")
     args = parser.parse_args()
@@ -301,6 +322,15 @@ def main() -> int:
                 return 1
             client.write(SITE, patch)
             print(f"crochet posé sur 0x{SITE:08X}; `restore` avant toute relance")
+            return 0
+
+        if args.action == "reset":
+            # Vider l'anneau sans déposer le crochet, pour qu'un geste précis
+            # -- un appui sur un bouton -- se lise seul plutôt que noyé dans le
+            # trafic ordinaire du titre.
+            client.write(COUNTER, bytes(4))
+            client.write(SLOTS_BASE, bytes(SLOTS * SLOT_SIZE))
+            print("anneau vidé, crochet toujours en place")
             return 0
 
         if args.action == "restore":

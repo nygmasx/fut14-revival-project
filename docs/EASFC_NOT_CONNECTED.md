@@ -130,3 +130,72 @@ local profile it is neither: nothing was ever asked of any server.
 
 The profile selector marks the difference -- `Imskobogota6z` carries an
 XBOX LIVE badge, `louaY` and `Player1` do not.
+
+
+## Mesuré, 24 août 2026 : le module n'appelle jamais `connect`, et le bouton non plus
+
+Le document ci-dessus laissait deux explications et en désignait une comme la
+moins chère et jamais essayée : `powdllzf` connecterait par un chemin que le
+crochet ne couvre pas, puisque celui-ci est **un site d'appel dans
+`default.xex`** et que le module est séparé, avec son propre code lié.
+
+Cette hypothèse est morte. `tools/xam_connect_log_hook.py` se pose sur
+`NetDll_connect` dans `xam.xex` -- le goulot que personne ne contourne, quelle
+que soit la copie de DirtySock -- et enregistre le LR de l'appelant.
+
+**Ce que la chaîne d'appel apprend au passage.** Le titre ne saute pas
+directement sur l'export. Il passe par son shim d'import `0x824CA450`, qui
+décale les arguments d'un rang et met `r3 = 1`, puis par la table de thunks en
+`0x83C82A64`, qui branche sur `0x81741BF8` **sans lien**. C'est ce `b` sans lien
+qui rend la mesure possible : LR porte encore l'appelant d'origine et non un
+maillon intermédiaire. Corollaire pratique : à l'entrée de l'export, `r4` est le
+socket, `r5` le sockaddr, `r6` la longueur -- et non `r3`/`r4`/`r5`.
+
+**Le témoin, d'abord.** Un redémarrage du serveur Blaze force le titre à
+rouvrir ses connexions, et la sonde les voit toutes :
+
+```text
+appelant 0x83C8E6D0 (default.xex)  87.106.7.87:42124   le redirecteur
+appelant 0x83C8E6D0 (default.xex)  87.106.7.87:10041   Blaze
+appelant 0x83C8E6D0 (default.xex)  87.106.7.87:18080   l'identité
+appelant 0x81773434 (xam.xex)      ...                 interne à XAM
+```
+
+**L'appui, ensuite.** Anneau vidé, crochet vérifié en place et stub relu octet
+par octet, écran sur FOOTBALL CLUB, bouton A sur « CONNEXION AUX SERVEURS EAS
+FC » :
+
+```text
+0 appels à NetDll_connect
+```
+
+Écran inchangé -- pas de sablier, pas de dialogue d'erreur, toujours
+« Déconnecté ». Puis le même témoin rejoué immédiatement après : douze appels
+en quelques secondes. La sonde était donc vivante pendant l'appui.
+
+### Ce que ça ferme, et où ça déplace le problème
+
+Le module ne compose pas. Il ne compose pas mal, il ne compose pas ailleurs :
+il ne compose pas. Toute la famille d'explications réseau est close --
+endpoints, ports, filtres, copie de DirtySock, chemin non couvert. Aucune
+n'était le mécanisme, et aucune ne peut l'être.
+
+Le problème est **en amont de la couche réseau** : quelque chose qui devrait
+déclencher la session EAS FC ne s'exécute jamais. Le bouton lui-même n'est pas
+une preuve d'intention -- rien ne dit qu'il atteint le module ; il se peut
+qu'il soit désarmé bien avant, par le même état qui grise les quatre tuiles.
+
+Les deux pistes qui restent, et elles ne sont plus dans le réseau :
+
+* **Suivre le bouton.** `easfcFlow` et `powCatalogue` sont dans
+  `docs/navgraphs/mainfeflow.json` ; l'action de la tuile CATALOGUE est
+  `gotoCatalogue`. Savoir si l'appui atteint seulement `powdllzf` se tranche
+  avec un crochet sur le point d'entrée de connexion du module, pas sur son
+  socket.
+* **Chercher la garde.** Le module a des chaînes d'état -- `connectedToPOW`,
+  `reconnectingToPOW`, `connectionState` à `0x8970D128`. Une condition lue là
+  et jamais satisfaite expliquerait à la fois le bandeau, les tuiles grisées et
+  ce silence complet.
+
+Ce qui reste vrai depuis le début : c'est cosmétique pour jouer. FUT se
+connecte, le club charge, le marché fonctionne, les pochettes s'ouvrent.

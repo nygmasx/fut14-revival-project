@@ -42,16 +42,19 @@ class StubTests(unittest.TestCase):
         """Un mot qu'aucun désassembleur ne lit est un mot que la console exécute."""
         self.assertEqual(len(self.code), len(HOOK.stub_bytes()) // 4)
 
-    def test_the_null_sockaddr_guard_skips_the_copy_and_not_the_opposite(self) -> None:
-        """La garde doit sauter la copie quand le pointeur est nul.
+    def test_the_sockaddr_guard_skips_the_copy_and_not_the_opposite(self) -> None:
+        """La garde doit sauter la copie quand le pointeur n'est pas plausible.
 
-        Écrite à l'envers, elle sautait la copie sur un pointeur valide et la
-        laissait s'exécuter sur un pointeur nul -- une faute de lecture dans
-        XAM, c'est-à-dire la console. Le sens se lit dans le mnémonique.
+        Toute adresse virtuelle de cette console a le bit de poids fort à un,
+        donc se compare comme un nombre négatif : `bge` saute sur zéro comme
+        sur une petite valeur parasite, et ne laisse passer qu'un vrai
+        pointeur. Écrite à l'envers, la garde sautait la copie sur un pointeur
+        valide et la laissait s'exécuter sur un pointeur nul -- une faute de
+        lecture dans XAM, c'est-à-dire la console.
         """
-        index = self.text.index("cmpwi r4, 0")
+        index = self.text.index("cmpwi r5, 0")
         mnemonic = self.code[index + 1][1]
-        self.assertEqual(mnemonic, "beq", "la garde teste le mauvais sens")
+        self.assertEqual(mnemonic, "bge", "la garde teste le mauvais sens")
         target = int(self.code[index + 1][2], 16)
         after_copy = [address for address, m, _ in self.code if m == "lis"]
         self.assertIn(target, after_copy, "le saut ne retombe pas sur le code déplacé")
@@ -130,6 +133,23 @@ class StubTests(unittest.TestCase):
 
     def test_the_stub_and_the_ring_do_not_overlap(self) -> None:
         self.assertLessEqual(HOOK.STUB + len(HOOK.stub_bytes()), HOOK.COUNTER)
+
+
+    def test_the_registers_read_are_the_ones_the_import_shim_leaves(self) -> None:
+        """Mesuré, pas supposé.
+
+        Le titre n'appelle pas l'export directement : son shim d'import décale
+        les arguments d'un rang. À l'entrée de l'export, r4 est le socket, r5
+        le sockaddr et r6 la longueur -- et non r3/r4/r5 comme le dit la
+        signature publique. La première version lisait la signature et
+        rapportait un socket à 1 et un sockaddr vide.
+        """
+        self.assertIn("stw r4, 8(r12)", self.text, "le socket n'est pas r4")
+        self.assertIn("stw r6, 0xc(r12)", self.text, "la longueur n'est pas r6")
+        self.assertTrue(
+            [t for t in self.text if t.startswith("lwz r10, 0(r5)")],
+            "le sockaddr n'est pas déréférencé depuis r5",
+        )
 
 
 if __name__ == "__main__":
