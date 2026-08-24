@@ -296,6 +296,12 @@ WATCH_GIVE_UP=${WATCH_GIVE_UP:-20}
 # Le balayage est un peu plus lent ainsi. Une console qui répond lentement vaut
 # mieux qu'une console qu'il faut aller rallumer.
 WATCH_SWEEP_CHUNK=${WATCH_SWEEP_CHUNK:-0x40000}
+# Depuis combien de secondes une requête FUT vaut encore « il est dedans ».
+#
+# Assez large pour couvrir un écran qui ne parle pas au serveur pendant un
+# moment -- un match, une animation de pochette -- sans quoi le surveillant
+# repartirait au milieu de la partie.
+FUT_WINDOW=${FUT_WINDOW:-300}
 WATCH_LOG=runtime/patch-watch.log
 
 stop_watch() {
@@ -329,12 +335,32 @@ start_watch() {
             # both back to normal the second this process was killed. Counting
             # twenty failures is four to eight minutes of that.
             #
-            # The journal is the oracle, as everywhere else here: the first FUT
-            # route served says the title is inside, in its own words.
-            if grep -ql 'fut_route_request\|/ut/auth' \"\$(ls -t runtime/live-easw-*.jsonl 2>/dev/null | head -1)\" 2>/dev/null; then
-                print \"\$(date +%T) FUT entered -- watcher stopped\"
-                break
-            fi
+            # The server is the oracle, and it is asked rather than read.
+            #
+            # It used to be the local journal. That only held while the server
+            # ran on this machine: pointed at the VPS, `runtime/live-easw-*`
+            # never receives another line, the grep can never match, and the
+            # watcher sweeps through the whole session -- exactly what the stop
+            # was written to prevent. `GET /revival/inside-fut` answers the
+            # same either way, and it answers about *this* caller: the Mac and
+            # the console leave the house by the same address, and a shared
+            # server must not stop this watcher because somebody else in
+            # another country opened their club.
+            #
+            # Écrit ici et pas dans une fonction : ce corps part dans un
+            # `zsh -c` par interpolation, et un sous-shell lancé ainsi n'hérite
+            # d'aucune fonction de celui-ci.
+            #
+            # Un serveur muet, injoignable, ou trop vieux pour connaître la
+            # route répond « non » et le surveillant continue comme avant --
+            # le mauvais côté sur lequel se tromper, mais le seul honnête. Son
+            # compteur d'échecs lui reste pour s'arrêter.
+            case \"\$(curl -s --max-time 4 'http://$MAC:$IDENTITY_PORT/revival/inside-fut?window=$FUT_WINDOW' 2>/dev/null)\" in
+                *'\"inside\": true'*|*'\"inside\":true'*)
+                    print \"\$(date +%T) FUT entered -- watcher stopped\"
+                    break
+                    ;;
+            esac
             if [ \$misses -ge $WATCH_MISSES ]; then
                 out=\$('$PY' tools/fifa14_tu3_helperfunctions_runtime_patch.py '$XBOX' --timeout 20 --chunk-size $WATCH_SWEEP_CHUNK 2>&1 | tail -1)
                 misses=0

@@ -4717,6 +4717,16 @@ class IdentityHttpService:
         self.accounts = accounts if accounts is not None else AccountStores()
         self.server: http.server.ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
+        # Quand chaque pair a touché une route `/ut/` pour la dernière fois.
+        #
+        # Ça ne sert pas au jeu : ça sert au surveillant de patch, qui balaie
+        # la mémoire de la console en XBDM et doit s'arrêter dès que le titre
+        # est entré dans Ultimate Team -- continuer, c'est ralentir les menus
+        # et l'animation des pochettes chez quelqu'un qui joue. Le titre est le
+        # seul à savoir où il en est, et une requête `/ut/` est la façon dont
+        # il le dit. Voir `GET /revival/inside-fut`.
+        self.fut_seen: dict[str, float] = {}
+        self.fut_seen_lock = threading.Lock()
 
     @property
     def public_base(self) -> str:
@@ -4824,6 +4834,42 @@ class IdentityHttpService:
                 if parsed.path == "/health":
                     self.reply(200, b"ok\n", {"Content-Type": "text/plain"})
                     return
+                if parsed.path == "/revival/inside-fut":
+                    # Le titre est-il dans Ultimate Team ?
+                    #
+                    # Répond sur le pair qui demande, sans paramètre : la
+                    # machine qui pose la question est derrière le même NAT que
+                    # la console, donc le serveur voit la même adresse publique
+                    # pour les deux. C'est ce qui rend la route sûre sur un
+                    # serveur partagé -- personne n'apprend rien sur les autres
+                    # joueurs -- et ce qui la rend utilisable sans que
+                    # l'appelant ait à savoir sous quelle adresse il sort.
+                    #
+                    # `peer` force l'adresse, pour un réseau où les deux ne
+                    # sortent pas ensemble, et `window` la fenêtre en secondes.
+                    query = urllib.parse.parse_qs(parsed.query)
+                    peer = (query.get("peer") or [self.client_address[0]])[0]
+                    try:
+                        window = float((query.get("window") or ["120"])[0])
+                    except ValueError:
+                        window = 120.0
+                    with owner.fut_seen_lock:
+                        last = owner.fut_seen.get(peer)
+                    age = None if last is None else time.time() - last
+                    inside = age is not None and age <= window
+                    self.reply(
+                        200,
+                        json.dumps({
+                            "peer": peer,
+                            "inside": inside,
+                            "age": None if age is None else round(age, 1),
+                        }).encode("utf-8") + b"\n",
+                        {
+                            "Content-Type": "application/json",
+                            "Cache-Control": "no-store",
+                        },
+                    )
+                    return
                 if parsed.path == "/revival/reset" and self.command == "POST":
                     self.account_store().reset()
                     owner.journal.event(
@@ -4888,6 +4934,14 @@ class IdentityHttpService:
                 normalized_path = FUT_ROUTE_SPELLINGS.get(
                     normalized_path.lower(), normalized_path
                 )
+                # Noté ici plutôt qu'à chaque route : c'est le seul endroit où
+                # toutes les orthographes de FUT sont déjà ramenées à une, donc
+                # le seul où « le titre est dans Ultimate Team » se dit une fois
+                # et couvre tout. Un `fut_route_request` ne couvrirait que les
+                # routes statiques, une petite partie de ce que FUT appelle.
+                if normalized_path.startswith("/ut/"):
+                    with owner.fut_seen_lock:
+                        owner.fut_seen[self.client_address[0]] = time.time()
                 if normalized_path in EASW_AUTH_PATHS:
                     # The native success parser reads these headers and hands
                     # EASW-Session and EASW-Token to CardsDLL.  Supplying them
