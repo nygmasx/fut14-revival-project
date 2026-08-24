@@ -335,26 +335,30 @@ start_watch() {
             # both back to normal the second this process was killed. Counting
             # twenty failures is four to eight minutes of that.
             #
-            # The server is the oracle, and it is asked rather than read.
+            # ATTENTION -- pas de backtick sous ce toit.
             #
-            # It used to be the local journal. That only held while the server
-            # ran on this machine: pointed at the VPS, `runtime/live-easw-*`
-            # never receives another line, the grep can never match, and the
-            # watcher sweeps through the whole session -- exactly what the stop
-            # was written to prevent. `GET /revival/inside-fut` answers the
-            # same either way, and it answers about *this* caller: the Mac and
-            # the console leave the house by the same address, and a shared
-            # server must not stop this watcher because somebody else in
-            # another country opened their club.
+            # Ce corps est une chaîne entre guillemets, construite par le shell
+            # appelant et passée telle quelle a zsh -c. Le # ne protege rien :
+            # il ne veut dire "commentaire" que pour l enfant, et le parent a
+            # deja tout substitue. Un backtick dans ces lignes est donc une
+            # substitution de commande, executee avant que le surveillant ne
+            # demarre. Ecrit ici le 24 aout apres l avoir appris ainsi.
             #
-            # Écrit ici et pas dans une fonction : ce corps part dans un
-            # `zsh -c` par interpolation, et un sous-shell lancé ainsi n'hérite
-            # d'aucune fonction de celui-ci.
+            # Le serveur est l oracle, et on l interroge au lieu de le lire.
+            # C etait le journal local, ce qui ne tenait que si le serveur
+            # tournait sur cette machine. Pointe sur le VPS, ce journal ne
+            # recoit plus une ligne, le grep ne peut plus matcher, et le
+            # surveillant balaie pendant toute la partie -- exactement ce que
+            # cet arret devait empecher.
             #
-            # Un serveur muet, injoignable, ou trop vieux pour connaître la
-            # route répond « non » et le surveillant continue comme avant --
-            # le mauvais côté sur lequel se tromper, mais le seul honnête. Son
-            # compteur d'échecs lui reste pour s'arrêter.
+            # La route repond sur le pair qui demande : le Mac et la console
+            # sortent par la meme adresse publique. Un serveur partage ne doit
+            # pas arreter ce surveillant-ci parce que quelqu un d autre a
+            # ouvert son club.
+            #
+            # Un serveur muet, injoignable ou trop vieux repond non, et le
+            # surveillant continue comme avant : le mauvais cote sur lequel se
+            # tromper, mais le seul honnete. Son compteur d echecs lui reste.
             case \"\$(curl -s --max-time 4 'http://$MAC:$IDENTITY_PORT/revival/inside-fut?window=$FUT_WINDOW' 2>/dev/null)\" in
                 *'\"inside\": true'*|*'\"inside\":true'*)
                     print \"\$(date +%T) FUT entered -- watcher stopped\"
@@ -428,6 +432,13 @@ case "${1:-}" in
     # anything is said -- and that silence reads like a patch that will not
     # take, when it is a console that is not there.
     --patch)  require_xbdm || exit 1; apply_patch; release_pad; exit 0 ;;
+    # `--watch` relance le seul surveillant, sur un titre déjà lancé et patché.
+    #
+    # Il existe parce que son arrêt anticipé ne pouvait pas être observé
+    # autrement : le vérifier demandait de relancer tout le titre, donc de
+    # détruire l'état qu'on voulait justement regarder. Un surveillant déjà en
+    # place est remplacé, pas doublé.
+    --watch)  require_xbdm || exit 1; stop_watch; start_watch; exit 0 ;;
     # Same as the full run. Kept because it is the spelling this project is
     # used to typing; the patch applies on its own either way.
     --launch)
