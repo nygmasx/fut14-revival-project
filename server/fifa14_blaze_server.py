@@ -1690,6 +1690,110 @@ class Fifa14Protocol:
     def identity_base(self) -> str:
         return f"http://{self.advertise}:{self.identity_port}"
 
+    def shared_config(self, state: "ClientState | None") -> list[tuple[str, str]]:
+        """Configuration served for *every* section, not just the four we knew.
+
+        The title asks for fourteen sections -- OSDK_TICKER, OSDK_ARENA,
+        OSDK_TOLLBOOTH, OSDK_SOCIAL_NETWORKS and the rest -- and until now ten
+        of them came back empty, because this method only recognised the four
+        whose contents had been recovered from the Xbox image.  Impulsum14, a
+        working FIFA 14 PC server, answers *the same full dictionary whatever
+        section is asked for*, and its EAS FC works.  A section that returns
+        nothing is not a neutral answer: a module that reads its settings from
+        OSDK_ARENA and receives an empty map has no URL, no retry period, and
+        no reason to try twice.
+
+        What is shared here is deliberately narrower than Impulsum14's
+        dictionary.  Anything that steers authentication (AUTH_TYPE,
+        USE_TOKEN_AUTH, NUCLEUS_*, ORIGIN_LOGIN_ENABLED) is PC-only and is
+        left out: this console logs in through Xbox Live and that path already
+        works.  Anything pointing at a service we do not serve (CMS_*, the
+        DIME and downloader trees) is left out too, because a URL that 404s is
+        worse than a switch that stays at its default.  What remains is the
+        EA Sports Football Club block, the POW switches, and timings.
+        """
+        identity = self.identity_base
+        core = f"{self.advertise}:{self.core_port}"
+        return [
+            # EA Sports Football Club.  OSDK_EASW_CONNECT_RETRY_PERIOD is the
+            # one this project has been missing without knowing it: powdllzf
+            # arms a reconnect timestamp, and when that timer expires it
+            # disarms itself and never re-arms.  A module with no configured
+            # retry period has nothing to re-arm it with.
+            ("EASW/ENABLED", "1"),
+            ("OSDK_EASW_CONNECT_RETRY_PERIOD", "30"),
+            ("OSDK_EASW_REQ_URL", f"{identity}/easw/req"),
+            ("OSDK_EASW_EVENT_URL", f"{identity}/easw/event"),
+            ("OSDK_EASW_MEDIA_URL", f"{identity}/easw/media"),
+            ("OSDK_EASW_GF_FILE_URL", f"{identity}/easw/gf"),
+            # POW, the module behind the FOOTBALL CLUB tab.  These are
+            # switches, not endpoints: they decide whether it backs out of the
+            # screen on the first error and whether it insists on downloading
+            # a scenario roster that no longer exists anywhere.
+            ("POW/ASSERT_POW_ERROR", "0"),
+            ("POW/POW_DISABLE_ERROR_BACKOUT", "1"),
+            ("POW/POW_WIDGET", "1"),
+            ("POW/ENABLE_ALL_UNLOCKABLES", "1"),
+            ("POW/ENABLE_RPUPS", "0"),
+            ("POW/ENABLE_USER_NEWS", "0"),
+            ("POW/FIRST_BOOT_ACTIVITY", "0"),
+            ("POW/FORCE_SCENARIO_COMPLETE", "1"),
+            ("POW/SEND_ACTIVITIES", "0"),
+            ("POW/SKIP_SCENARIO_ROSTER_DOWNLOAD", "1"),
+            ("POW/STORE_CUSTOM_CATALOG", "0"),
+            ("POW_MDL_MAX_IMAGESIZE", "1048576"),
+            ("POW_MDL_DELAYNEWSDOWNLOAD", "0"),
+            ("FIFA_POW_MMM_URI", f"{identity}/"),
+            # RS4, the EAS FC redirect.  Left unset the module falls back to
+            # hostnames that have been dead for a decade.
+            ("ONLINE/SERVER_RS4", identity),
+            ("FIFA_RS4_URL", identity),
+            ("FIFA_RS4_TIMEOUT", "30"),
+            ("ONLINE/POW_CUSTOMURL", core),
+            ("ONLINE/POW_CUSTOMCONTENTURL", identity),
+            # Services we deliberately do not run.  Off is an answer; empty is
+            # not, and a module left at its retail default looks for a host
+            # that stopped answering in 2016.
+            ("ABUSE_REPORTING_ENABLED", "0"),
+            ("WEBOFFER_ENABLED", "0"),
+            ("ROSTER_UPDATE_ENABLED", "0"),
+            ("SPONSORED_EVENT_ENABLED", "0"),
+            ("PRIVATE_BETA", "0"),
+            ("EMAIL_OPT_IN", "0"),
+            ("SKIP_LEGAL_DOC", "1"),
+            ("ALLOW_OFFLINE", "1"),
+            ("OSDK_ONLINE_ENABLED", "1"),
+            # Timings and buffer sizes, verbatim from the working PC server.
+            ("OSDK_PEERBUFFERSIZE", "16384"),
+            ("OSDK_DISTBUFFERSIZE_IN", "16384"),
+            ("OSDK_DISTBUFFERSIZE_OUT", "16384"),
+            ("OSDK_MAXGAMES", "16"),
+            ("OSDK_MAXROOMS", "16"),
+            ("OSDK_USERROOM_PREFIX", "room"),
+            ("OSDK_MATCHUP_TIMEOUT", "30"),
+            ("OSDK_KEEPALIVEINTERVAL", "30"),
+            ("OSDK_STATS_EMPTY_CELL", "-1"),
+            ("OSDK_TICKER_COUNT", "10"),
+            ("OSDK_USERLIST_REQUEST_MAX_USERS", "50"),
+            ("JOIN_GAME_TIMEOUT", "30"),
+            ("CLIENT_TIMEOUT", "90"),
+            ("REQUEST_TIMEOUT", "80"),
+        ]
+
+    @staticmethod
+    def merge_config(
+        shared: list[tuple[str, str]], section: list[tuple[str, str]]
+    ) -> list[tuple[str, str]]:
+        """Section values win over shared ones, and no key appears twice.
+
+        The frame carries a map, and a map with a repeated key is a decoder's
+        problem, not a server's licence.  Where both define a key the section
+        wins, because those values were read off the Xbox image and the shared
+        ones were read off a PC server.
+        """
+        overridden = {key for key, _ in section}
+        return [pair for pair in shared if pair[0] not in overridden] + section
+
     def fetch_config(
         self,
         request: bytes,
@@ -1823,6 +1927,7 @@ class Fifa14Protocol:
                 ("ROSTER_LKR", ""),
                 ("ROSTER_CSUM", ""),
             ]
+        values = self.merge_config(self.shared_config(state), values)
         journal_fetch(values)
         return response_frame(
             request,
