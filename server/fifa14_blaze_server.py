@@ -312,6 +312,13 @@ MATCHMAKING_SESSION_CANCELED = 4
 NOTIFY_SERVER_CENSUS_DATA = 1
 GAME_MANAGER_CENSUS_TDF_ID = 0x21239231
 
+# The configuration sections whose contents were read off this console's own
+# image and verified against it.  They are answered exactly as they were, and
+# nothing shared is merged into them -- see `fetch_config`.
+SECTIONS_RECOVERED_FROM_THE_XBOX_IMAGE = frozenset(
+    {"OSDK_CORE", "OSDK_CLIENT", "OSDK_ROSTER", "IdentityParams"}
+)
+
 CENSUS_SUBSCRIBE = 1
 CENSUS_UNSUBSCRIBE = 2
 
@@ -1927,7 +1934,24 @@ class Fifa14Protocol:
                 ("ROSTER_LKR", ""),
                 ("ROSTER_CSUM", ""),
             ]
-        values = self.merge_config(self.shared_config(state), values)
+        # The shared block goes only where there was nothing.
+        #
+        # Serving it everywhere is what the working PC server does, and doing
+        # the same here broke the login outright on 2026-08-27: the console
+        # authenticated, took the redirect, dropped the connection one second
+        # later and retried every seventy seconds behind "les serveurs EA ne
+        # sont pas disponibles".  Reverting the server and relaunching against
+        # it held the session, which named the change without ambiguity.
+        #
+        # The mistake was one of standing, not of content.  The four sections
+        # below were recovered from this console's own image and verified on
+        # hardware; `OSDK_CORE` and `OSDK_CLIENT` in particular are what
+        # CardsDLL reads.  Fifty keys lifted from a PC server -- among them
+        # ALLOW_OFFLINE, SKIP_LEGAL_DOC and OSDK_ONLINE_ENABLED -- do not get
+        # to outrank that.  An empty section, by contrast, has nothing to
+        # lose.
+        if name not in SECTIONS_RECOVERED_FROM_THE_XBOX_IMAGE:
+            values = self.merge_config(self.shared_config(state), values)
         journal_fetch(values)
         return response_frame(
             request,

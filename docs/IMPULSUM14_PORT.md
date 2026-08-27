@@ -58,9 +58,30 @@ Le bloc est volontairement **plus étroit** que le dictionnaire d'Impulsum14 :
   arbres DIME et downloader) reste dehors : une URL qui répond 404 est pire
   qu'un commutateur laissé à son défaut.
 
-Sept tests tiennent la forme, dont « aucune section ne revient vide », « aucune
-clé servie deux fois dans une même carte » et « aucune URL partagée ne nomme un
-hôte qui n'est pas le nôtre ».
+Neuf tests tiennent la forme, dont « aucune clé servie deux fois dans une même
+carte », « aucune URL partagée ne nomme un hôte qui n'est pas le nôtre » et les
+deux qui viennent d'une erreur payée sur la console.
+
+### L'erreur, et ce qu'elle a coûté
+
+La première version servait le bloc à **toutes** les sections, comme le fait
+Impulsum14. Le 27 août au soir, la console ne s'est plus connectée du tout :
+elle s'authentifiait, prenait la redirection, fermait la connexion une seconde
+plus tard, et recommençait toutes les soixante-dix secondes derrière « les
+serveurs EA ne sont pas disponibles ». Quatre cycles identiques.
+
+Le diagnostic a demandé de retirer les deux changements de la soirée d'un coup
+— le bloc de configuration et un crochet posé dans XAM — puis de relancer : la
+session a tenu, et le crochet n'avait jamais empêché une connexion TCP
+d'aboutir. Le bloc était nommé sans ambiguïté.
+
+La faute n'était pas dans le contenu du bloc mais dans sa portée. `OSDK_CORE`,
+`OSDK_CLIENT`, `OSDK_ROSTER` et `IdentityParams` ont été retrouvées dans
+l'image de cette console et vérifiées sur elle ; `OSDK_CORE` et `OSDK_CLIENT`
+sont ce que lit CardsDLL. Cinquante clés tirées d'un serveur PC — dont
+`ALLOW_OFFLINE`, `SKIP_LEGAL_DOC` et `OSDK_ONLINE_ENABLED` — n'ont pas à passer
+devant. Le bloc ne va donc plus que là où il n'y avait rien : les dix sections
+qui revenaient vides.
 
 ## Ce qu'ils ont et que nous n'avons pas
 

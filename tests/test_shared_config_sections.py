@@ -77,17 +77,44 @@ class SharedConfigTests(unittest.TestCase):
             with self.subTest(section=section):
                 self.assertTrue(self.served(section))
 
+    def test_the_sections_read_off_the_xbox_image_are_untouched(self) -> None:
+        # Serving the shared block everywhere broke the login outright on
+        # 2026-08-27: the console authenticated, took the redirect, dropped
+        # one second later, and retried every seventy seconds behind "les
+        # serveurs EA ne sont pas disponibles".  Reverting the server and
+        # relaunching held the session, which named the change.
+        #
+        # These four were recovered from this console's own image and verified
+        # on hardware -- OSDK_CORE and OSDK_CLIENT are what CardsDLL reads.
+        # Keys lifted from a PC server do not get to outrank that.
+        self.assertEqual(set(self.served("IdentityParams")), {"client_id", "redirect_uri"})
+        for section in ("OSDK_CORE", "OSDK_CLIENT", "OSDK_ROSTER"):
+            with self.subTest(section=section):
+                served = self.served(section)
+                self.assertNotIn("ALLOW_OFFLINE", served)
+                self.assertNotIn("SKIP_LEGAL_DOC", served)
+                self.assertNotIn("OSDK_ONLINE_ENABLED", served)
+
+    def test_osdk_roster_keeps_its_four_names_and_nothing_else(self) -> None:
+        self.assertEqual(
+            set(self.served("OSDK_ROSTER")),
+            {"ROSTER_URL", "ROSTER_VER", "ROSTER_LKR", "ROSTER_CSUM"},
+        )
+
     def test_every_section_carries_the_easfc_retry_period(self) -> None:
         # This is the key the reconnect timer in powdllzf has to read to have
         # anything to re-arm itself with.  Which section the module reads is
-        # not known, so all of them carry it.
+        # not known, so all of them carry it -- all but the one that is not a
+        # section at all.
         for section in SECTIONS_THE_TITLE_ASKS_FOR:
+            if section in SERVER.SECTIONS_RECOVERED_FROM_THE_XBOX_IMAGE:
+                continue
             with self.subTest(section=section):
                 served = self.served(section)
                 self.assertEqual(served["OSDK_EASW_CONNECT_RETRY_PERIOD"], "30")
                 self.assertEqual(served["EASW/ENABLED"], "1")
 
-    def test_a_section_never_serves_the_same_key_twice(self) -> None:
+    def test_a_section_never_serves_the_same_key_twice(self) -> None:  # noqa: D401
         # The frame carries a map.  A repeated key is a decoder's problem, and
         # the merge is what keeps it from happening when a section overrides a
         # shared value.
@@ -101,10 +128,10 @@ class SharedConfigTests(unittest.TestCase):
                 keys = [key for key, _ in conf.value[2]]
                 self.assertEqual(len(keys), len(set(keys)))
 
-    def test_the_xbox_values_win_over_the_pc_ones(self) -> None:
+    def test_the_xbox_locale_is_still_four_characters(self) -> None:
         # OSDK_CORE's locale was read off this console's own PreAuth and is
         # four characters exactly; Impulsum14 serves a comma-separated PC list
-        # there.  The section must win.
+        # under the same name.  Nothing shared may reach this section.
         self.state.locale = "frFR"
         served = self.served("OSDK_CORE")
         self.assertEqual(served["OSDK_EASW_ALLOWED_LOCALES"], "frFR")
