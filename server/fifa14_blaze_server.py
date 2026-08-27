@@ -4792,11 +4792,25 @@ class Fifa14Protocol:
                 )
             ]
 
+        # What the console *asked for* matters more than the fact that it
+        # asked.  Until now this line recorded only the numbers, and the
+        # numbers alone cannot be answered: `getStatGroup` is the most
+        # frequent unanswered command in the journal, and every one of its
+        # replies is built around the group NAME it carries.  Recording the
+        # fields turns one console session into a specification -- the group
+        # names, the board ids, the entity types the title actually wants --
+        # instead of a list of things to guess at.
+        #
+        # `hex` is kept beside them because a field this decoder reads wrongly
+        # would otherwise be recorded wrongly and look right; the raw frame is
+        # the one thing that cannot be misread later.
         self.logger.event(
             "unknown_route",
             connection=state.connection_id,
             component=route[0],
             command=route[1],
+            fields=json_value(decoded["fields"]),
+            hex=request.hex().upper(),
         )
         return [response_frame(request)]
 
