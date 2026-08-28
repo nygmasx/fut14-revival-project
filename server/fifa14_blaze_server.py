@@ -658,6 +658,22 @@ class AccountStores:
 # its own EASW-* signature headers.  Accept both.
 EASW_AUTH_PATHS = ("/authentication360", "/v2/authenticationNucleusPersona")
 
+# `POST /easw/event/personas/<persona>/sku/<sku>/event` -- the EA Sports
+# Football Club module reporting that this player is present.
+#
+# It appeared for the first time on 2026-08-28 at 00:09:57, minutes after the
+# ten empty configuration sections were finally filled, and without anything
+# being pressed: the module read `OSDK_EASW_EVENT_URL`, re-armed itself, and
+# started posting every twenty seconds.  Until that evening it had never sent
+# anything at all -- its reconnect timer had expired years of console-time ago
+# and had nothing configured to re-arm it with.
+#
+# The SKU segment is how this build names itself: `FFA14XBX`, where the PC
+# build says `FFA14PCC`.
+EASW_EVENT_PATH = re.compile(
+    r"^/easw/event/personas/(?P<persona>\d+)/sku/(?P<sku>[A-Za-z0-9]+)/event$"
+)
+
 # The FUT HTTP surface, keyed by exact path.  Every body here is the response
 # the corresponding FIFA 14 parser treats as "nothing yet": empty collections
 # and absent optional members, so the client keeps its own zeroed defaults
@@ -969,6 +985,19 @@ EASW_TOKEN = "LOCAL-FIFA14-EASW-TOKEN"
 EASW_SESSION = "LOCAL-FIFA14-EASW-SESSION"
 
 REQUEST_BODY_PREVIEW_LIMIT = 4096
+
+
+def easw_event_category(body: bytes) -> str:
+    """The `term` of the Atom entry's `<category>`, e.g. "presence".
+
+    Read with a regular expression rather than an XML parser on purpose: this
+    body arrives from the network on every event, and a full parser is a much
+    larger surface to hand an attacker than one bounded match.  A body that
+    does not look like the expected entry simply has no category, which is
+    what the journal will then show.
+    """
+    match = re.search(rb'<category\s+term="([A-Za-z0-9_.-]{1,64})"', body[:2048])
+    return match[1].decode("ascii") if match is not None else ""
 
 
 def request_body_preview(body: bytes) -> str | None:
@@ -5111,6 +5140,49 @@ class IdentityHttpService:
                             "EASW-Session": EASW_SESSION,
                             "EASW-Nucleus-Persona": str(persona_id),
                             "EASW-Userid": str(persona_id),
+                        },
+                    )
+                    return
+                easw_event = EASW_EVENT_PATH.match(normalized_path)
+                if easw_event is not None:
+                    # The body is an Atom entry: an `<updated>` stamp, a
+                    # `<category term="...">` naming the kind of event, and one
+                    # `<e:event>` carrying the console's xuid, the player's
+                    # handle and a numeric id.  All of it is recorded, because
+                    # this is the first traffic this module has ever produced
+                    # and nothing else documents its vocabulary.
+                    owner.journal.event(
+                        "easw_event",
+                        peer=self.client_address[0],
+                        persona=easw_event["persona"],
+                        sku=easw_event["sku"],
+                        category=easw_event_category(body),
+                        bytes=len(body),
+                        body=request_body_preview(body),
+                    )
+                    # An empty 200 rather than an invented entry.
+                    #
+                    # What EASW answers here is not known, and the lesson from
+                    # the stats screens on 22 August is that guessing at a
+                    # success shape can be worse than admitting emptiness: a
+                    # fabricated reply the client half-parses leaves it waiting
+                    # for a follow-up that never comes, while an honest answer
+                    # lets it move on.  A presence event is fire-and-forget --
+                    # the client posts it and does not read a body back -- so
+                    # the smallest well-formed acceptance is the honest answer
+                    # here, and 404 plainly was not.
+                    #
+                    # If the console keeps re-posting the same event id after
+                    # this, the next thing to try is 201 with the entry echoed
+                    # back; the journal above is what will say which.
+                    self.reply(
+                        200,
+                        b"",
+                        {
+                            "Content-Type": "text/xml",
+                            "Cache-Control": "no-store",
+                            "EASW-Token": EASW_TOKEN,
+                            "EASW-Session": EASW_SESSION,
                         },
                     )
                     return
