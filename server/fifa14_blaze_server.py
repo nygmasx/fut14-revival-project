@@ -674,6 +674,30 @@ EASW_EVENT_PATH = re.compile(
     r"^/easw/event/personas/(?P<persona>\d+)/sku/(?P<sku>[A-Za-z0-9]+)/event$"
 )
 
+# The other things the module posts once it is talking.  All three are
+# *uploads*: the console telling the service about itself, not asking it for
+# anything.  `buddies` carries this player's Xbox Live friends list, and
+# `online_stats` a small create with SKILL, DNF and TIMEZONE.
+#
+# They are answered, and the two EASW *reads* -- `GET .../configuration` and
+# `GET .../personas/<id>/sku/<sku>;full` -- deliberately are not.  The
+# difference is not timidity: 404 on an upload is plainly wrong, while a read
+# answered with an invented document is the failure mode that cost this
+# project an evening on the stats screens, where a shape the client
+# half-accepted left it waiting forever for a follow-up.  Those two wait until
+# the parser in powdllzf has been read.
+EASW_UPLOAD_PATHS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("presence", EASW_EVENT_PATH),
+    ("buddies", re.compile(r"^/easw/req/personas/(?P<persona>\d+)/buddies$")),
+    (
+        "online_stats",
+        re.compile(
+            r"^/easw/req/personas/(?P<persona>\d+)"
+            r"/sku/(?P<sku>[A-Za-z0-9]+)/online_stats$"
+        ),
+    ),
+)
+
 # The FUT HTTP surface, keyed by exact path.  Every body here is the response
 # the corresponding FIFA 14 parser treats as "nothing yet": empty collections
 # and absent optional members, so the client keeps its own zeroed defaults
@@ -5143,19 +5167,27 @@ class IdentityHttpService:
                         },
                     )
                     return
-                easw_event = EASW_EVENT_PATH.match(normalized_path)
+                easw_kind, easw_event = "", None
+                for candidate_kind, pattern in EASW_UPLOAD_PATHS:
+                    easw_event = pattern.match(normalized_path)
+                    if easw_event is not None:
+                        easw_kind = candidate_kind
+                        break
                 if easw_event is not None:
-                    # The body is an Atom entry: an `<updated>` stamp, a
-                    # `<category term="...">` naming the kind of event, and one
-                    # `<e:event>` carrying the console's xuid, the player's
-                    # handle and a numeric id.  All of it is recorded, because
-                    # this is the first traffic this module has ever produced
-                    # and nothing else documents its vocabulary.
+                    # Every one of these bodies is XML the console composed
+                    # itself, and all of it is recorded: this is the first
+                    # traffic the module has ever produced and nothing else
+                    # documents its vocabulary.  A presence entry carries an
+                    # `<updated>` stamp, a `<category term="...">` and one
+                    # `<e:event>` with the console xuid and the player handle;
+                    # `buddies` carries the Xbox Live friends list; and
+                    # `online_stats` three named values.
                     owner.journal.event(
                         "easw_event",
                         peer=self.client_address[0],
+                        upload=easw_kind,
                         persona=easw_event["persona"],
-                        sku=easw_event["sku"],
+                        sku=easw_event.groupdict().get("sku"),
                         category=easw_event_category(body),
                         bytes=len(body),
                         body=request_body_preview(body),

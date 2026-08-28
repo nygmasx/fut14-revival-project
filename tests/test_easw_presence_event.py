@@ -108,11 +108,50 @@ class EaswPresenceEventTests(unittest.TestCase):
         event = self.records("easw_event")[0]
         self.assertEqual((event["persona"], event["sku"]), ("42", "FFA14PCC"))
 
-    def test_a_neighbouring_easw_path_is_not_swallowed(self) -> None:
-        # Only the event route is implemented.  The others were configured
-        # this evening but have never been seen in use, and answering a route
-        # wrongly is worse than not answering it -- the journal will show them
-        # if the console starts asking.
+    def test_the_friends_list_upload_is_accepted(self) -> None:
+        # Recorded from the console: the module uploads this player's Xbox Live
+        # friends list, which is what "Infos amis" in the FOOTBALL CLUB tab is
+        # made of.
+        body = (
+            b'<?xml version="1.0" encoding="UTF-8"?><buddies>'
+            b'<buddylist id="360"><buddy xuid="000900000A84E6DB" handle="Un ami" />'
+            b"</buddylist></buddies>"
+        )
+        self.assertEqual(
+            self.post("/easw/req/personas/1000001/buddies", body).status, 200
+        )
+        event = self.records("easw_event")[0]
+        self.assertEqual(event["upload"], "buddies")
+        self.assertEqual(event["persona"], "1000001")
+        # This route carries no SKU segment, and the record must say so rather
+        # than invent one.
+        self.assertIsNone(event["sku"])
+
+    def test_the_online_stats_upload_is_accepted(self) -> None:
+        body = (
+            b'<?xml version="1.0" encoding="UTF-8"?><online_statistics_create>'
+            b'<stat name="SKILL" value="1" /><stat name="DNF" value="0" />'
+            b"</online_statistics_create>"
+        )
+        path = "/easw/req/personas/1000001/sku/FFA14XBX/online_stats"
+        self.assertEqual(self.post(path, body).status, 200)
+        event = self.records("easw_event")[0]
+        self.assertEqual((event["upload"], event["sku"]), ("online_stats", "FFA14XBX"))
+
+    def test_the_presence_event_is_named_as_such(self) -> None:
+        self.post()
+        self.assertEqual(self.records("easw_event")[0]["upload"], "presence")
+
+    def test_the_two_easw_reads_are_left_alone(self) -> None:
+        # The uploads are answered because 404 on an upload is plainly wrong.
+        # These two are reads, and a read answered with an invented document
+        # is the failure mode that cost an evening on the stats screens: a
+        # shape the client half-accepts leaves it waiting forever.  They wait
+        # until the parser in powdllzf has been read.
+        self.assertEqual(self.post("/easw/req/sku/FFA14XBX/configuration").status, 404)
+        self.assertEqual(
+            self.post("/easw/req/personas/1000001/sku/FFA14XBX;full").status, 404
+        )
         self.assertEqual(self.post("/easw/media/personas/1000001").status, 404)
         self.assertEqual(self.records("easw_event"), [])
 
