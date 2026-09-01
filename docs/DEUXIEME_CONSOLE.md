@@ -198,3 +198,47 @@ le titre en cours par `*FIFA*`, ce qui marche pour
 script sautait donc `await_dashboard` et armait le lanceur sur un titre déjà
 lancé, à attendre un `modload` qui ne pouvait plus venir. Il teste maintenant
 aussi `*default.xex*`.
+
+## Le stealth server : Cipher ne couvre pas les softmods
+
+Mesuré le 1er septembre 2026, les deux consoles allumées ensemble, même Cipher
+(loader 1.12 / cœur 1.71), même réseau, même dashboard 17559 :
+
+```
+console 1  RGH        Live status changed: 0x1510F0
+                      Notify: Connected to Xbox Live       -> marche
+console 2  ABadAvatar Live status changed: 0x8015190E (x6)
+                      alterné avec 0x1510F1, jamais 0x1510F0  -> échoue
+```
+
+Cipher parle pourtant à son propre serveur depuis la console 2 : il s'y est
+enregistré et affiche son essai. Ce n'est donc ni le réseau ni le service. La
+seule variable qui reste entre les deux consoles est **le type d'exploit**, et
+c'est exactement ce que les deux fournisseurs annoncent : xbGuard se présente
+comme couvrant « RGH/JTAG/XDK **and Bad Update/Bad Avatar consoles** » et
+propose un *Standby Mode* décrit comme utile aux softmods ; Cipher n'annonce
+que RGH / JTAG / XDK.
+
+xbGuard est donc posé sur la clé de la console 2 en `plugin2`, Cipher débranché
+mais conservé, avec un `launch.ini.cipher` laissé sur la clé pour revenir en
+arrière sans le Mac. Le paquet (`xbguard.live/xbGuard.zip`, téléchargeable sans
+compte) livre exactement la même forme de `launch.ini` que la console 1 :
+`plugin1 = xbdm`, `plugin2 = stealth`, `plugin3 = JRPC2`, `pingpatch = false`,
+`liveblock = false`. Le Lite Mode est gratuit et annonce les *challenge
+responses*, ce qui est tout ce dont ce projet a besoin.
+
+### Deux choses apprises au passage, dont une erreur à ne pas refaire
+
+**Le préfixe du XUID ne dit pas le type du profil.** Le dossier de profil de la
+console 2 est `Hdd:\Content\E00006ED8DE43D44` — préfixe `E0`, que la littérature
+associe aux profils hors ligne. J'en ai conclu que `psyko mg` était un profil
+local, donc le cas `louaY` de `docs/EASFC_NOT_CONNECTED.md`. **C'était faux** :
+une capture d'écran montre le badge XBOX LIVE sur ce profil. Sur cette
+question, l'écran tranche et le nom de dossier ne prouve rien —
+`tools/xbdm_screenshot.py` coûte deux secondes.
+
+**FIFA teste la connexion LIVE au démarrage du titre, et ne repose plus la
+question.** Lancer le jeu puis se connecter ne rattrape rien : il faut le profil
+connecté à LIVE **avant** d'appuyer. C'est ce qui a produit « Vous devez être
+connecté à Xbox Live et aux serveurs EA » alors que tout le reste était en
+place — redirecteur vérifié, EAS FC pointé, TU3 patché.
