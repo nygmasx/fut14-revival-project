@@ -242,3 +242,41 @@ question.** Lancer le jeu puis se connecter ne rattrape rien : il faut le profil
 connecté à LIVE **avant** d'appuyer. C'est ce qui a produit « Vous devez être
 connecté à Xbox Live et aux serveurs EA » alors que tout le reste était en
 place — redirecteur vérifié, EAS FC pointé, TU3 patché.
+
+### Correction, une heure plus tard : ce n'était pas le stealth server
+
+La section ci-dessus concluait que Cipher ne couvrait pas les softmods. **C'est
+faux, et la façon dont je m'y suis pris était la vraie erreur.** xbGuard,
+installé à sa place, initialise son stealth complètement et donne exactement le
+même code :
+
+```
+[xbGuard::Keyvault]: Using Nand Keyvault!
+[xbGuard::Network]: Connection valid. Attempting to connect to our servers...
+[xbGuard::StealthNetwork]: Initialized
+[xbGuard]: Stealth Initialized!
+[xbGuard::XBL]: LIVE Logon Status Updated: 8015190E     <- identique à Cipher
+[xbGuard::Network]: [0] Failed to receive packet data! (timeout)
+[xbGuard::Network]: [0] Failed to connect to servers!
+```
+
+La comparaison console 1 / console 2 qui avait servi à conclure ne contrôlait
+pas la variable réseau. Le test de connexion de la console 2 affiche
+`Réseau: Connecté / Internet: Échec / Xbox Live: Bloqué`, et le log de xbGuard
+montre le même désordre en amont : « Waiting for network », « Unable to obtain
+console IP address (0x00008002) », puis des délais d'attente en série — tout en
+ayant **réussi** entre-temps à télécharger sa propre mise à jour v15.2.4 et ses
+ressources. C'est-à-dire de la connectivité par à-coups, pas son absence.
+
+`8015190E` est donc la **conséquence** et non la cause : les deux services
+disent la même chose, à savoir qu'ils n'atteignent pas les serveurs.
+
+Ce que ça laisse comme leçon, plus utile que la conclusion elle-même : deux
+consoles ne diffèrent jamais par une seule variable simplement parce qu'on n'en
+a regardé qu'une. Ici la console 1 est sur une liaison stable et la console 2
+sur un Wi-Fi qui perd son bail DHCP — et c'est cette différence-là, invisible
+dans les logs Cipher, qui portait tout l'écart.
+
+xbGuard reste en place : il est au moins aussi capable, il se met à jour seul,
+et son log est nettement plus explicite que celui de Cipher. Mais il n'a rien
+résolu, parce qu'il n'y avait rien à résoudre de ce côté.
