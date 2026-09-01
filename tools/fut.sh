@@ -207,9 +207,16 @@ except Exception:
 launch_title() {
     step "launching the title"
     require_xbdm || return 1
+    # `*FIFA*` matched the console 1 install -- `Hdd:\Games\FIFA 14\default.xex`
+    # carries the name in its path. A disc-launched title does not: console 2
+    # runs FIFA from the DVD and `running_title` returns a path with no `FIFA`
+    # in it, so this step silently skipped `await_dashboard` and armed the
+    # launcher against a title that was already up -- waiting for a `modload`
+    # that could not come. `default.xex` is the reliable signal: the dashboard
+    # is `dash.xex`, so any `default.xex` is a game.
     case "$(running_title)" in
-        *FIFA*|*fifa*)
-            print "   FIFA is already running."
+        *FIFA*|*fifa*|*default.xex*)
+            print "   A title is already running."
             await_dashboard || return 1
             ;;
     esac

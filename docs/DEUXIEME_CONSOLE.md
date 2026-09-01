@@ -104,24 +104,35 @@ projet gèle des titres régulièrement. Sur la console 1 (RGH) ça coûte un
 reboot ; ici ça coûtera un quart d'heure. Une Slim est glitchable (Trinity,
 Corona) : si le rythme devient insupportable, le RGH matériel reste la sortie.
 
-**Le ban LIVE, et c'est la vraie décision.** Une retail bannie ne se débannit
-pas — contrairement à une RGH. Or `docs/MATCHMAKING.md` établit que la couche
-XNet du pair-à-pair a besoin des adresses fournies par le vrai Xbox LIVE :
+**LIVE n'est pas optionnel, et c'est ce qui impose un stealth server.**
+`docs/EASFC_NOT_CONNECTED.md` l'a mesuré profil contre profil : un profil local
+reçoit « Vous devez être connecté à Xbox Live et aux serveurs EA », un profil
+Xbox LIVE passe. Ce n'est donc pas qu'une affaire de maillage pair-à-pair —
+**FUT lui-même refuse de s'ouvrir sans LIVE**. Et `docs/MATCHMAKING.md` ajoute
+que la couche XNet du pair-à-pair a besoin des adresses fournies par LIVE :
 « LIVE réel pour la couche console, serveur privé pour la couche EA morte ».
-Mettre une console softmodée sur LIVE n'est pas gratuit.
 
-Le `launch.ini` livré a `liveblock = true`, qui bloque la résolution DNS de
-LIVE. **On le garde pour commencer**, et on essaie d'abord le maillage sur le
-LAN, où les deux consoles sont pour la première fois côte à côte — les six
-appariements de `docs/MATCHMAKING.md` avaient une console en France et une aux
-États-Unis. Si le maillage se forme sans LIVE, la question ne se pose plus. Il
-sera temps de la poser si, et seulement si, il échoue pour la couche XNet.
+La console 1 le fait depuis le début : `docs/PLUGIN.md` montre
+`plugin2 = Usb:\Cipher\Cipher.xex`. La console 2 a besoin du même montage —
+Cipher (ou xbGuard) en `plugin2`, et `liveblock = false` dans le `launch.ini`,
+alors que XeUnshackle le livre à `true`.
 
-Ne **pas** installer de « stealth server » (xbGuard et compagnie). Le README de
-XeUnshackle est explicite : l'usurpation change l'adresse MAC **dans la NAND, de
-façon persistante**. Et le paquet tout-en-un `Devs52/ABadAvatar-AIO` qui circule
-embarque en plus une boutique de jeux piratés — ce n'est pas ce qu'on met sur
-cette console.
+Deux conséquences pratiques :
+
+* **Les plugins sont chargés au moment où Dashlaunch démarre**, c'est-à-dire à
+  la sortie de XeUnshackle. Ajouter Cipher à une session déjà en cours est
+  impossible : il faut écrire le `launch.ini` et les fichiers sur la clé, puis
+  refaire l'exploit. Autant les poser avant de rallumer.
+* **Rien de tout ça n'est distribué avec le dépôt.** `docs/SAFETY.md` et
+  `README.md` interdisent d'y committer les fichiers ou la configuration
+  Cipher/xbGuard, les clés console et les KV. La règle porte sur la
+  distribution, pas sur l'usage : le montage local en a besoin, le dépôt ne le
+  publie pas.
+
+Le risque reste réel et il faut le connaître : une retail bannie ne se débannit
+pas, alors qu'une RGH se rattrape. C'est précisément ce que le stealth server
+sert à éviter, et c'est pour ça qu'il n'est pas facultatif ici. Faire un dump
+de la NAND avant, comme le recommande XeUnshackle, est une précaution gratuite.
 
 ## Le club : rien à faire, et une chose à ne pas faire
 
@@ -142,3 +153,48 @@ feraient écraser.
   (`tools/console_preflight.py` vérifie les trois : titre, install, TU).
 - XeXMenu 1.2 ou Aurora sur la clé, pour lancer le titre à la main — sur un
   softmod le Mac ne peut pas rebooter la console vers le dashboard.
+
+## Ce que la console 2 a donné — 1er septembre 2026
+
+Premier essai d'ABadAvatar réussi du premier coup, en une vingtaine de minutes
+d'écran de profils. Ce qui a été mesuré ensuite, par XBDM, sans rien casser :
+
+```
+adresse            192.168.1.45          (le Mac est passé en .43)
+bannière           201- connected
+XBDM               2.0.21076.11
+carte mère         Waternoose / Trinity  -- glitchable, le RGH reste ouvert
+noyau              2.0.17559.0
+disque             245 Go, dont 243 libres
+```
+
+**Le build est le bon.** C'était le vrai risque de la soirée : toutes les
+adresses statiques de ce dépôt ne valent que pour un `default.xex` précis. Le
+disque de la console 2, corrigé par le TU3, donne `0x534C8977` — identique à la
+console 1 — et `powdllzf` se mappe au même `0x89700000`. Rien à relocaliser.
+
+**Le TU3 se pousse par le réseau.** `sendfile` accepte `Hdd:\`, donc
+`work/tu3/tu3-original.stfs` a été écrit directement dans
+`Hdd:\Content\0000000000000000\454109C3\000B0000\tu00000003_00000000` : 157 052 928
+octets, taille vérifiée au bout, 4,4 minutes à 0,6 Mo/s en Wi-Fi. Le dashboard
+retail l'applique tout seul au lancement. Ne **jamais** pousser
+`tu3-codex-patched.stfs` à la place : `docs/TU3_STATIC_PATCH.md` explique
+pourquoi il est illisible.
+
+**Le jeu tourne depuis le disque, sans installation.** Sur 360 installer un jeu
+ne dispense pas du disque dans le lecteur — ça n'achète que la vitesse de
+chargement. `Content\...\454109C3\00007000` est donc absent et ce n'est pas une
+anomalie.
+
+**La clé USB s'écrit à distance.** `Usb:\` et `Usb0:\` sont refusés par XBDM,
+mais **`\Device\Mass0\` marche**, en lecture comme en écriture. C'est ce qui
+permet de préparer la session suivante — plugins, `launch.ini` — sans jamais
+débrancher la clé de la console. Cipher et son `launch.ini` y ont été posés
+ainsi.
+
+Une correction que ça a values à `tools/fut.sh` : `launch_title` reconnaissait
+le titre en cours par `*FIFA*`, ce qui marche pour
+`Hdd:\Games\FIFA 14\default.xex` et pas pour un lancement depuis le disque. Le
+script sautait donc `await_dashboard` et armait le lanceur sur un titre déjà
+lancé, à attendre un `modload` qui ne pouvait plus venir. Il teste maintenant
+aussi `*default.xex*`.
