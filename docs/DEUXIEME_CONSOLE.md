@@ -280,3 +280,35 @@ dans les logs Cipher, qui portait tout l'écart.
 xbGuard reste en place : il est au moins aussi capable, il se met à jour seul,
 et son log est nettement plus explicite que celui de Cipher. Mais il n'a rien
 résolu, parce qu'il n'y avait rien à résoudre de ce côté.
+
+### La cause, mesurée : le lien Wi-Fi de la console 2 perd un tiers des paquets
+
+Soixante connexions XBDM espacées de deux secondes, sur chaque console, à
+quelques minutes d'intervalle sur le même réseau :
+
+```
+console 1 (RGH,        192.168.1.25)   60/60 réponses    0 % de perte   médiane 12 ms
+console 2 (ABadAvatar, 192.168.1.45)   40/60 réponses   33 % de perte   médiane 13 ms
+```
+
+Le point d'accès est donc hors de cause — il sert la console 1 sans une seule
+perte. Et la latence de la console 2 est la même que celle de la console 1
+**quand elle répond** : ce n'est pas de la portée ni du signal faible, c'est un
+lien qui tombe entièrement une fois sur trois.
+
+Toute la soirée s'explique par là, et par rien d'autre : XBDM qui disparaît et
+revient, l'adresse `169.254` en auto-attribution, « Unable to obtain console IP
+address », les délais d'attente en série de xbGuard, et `8015190E` au bout de
+la chaîne. Aucun réglage logiciel n'y peut rien — l'IP fixe non plus, qui ne
+fait rien pour des paquets qui n'arrivent pas.
+
+**Conséquence pour la suite du projet, et elle n'est pas mince :** le maillage
+pair-à-pair se juge dans une fenêtre de dix secondes
+(`docs/MATCHMAKING.md`). Sur un lien qui perd un tiers des paquets, « le
+maillage a échoué » et « le paquet s'est perdu » sont indiscernables — et ce
+blocage a déjà coûté quatre fausses pistes. **Le test du maillage ne doit pas
+être tenté tant que la console 2 est en Wi-Fi.** Un câble ou un CPL est un
+prérequis, pas un confort.
+
+Le témoin, ici, est ce qui a fait toute la valeur de la mesure. C'est
+exactement ce qui manquait à la conclusion sur Cipher, une heure plus tôt.
