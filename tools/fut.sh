@@ -25,7 +25,19 @@
 # the file being cleared -- so re-entering FUT without a relaunch cannot work.
 set -u
 
-REPO=${REPO:-/Users/hudak/Desktop/fut14-revival-project}
+REPO=${REPO:-~/Downloads/fifa14-fut-stable/fifa14-fut-offline-revival}
+
+# Which exploit this console runs, because it decides how the title is started.
+#
+#   rgh      the NAND is patched, so a reboot comes back patched. The Mac can
+#            drive the whole thing: `magicboot` to the dashboard, then
+#            `--launch-title`. Nothing to press.
+#   softmod  BadUpdate. A reboot takes the patched hypervisor with it -- no
+#            XBDM, no Dashlaunch, and the Mac has lost the console until
+#            somebody re-runs the exploit by hand. So we never reboot: we ask
+#            for the dashboard and wait, and the title is launched from Aurora
+#            while the launcher sits armed on `modload`.
+CONSOLE_MOD=${CONSOLE_MOD:-rgh}
 PY="$REPO/.venv/bin/python"
 
 cd "$REPO" || { print -u2 "repo not found: $REPO"; exit 1 }
@@ -134,10 +146,16 @@ except Exception:
 require_xbdm() {
     xbdm_up && return 0
     print -u2 "\n!! XBDM is not answering on $XBOX:730."
-    print -u2 "   On a BadUpdate softmod this is normally one of three things:"
-    print -u2 "     - the console is off, or rebooted (the patches are volatile)"
-    print -u2 "     - the exploit has not been re-run since the last power-on"
-    print -u2 "     - xbdm.xex is not declared in launch.ini"
+    if [[ $CONSOLE_MOD == softmod ]]; then
+        print -u2 "   On a BadUpdate softmod this is normally one of three things:"
+        print -u2 "     - the console is off, or rebooted (the patches are volatile)"
+        print -u2 "     - the exploit has not been re-run since the last power-on"
+        print -u2 "     - xbdm.xex is not declared in launch.ini"
+    else
+        print -u2 "   On an RGH: the console is off, Dashlaunch is not loading"
+        print -u2 "   xbdm.xex, or another tool already holds the one debugger"
+        print -u2 "   connection this console serves."
+    fi
     return 1
 }
 
@@ -153,7 +171,26 @@ require_xbdm() {
 # for the original reason: it took this console off the network on 12 August
 # and it needed the power button.
 await_dashboard() {
-    print "   Quit FIFA and return to the dashboard (Aurora)."
+    if [[ $CONSOLE_MOD == softmod ]]; then
+        print "   Quit FIFA and return to the dashboard (Aurora)."
+    else
+        # This console auto-boots FIFA from the dashboard, so "quit the title
+        # and run me again" is advice nobody can follow: by the time anyone
+        # looks, the title is back. Bare `magicboot`, never `magicboot cold` --
+        # cold took this console off the network on 12 August and it needed the
+        # power button.
+        print "   FIFA is running -- returning to the dashboard"
+        "$PY" -c "
+import socket
+try:
+    s = socket.create_connection(('$XBOX', 730), timeout=8)
+    s.recv(256)
+    s.sendall(b'magicboot\r\n')
+    s.close()
+except Exception:
+    pass
+" >/dev/null 2>&1
+    fi
     local waited=0
     while [ $waited -lt 300 ]; do
         sleep 5
@@ -176,23 +213,26 @@ launch_title() {
             await_dashboard || return 1
             ;;
     esac
-    # Armed here, launched by you.
+    # `--launch-title` sends `magicboot title=...`, which reboots. On an RGH
+    # the console comes back patched and the launcher catches the title on the
+    # way up; on a softmod it comes back **stock**, and the patcher that
+    # follows would be writing into a console that is no longer listening.
     #
-    # `--launch-title` sent `magicboot title=...`, which reboots. On an RGH the
-    # console comes back patched; on this softmod it comes back **stock**, and
-    # the patcher that follows would be writing into a console that is no longer
-    # listening. Without the option the launcher hooks XBDM's `modload`
-    # notification and waits -- which catches exactly the same instant, before
-    # any game code runs, whoever pressed the button.
-    #
-    # Launch FIFA now rather than waiting for a prompt: the launcher's own
-    # "Waiting for default.xex" line is captured by the command substitution
-    # below, so it does not reach the screen until the whole step is finished.
-    print "   Launch FIFA 14 from Aurora now -- the launcher is armed and silent."
+    # Without the option the launcher hooks XBDM's `modload` notification and
+    # waits -- the same instant, before any game code runs, whoever pressed the
+    # button. That is the softmod path, and it needs a human at the console.
+    local launch=(--launch-title "$TITLE")
+    if [[ $CONSOLE_MOD == softmod ]]; then
+        launch=()
+        # Said before the run, not during: the launcher's own "Waiting for
+        # default.xex" line is swallowed by the command substitution below and
+        # does not reach the screen until the whole step is over.
+        print "   Launch FIFA 14 from Aurora now -- the launcher is armed and silent."
+    fi
     local out
     out=$("$PY" tools/fifa14_early_local_server.py "$XBOX" \
         --local-ip "$MAC" --identity-port "$IDENTITY_PORT" \
-        --timeout 900 \
+        --timeout 900 "${launch[@]}" \
         --redirector-transport plaintext --redirect-fut-resource 2>&1 | tail -2)
     print "$out" | sed 's/^/   /'
     # Without these the console never reaches this server at all, and the game
