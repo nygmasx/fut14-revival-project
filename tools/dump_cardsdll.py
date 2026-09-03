@@ -3,6 +3,8 @@ r"""Pull CardsDLL's mapped image off the console, for reading offline.
 
     tools/dump_cardsdll.py                 the whole module
     tools/dump_cardsdll.py --from 0x60000  resume from an offset
+    tools/dump_cardsdll.py --modules       what is loaded, with bases and sizes
+    tools/dump_cardsdll.py --base 0x89700000 --size 0x150000   any other module
 
 The module only exists once Ultimate Team has been entered -- at the dashboard
 it is not loaded at all -- and it maps at 0x89000000, 0x2B0000 bytes.
@@ -80,8 +82,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("host", nargs="?", default=None)
     parser.add_argument("--from", dest="start", type=lambda v: int(v, 0), default=0)
     parser.add_argument("--chunk", type=lambda v: int(v, 0), default=0x2000)
-    parser.add_argument("--output", type=Path, default=OUTPUT)
+    parser.add_argument("--output", type=Path, default=None)
+    # Any mapped module, not only this one. `--modules` asks the console for
+    # the list and its bases and sizes, so nothing here has to be guessed:
+    #
+    #     powdllzf.xex.dll    base=0x89700000 size=0x00150000
+    #     CardsDLLzf.xex.dll  base=0x89000000 size=0x002B0000
+    parser.add_argument("--base", type=lambda v: int(v, 0), default=BASE)
+    parser.add_argument("--size", type=lambda v: int(v, 0), default=SIZE)
+    parser.add_argument("--modules", action="store_true",
+                        help="list the console's loaded modules and stop")
     args = parser.parse_args(argv)
+    if args.output is None:
+        args.output = OUTPUT if args.base == BASE else (
+            REPO / "work" / f"module-{args.base:08x}.bin"
+        )
 
     host = args.host
     if host is None:
@@ -89,6 +104,19 @@ def main(argv: list[str] | None = None) -> int:
         import revival_config
 
         host = revival_config.value("console.address")
+
+    if args.modules:
+        client = Xbdm(host)
+        try:
+            client.sock.sendall(b"modules\r\n")
+            while True:
+                line = client.reader.readline()
+                if not line or line.rstrip(b"\r\n") == b".":
+                    break
+                print("  " + line.decode("ascii", "replace").rstrip())
+        finally:
+            client.close()
+        return 0
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     mode = "r+b" if args.output.exists() and args.start else "wb"
@@ -98,14 +126,14 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.output, mode) as handle:
             if args.start:
                 handle.seek(args.start)
-            for offset in range(args.start, SIZE, args.chunk):
-                length = min(args.chunk, SIZE - offset)
-                handle.write(client.memory(BASE + offset, length))
+            for offset in range(args.start, args.size, args.chunk):
+                length = min(args.chunk, args.size - offset)
+                handle.write(client.memory(args.base + offset, length))
                 if offset % 0x40000 == 0:
                     done = offset + length
                     rate = done / max(1e-6, time.time() - started) / 1024
                     print(
-                        f"  0x{offset:06X}  {done:,}/{SIZE:,} bytes  {rate:.0f} KB/s",
+                        f"  0x{offset:06X}  {done:,}/{args.size:,} bytes  {rate:.0f} KB/s",
                         flush=True,
                     )
     finally:

@@ -1,31 +1,30 @@
 #!/usr/bin/env python3
-"""Écouter si une console envoie quoi que ce soit au relais.
+"""Listen for whether a console sends anything at all to the relay.
 
     tools/xnet_probe.py --port 3074
 
-Une sonde, pas un relais. Elle n'ouvre qu'une socket UDP et note ce qui
-arrive : d'où, combien d'octets, et à quelle heure.
+A probe, not a relay. It opens one UDP socket and records what arrives: where
+from, how many bytes, and at what time.
 
-Ce qu'elle décide
------------------
-Le trafic de match ne passe pas par le serveur : les deux consoles se parlent
-directement, en UDP, à l'adresse que ce serveur leur a donnée l'une pour
-l'autre. Le 22 août, deux consoles se sont trouvées, sont entrées en match, et
-ne se sont jamais vues -- l'une des deux a rapporté `STAT=0` sur l'autre. Deux
-NAT domestiques, la France et les États-Unis, et plus aucun service d'EA pour
-aider à la traversée.
+What it settles
+---------------
+Match traffic does not go through the server. The two consoles talk to each
+other directly, over UDP, at the address this server handed each of them for
+the other. On 22 August two consoles found each other, entered a match, and
+never saw one another -- one reported `STAT=0` on the other. Two home NATs,
+France and the United States, and no EA service left to help with traversal.
 
-`FIFA14_PEER_RELAY` réécrit l'adresse publique et le port dans le XNADDR que
-chaque console reçoit pour l'autre, de sorte que le trafic parte vers cette
-machine-ci. Reste à savoir si le noyau de la console honore cette réécriture :
-un XNADDR porte aussi vingt octets d'`abOnline`, remplis par la passerelle
-Xbox LIVE, et rien ne dit publiquement si l'association de sécurité s'en sert
-pour router.
+`FIFA14_PEER_RELAY` rewrites the public address and port in the XNADDR each
+console receives for the other, so that the traffic heads for this machine
+instead. What is not established is whether the console's kernel honours that
+rewrite: an XNADDR also carries twenty bytes of `abOnline`, filled in by the
+Xbox LIVE gateway, and nothing published says whether the security association
+uses them for routing.
 
-Si un seul paquet arrive ici, la réponse est oui et un relais vaut la peine
-d'être écrit. S'il n'arrive rien, `abOnline` compte et il faudra chercher
-ailleurs. Une demi-heure pour une réponse binaire, au lieu de plusieurs heures
-pour découvrir le mur à la fin.
+If a single packet arrives here, the answer is yes and a relay is worth
+writing. If nothing arrives, `abOnline` matters and the answer is somewhere
+else. Half an hour for a binary answer, rather than several hours to discover
+the wall at the end.
 """
 
 from __future__ import annotations
@@ -43,14 +42,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--listen", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=3074)
     parser.add_argument("--journal", type=Path, default=None,
-                        help="où écrire ce qui arrive, en plus de l'écran")
+                        help="where to write what arrives, in addition to the screen")
     arguments = parser.parse_args(argv)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((arguments.listen, arguments.port))
-    print(f"sonde: UDP {arguments.listen}:{arguments.port}", flush=True)
-    print("en attente -- un seul paquet suffit à répondre", flush=True)
+    print(f"probe: UDP {arguments.listen}:{arguments.port}", flush=True)
+    print("waiting -- one packet is enough to answer", flush=True)
 
     seen: dict[str, int] = {}
     while True:
@@ -70,14 +69,14 @@ def main(argv: list[str] | None = None) -> int:
             "bytes": len(payload),
             "packets_from_peer": seen[where],
             "first_from_peer": first,
-            # Les premiers octets seulement : le contenu est chiffré de bout en
-            # bout entre les deux consoles et n'est pas à lire d'ici. Ce qui
-            # compte est qu'il soit arrivé.
+            # The first bytes only: the contents are encrypted end to end
+            # between the two consoles and are not to be read from here. What
+            # matters is that it arrived at all.
             "head": payload[:16].hex().upper(),
         }
         line = json.dumps(record, sort_keys=True)
         if first:
-            print(f"\n*** PREMIER PAQUET de {where} -- la réécriture est honorée",
+            print(f"\n*** FIRST PACKET from {where} -- the rewrite is honoured",
                   flush=True)
         print(line, flush=True)
         if arguments.journal is not None:

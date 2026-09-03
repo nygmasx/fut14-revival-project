@@ -123,3 +123,119 @@ def test_the_borrowed_address_does_not_claim_the_same_hardware() -> None:
     out = mirrored()(REAL)
     assert out[10:16] != REAL[10:16]
     assert out[10] & 0x02                 # administrée localement
+
+
+def server_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "blaze_server_guest_mirror", REPO / "server" / "fifa14_blaze_server.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_invented_guest_borrows_too() -> None:
+    """The guest was fabricated while only the host could borrow.
+
+    `FIFA14_TEST_OPPONENT` invents a guest, and its address carried twenty zero
+    bytes of `abOnline` -- exactly the shape that made a console send nothing at
+    all and told us nothing about why. The host had been given a way out of that
+    confound and the guest had not, so the host role could never be tested
+    cleanly with one console.
+
+    Both roles read either knob now: `FIFA14_TEST_PEER_ADDRESS` names no side,
+    and `FIFA14_TEST_HOST_ADDRESS` keeps working.
+    """
+    import os
+
+    module = server_module()
+    Field, STRUCT, BINARY, INTEGER = (
+        module.Field, module.STRUCT, module.BINARY, module.INTEGER
+    )
+    real = (0, Field("VALU", STRUCT, [
+        Field("XDDR", BINARY, REAL),
+        Field("XUID", INTEGER, 2305837508020095216),
+    ]))
+
+    server = module.Fifa14Protocol.__new__(module.Fifa14Protocol)
+
+    for knob in ("FIFA14_TEST_PEER_ADDRESS", "FIFA14_TEST_HOST_ADDRESS"):
+        os.environ.pop("FIFA14_TEST_PEER_ADDRESS", None)
+        os.environ.pop("FIFA14_TEST_HOST_ADDRESS", None)
+        os.environ[knob] = "mirror"
+        try:
+            worn = server.borrowed_address(real)
+        finally:
+            os.environ.pop(knob, None)
+        assert module.mirror_invented_address.__doc__
+        xddr = next(f.value for f in worn[1].value if f.label == "XDDR")
+        xuid = next(f.value for f in worn[1].value if f.label == "XUID")
+        # The only genuine abOnline available, carried across untouched.
+        assert bytes(xddr)[16:] == REAL[16:], knob
+        # A MAC no sold hardware can have, so two machines do not claim one.
+        assert bytes(xddr)[10:16] != REAL[10:16], knob
+        assert bytes(xddr)[10] & 0x02, knob
+        # The roster is keyed on the XUID, so the invented player keeps its own.
+        assert xuid == module.SYNTHETIC_PERSONA, knob
+
+    # With no real address there is nothing to borrow, and saying so beats
+    # handing back something that looks borrowed.
+    os.environ["FIFA14_TEST_PEER_ADDRESS"] = "mirror"
+    try:
+        assert server.borrowed_address(None) is None
+    finally:
+        os.environ.pop("FIFA14_TEST_PEER_ADDRESS", None)
+
+    # And with the knob off, neither name borrows anything.
+    assert module.mirror_invented_address() is False
+
+
+def test_the_address_on_the_wire_is_the_one_that_was_borrowed() -> None:
+    """The borrow is worthless if a later builder overwrites it.
+
+    `synthetic_player` builds notification 21, and it called
+    `synthetic_address()` with no argument -- so the fabricated address was
+    rebuilt there even when the roster already held a borrowed one. The journal
+    said `test_peer_borrowed_address`, and the wire carried twenty zero bytes of
+    `abOnline` anyway. A run judged on that would have been judged on nothing.
+    """
+    import os
+
+    module = server_module()
+    Field, STRUCT, BINARY, INTEGER = (
+        module.Field, module.STRUCT, module.BINARY, module.INTEGER
+    )
+    real = (0, Field("VALU", STRUCT, [
+        Field("XDDR", BINARY, REAL),
+        Field("XUID", INTEGER, 2305837508020095216),
+    ]))
+
+    server = module.Fifa14Protocol.__new__(module.Fifa14Protocol)
+    server.logger = type("Quiet", (), {"event": lambda *a, **k: None})()
+
+    class Game:
+        host_address = real
+        members: list = []
+
+    os.environ["FIFA14_PEER_RELAY"] = "10.0.0.116:3074"
+    os.environ["FIFA14_TEST_PEER_ADDRESS"] = "mirror"
+    try:
+        game = Game()
+        game.members = [{
+            "persona": module.SYNTHETIC_PERSONA,
+            "address": server.synthetic_address(real),
+        }]
+        out = server.synthetic_peer_address(game)
+    finally:
+        os.environ.pop("FIFA14_PEER_RELAY", None)
+        os.environ.pop("FIFA14_TEST_PEER_ADDRESS", None)
+
+    xddr = bytes(next(f.value for f in out[1].value if f.label == "XDDR"))
+    # The borrowed abOnline survived all the way to the wire.
+    assert xddr[16:] == REAL[16:]
+    # And the relay was applied here, because this notification does not pass
+    # through `member_player`, where a real member's address is rewritten.
+    assert xddr[4:8] == bytes([10, 0, 0, 116])
+    assert int.from_bytes(xddr[8:10], "big") == 3074

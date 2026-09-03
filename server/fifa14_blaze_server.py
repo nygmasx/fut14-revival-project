@@ -627,9 +627,18 @@ FUT_ROUTES: dict[str, bytes] = {
     "/ut/game/fifa14/match/end": b"{}",
     "/ut/game/fifa14/clientdata/tutorialpopups": b"{}",
     "/ut/game/fifa14/clientdata/userHubData": b"{}",
-    # Trade pile, watch list and club capacity. Zero here means every add is
-    # refused as "pile full"; these are the retail defaults the PC revival
-    # carries.
+    # Trade pile, watch list and club capacity.
+    #
+    # Retail reads "TRANSFER LIST 0/30" on the item screen -- capacity 30, and
+    # `maximumTradePileSize` in `/settings` says 30 as well -- where this
+    # serves 20000. Left alone deliberately: a club already holding more than
+    # thirty on its list would be over a limit it has never been under, and
+    # that is a decision about the save rather than a correction to a document.
+    #
+    # Keys 1, 5, 6 and 7 were added here on the theory that the CLUB tab was
+    # greyed out for want of a capacity. That theory is dead: retail greys the
+    # same tab and still prints "CLUB 352" beside it, so greying is normal and
+    # the tab wants a **count**, which now travels on `/club` as `total`.
     "/ut/game/fifa14/clientdata/pileSize": (
         b'{"entries":[{"key":2,"value":20000},{"key":3,"value":20000},'
         b'{"key":4,"value":20000}]}'
@@ -738,6 +747,7 @@ HANDLED_ROUTES = (
     "/ut/game/fifa14/squad/list",
     "/ut/game/fifa14/store/purchasegroup/all",
     "/ut/game/fifa14/tournament",
+    "/ut/game/fifa14/totw",
     "/ut/game/fifa14/tournament/list",
     "/ut/game/fifa14/tournament/teams",
     "/ut/game/fifa14/tournament/user/list",
@@ -773,6 +783,122 @@ ICEBREAKER_PACK_LIST = Path(__file__).resolve().parent / "icebreakerpacklist.jso
 # What a quick sell pays when the request does not say which card went. The
 # real discardValue travels on the item; this is the floor.
 SELL_PRICE_FALLBACK = 200
+
+
+# The Xbox SKU, and it is in CardsDLL's own string table -- `FFA14XBX`, with
+# no `FFA14PCC` or `FFA14PS3` beside it. Impulsum's PC build sends all three;
+# this one sends the platform it is running on.
+ACCOUNT_SKU = "FFA14XBX"
+
+
+def account_info_document(persona_id: int, persona_name: str) -> dict:
+    """`/ut/game/fifa14/user/accountinfo`, which the console asks 142 times over.
+
+    An empty persona list is what this served from the beginning, and the
+    reasoning was sound when it was written:
+
+        A populated list tells the client it already owns a FUT account, so the
+        login helper goes looking for that account's club, squad and identity
+        -- none of which exist here -- and waits on a completion that never
+        arrives.
+
+    None of which exist *here* was the operative clause, and it stopped being
+    true. The club holds 1,079 cards, a squad, a 13-0-1 record and a season in
+    progress. Telling the client it has no FUT account is now the false half.
+
+    `FIFA14_ACCOUNT_PERSONA=1` states the true one. **Off by default**: the
+    empty list is what the login demonstrably walks today, and the failure mode
+    the comment describes is a login that never completes.
+
+        FIFA14_ACCOUNT_PERSONA=1 tools/fut.sh
+
+    Two reasons to want it, and they are separate.
+
+    **The gamertag.** This server already knows it -- Blaze carries it in
+    `DSNM` and `PersistentAccountStore` writes it down, "Mosebee" against
+    persona 2305837508020095216 -- and then this route throws it away and sends
+    an empty list. Impulsum's build hardcodes `personaName` to "FUT14" with
+    `personaId` 1000; there is no reason to invent a persona when the console
+    has already said who it is.
+
+    **EAS FC.** Impulsum's own comment on this route says the persona here
+    must match the one authenticated over Blaze "or EASFC can't associate the
+    session and shows 'unable to connect'". That is worth trying and it is not
+    a fix on its own: `docs/EASFC_NOT_CONNECTED.md` records zero frames on 8094
+    and 8080 and zero `/pow/` requests in every journal this project has, so
+    the module is not failing to associate -- it is not arriving. Matching the
+    persona may well be necessary. It cannot be sufficient.
+
+    The club entry only appears once the club is established, which is what
+    Impulsum does too: an unestablished club sends an empty `userClubList`,
+    which is the same "no FUT account yet" statement the empty persona list was
+    making, one level down and without lying about the persona.
+    """
+    # On by default from 25 August, after a launch carried it end to end: the
+    # login ran to completion and the club loaded. That was the risk worth
+    # flagging for -- what the empty list avoided was a login that never
+    # finishes -- and one launch has now shown it does finish.
+    #
+    # It did NOT clear the EAS FC banner, which was the expected result and is
+    # recorded in docs/EASFC_NOT_CONNECTED.md: nothing has ever asked this
+    # server anything on EAS FC's behalf, so a persona it never reads cannot
+    # have been the reason. What it does is stop misrepresenting who the player
+    # is.
+    #
+    # `FIFA14_ACCOUNT_PERSONA=0` goes back to the empty list.
+    if os.environ.get("FIFA14_ACCOUNT_PERSONA", "1").strip().lower() in {
+        "0", "false", "no"
+    }:
+        return {"userAccountInfo": {"personas": [], "returningUser": False}}
+
+    club_name = str(CLUB_IDENTITY.name or "").strip()
+    club_abbr = str(CLUB_IDENTITY.abbr or "").strip()
+    established = bool(club_name)
+    persona = {
+        "personaId": int(persona_id or 0),
+        "personaName": persona_name or "",
+        # `isReturningUser` is in CardsDLL (`returningUser` is not). It is the
+        # flag `fcc_login1` reads to send `createClub` rather than
+        # `iceBreaker` -- see `Wallet.user_info`, which reads the same bit off
+        # the user record at +0x8D.
+        "isReturningUser": established,
+        "returningUser": established,
+        "trial": False,
+        "userState": "",
+        "userClubList": [],
+    }
+    if established:
+        # No `teamId` and no `clubId`. Impulsum sends both from a stored
+        # `Club.TeamId`; this server has never had one, and inventing an id is
+        # the mistake that drew NOT FOUND on every club item until the four
+        # families were measured. The club is identified here by the name and
+        # abbreviation the player chose, which are real, and the rest of the
+        # login already identifies it by persona.
+        #
+        # If the launch shows the client wanting a club id, it gets a measured
+        # one rather than a plausible one.
+        persona["userClubList"].append(
+            {
+                "year": 2014,
+                "clubName": club_name,
+                "clubAbbr": club_abbr,
+                "platform": "xbox360",
+                "seasonId": 1,
+                "status": 1,
+                "established": 2013,
+                # The same divisions `Wallet.user_info` already sends, so the
+                # two documents cannot disagree about the club.
+                "divisionOnline": 10,
+                "divisionOffline": 10,
+                "skuAccessList": {ACCOUNT_SKU: 1},
+            }
+        )
+    return {
+        "userAccountInfo": {
+            "personas": [persona],
+            "returningUser": established,
+        }
+    }
 
 
 def with_balance(payload: bytes, coins: int) -> bytes:
@@ -850,6 +976,11 @@ from fut_inventory import (  # noqa: E402
     match_result,
     match_reward,
     hub_response,
+    totw_hub_squad,
+    totw_club_info,
+    TOTW_PERSONA_ID,
+    totw_challenge_entries,
+    totw_challenge_response,
     store_catalogue,
     store_pack_descriptions,
     totw_index_with_squad,
@@ -984,6 +1115,153 @@ def normalize_route(path: str) -> str:
     return normalized
 
 
+# EA Sports Football Club, ported from the PS3 line on 28 August.
+#
+# That console reaches this surface and this server answers it: 1,178 `/pow/`
+# requests across sixteen routes in `runtime/blaze-server.jsonl`, with EASFC
+# connected. None of it is speculative -- the documents below were shaped
+# against a real console re-asking real routes, and the comments that say so
+# came across with the code.
+#
+# The Xbox has never asked for any of it. `docs/EASFC_NOT_CONNECTED.md` counts
+# zero, which was read for months as "the module never starts". It does start:
+# it reports a server error. Serving the surface is half the answer; the other
+# half is the endpoint keys in `fetch_config`, which were sending POW at the
+# Blaze core port.
+
+# Every path `powdllzf` builds, read off the dumped module
+# (`work/powdllzf.bin`). Not all of them are asked
+# for; the three the console asked for on 2026-08-27, in the first session
+# where `/pow/auth` succeeded, are marked.
+#
+#   pow/auth                                        the handshake, handled above
+#   pow/v2/activity                                 ASKED
+#   pow/lvl/weight/tiergp/businessunit/tiertp/fifa  ASKED
+#   pow/bank/user/account                           ASKED
+#   pow/lvl/user/tiergp/businessunit/tiertp/fifa
+#   pow/bank/currency/pow_funds/cap/info
+#   pow/chal/user/prog          pow/communication/all
+#   pow/communication/type/alert
+#   pow/gamechange/gamechangetype
+#   pow/inventory/item          pow/inventory/item/list
+#   pow/lb/game/%s/type/...     pow/message
+#   pow/mm/game/fifa14/message/list
+#   pow/news/opt   pow/news/opt/%s   pow/news/user
+#   pow/nucleus/entitlements
+#   pow/pfyc/...                pow/store/...
+#   pow/user/friends
+POW_ROUTE_PREFIX = "/pow/"
+
+
+def pow_service_document(path: str, query: str = "") -> bytes:
+    """The EA Sports Football Club reply for `path`.
+
+    Three sources, and they are not equally good. The comments below say which
+    each line came from, because the difference decides what to do when one of
+    these turns out wrong.
+
+    **The module's own literals.** `powdllzf` ships canned fake-server
+    responses -- `POW::FIFA::FakeServerResponseActivity` and its neighbours --
+    and they are complete documents, not fragments:
+
+        {"catalogs":[{"catalogId": 45635,"name":"fifa13 store"},...]}
+        {"currencies":[{"currency":"pow_funds","funds":%d,
+                        "fundsCapInfo:[{period:"daily","fundsEarned":%d},...]}]}
+        { "level":2,"leveledUp":false,"xp":435,"xpGained":230,"xpLoyalty":2,
+          "challengesDone":2,"xpCapCurrLevel":400,"xpCapNextLevel":485,
+          "funds":[{"currencyName":...,"fundsBalance":2550,"fundsEarned":250}],
+          "notifications":[...] }
+
+    That is measurement. The root key and the member spellings are the
+    module's. (Its `fundsCapInfo` literal is missing a closing quote -- a typo
+    in EA's own debug string, repaired here rather than reproduced.)
+
+    **The member table.** For routes with no literal, the root key is taken
+    from `powdllzf`'s JSON dictionary -- `items`, `gifts`, `chals`, `news`,
+    `messageList`, `personaList`, `tierweights`, `endOfList`. The dictionary is
+    one flat alphabetical list shared by every parser in the module, so it
+    proves the word exists and not which document holds it. Inference.
+
+    **Nothing.** Everything else gets `{}` and is journalled until a console
+    says otherwise.
+
+    Empty collections throughout. This club has no Football Club store
+    history, no gifts and no challenges, and saying so is different from
+    failing to answer -- which is the whole point. `/pow/store/.../catalog/list`
+    was answered `{}` on 2026-08-27 and the console re-asked it every sixteen
+    seconds forever: a datacache retrying a fetch it could not parse. A
+    well-formed list with no entries is a fetch that succeeded.
+    """
+    # -- the module's own literals ------------------------------------------
+    if path.endswith("/catalog/list"):
+        # One catalogue, not none. `{"catalogs":[]}` was tried on 2026-08-27
+        # and the console re-asked this route every sixteen seconds anyway --
+        # so the document parsed, and `CatalogListCacheData` treats a cache it
+        # filled with nothing as a fetch that produced nothing and goes round
+        # again. An empty list is the right answer to "what is in the store"
+        # and the wrong answer to "which stores are there".
+        #
+        # 45635 is EA's own id, out of the canned response in the module. An
+        # id this server invented would be a plausible-looking number with
+        # nothing behind it, which is the mistake that drew NOT FOUND on every
+        # club item until the four families were measured. This one is at
+        # least the id the shipping module's test server used.
+        return b'{"catalogs":[{"catalogId":45635,"name":"FIFA 14"}]}'
+    if path.startswith("/pow/store/catalog/"):
+        # The items in one catalogue, asked for by that id. Empty is honest:
+        # this club has bought nothing from EA Sports Football Club, and there
+        # is nothing to sell it. `POW_CATALOG_ITEM_REQUEST_SIZE` is the module's
+        # own paging constant, so `endOfList` belongs here.
+        return b'{"items":[],"endOfList":true}'
+    if path == "/pow/bank/user/account":
+        return (
+            b'{"currencies":[{"currency":"pow_funds","funds":0,'
+            b'"fundsBalance":0,"fundsEarned":0,'
+            b'"fundsCapInfo":[{"period":"daily","fundsEarned":0},'
+            b'{"period":"weekly","fundsEarned":0}]}]}'
+        )
+    if path == "/pow/bank/currency/pow_funds/cap/info":
+        return (
+            b'{"fundsCapInfo":[{"period":"daily","fundsCap":0,"fundsEarned":0},'
+            b'{"period":"weekly","fundsCap":0,"fundsEarned":0}]}'
+        )
+    if path == "/pow/lvl/user/tiergp/businessunit/tiertp/fifa":
+        # `self=true` asks for this console's own level; the POST form carries
+        # a `nucIds` list and wants one entry per id, which is what
+        # `personaList` is for. An empty club starts at level 1 with no XP.
+        if "self=true" in query:
+            return (
+                b'{"level":1,"leveledUp":false,"xp":0,"xpGained":0,'
+                b'"xpLoyalty":0,"challengesDone":0,'
+                b'"xpCapCurrLevel":0,"xpCapNextLevel":100,'
+                b'"funds":[{"currencyName":"pow_funds","fundsBalance":0,'
+                b'"fundsEarned":0}],"notifications":[]}'
+            )
+        return b'{"personaList":[]}'
+    # -- root keys from the member table, contents empty ---------------------
+    if path == "/pow/lvl/weight/tiergp/businessunit/tiertp/fifa":
+        return b'{"tierweights":[]}'
+    if path.startswith("/pow/inventory/item"):
+        return b'{"items":[],"endOfList":true}'
+    if path.startswith("/pow/store/gift"):
+        return b'{"gifts":[],"endOfList":true}'
+    if path == "/pow/news/user":
+        return b'{"news":[],"endOfList":true}'
+    if path.startswith("/pow/communication/"):
+        return b'{"notifications":[],"endOfList":true}'
+    if path == "/pow/mm/game/fifa14/message/list":
+        return b'{"messageList":[],"endOfList":true}'
+    if path == "/pow/chal/user/prog":
+        return b'{"chals":[],"endOfList":true}'
+    if path == "/pow/user/friends":
+        return b'{"users":[],"endOfList":true}'
+    if path == "/pow/v2/activity":
+        return b'{"completedActivity":[]}'
+    # -- unmodelled ----------------------------------------------------------
+    return b"{}"
+
+
+
 class SessionStore:
     """Which club a FUT session id belongs to.
 
@@ -1033,6 +1311,19 @@ class SessionStore:
             )
         except OSError:
             pass
+
+    def existing(self, persona_id: int) -> str | None:
+        """The session id this persona already holds, without minting one.
+
+        `issue` replaces the token it finds, which is right for a login and
+        wrong for anything that merely needs to name the session. EA Sports
+        Football Club authenticates on its own -- `POST /pow/auth`, from
+        powdllzf rather than CardsDLL -- and answering that by rotating the
+        FUT session invalidates the `X-UT-SID` the client is still using for
+        every Ultimate Team request.
+        """
+        with self._lock:
+            return self._by_persona.get(int(persona_id))
 
     def issue(self, persona_id: int) -> str:
         """A new session id for this persona, replacing any it already had."""
@@ -1544,6 +1835,96 @@ class Fifa14Protocol:
     def identity_base(self) -> str:
         return f"http://{self.advertise}:{self.identity_port}"
 
+    @property
+    def pow_config_keys(self) -> list[tuple[str, str]]:
+        """The six POW/EASFC endpoint overrides. Served -- and they must be.
+
+        **Zamboni serves none of these**, and that is the configuration EA
+        Sports Football Club actually connects under. The PS3 line carries the
+        same finding as a platform flag, `serves_pow_urls=False`, with the
+        reasoning that serving `POW_CUSTOMURL` moved `/pow/auth` somewhere
+        nothing answered. That console reaches the hub: 1,178 `/pow/` requests
+        across sixteen routes.
+
+        This server served all six, and got further than ever before but no
+        further than the handshake. `POST /pow/auth` is answered and accepted;
+        POW then reports RECONNECTING and takes notifications 2 and 15 with
+        status 1, which is `TXT_EASFC_SERVER_ERROR`. Something after the
+        handshake fails, and five of these keys point at parts of the service
+        this server has never been asked for -- a content server, a nucleus
+        proxy, a message manager.
+
+        With them unserved the module keeps its own built-in endpoints, which
+        the launch patch has already rewritten to this server. That is exactly
+        the shape Zamboni runs in, and it is the only untried configuration
+        that a working reference vouches for.
+
+        Tried, and it does not port. With the keys unserved this console made
+        **no `/pow/` request at all** -- not the handshake it had been making
+        an hour earlier -- while the module string beside it read
+        `http://IP:18080` the whole time.
+
+        Which answers the question the last note left open. POW reads the
+        config, and the patched string is not a fallback it ever reaches. The
+        PS3 can serve nothing because RPCS3 redirects `pal.gt.easfc.ea.com`
+        back to the host; the Xbox has no host redirect in front of it, so an
+        unserved key points at EA and the request is never seen again.
+
+        So the keys stay served, which is also the configuration that got
+        furthest: `POST /pow/auth` answered and accepted, and POW reporting
+        RECONNECTING before it fails. `FIFA14_POW_URLS=0` withholds them, and
+        the only thing that proves is the paragraph above.
+
+        Nothing about FUT depends on them either way: these are the `POW_` and
+        `FIFA_POW_` names only, and FUT's own endpoints --
+        `FUT_RS4_BASE_URL`, `FUTBOOTCFGFILE_URL`, `OSDK_EASW_AUTH_URL` -- sit
+        untouched beside them.
+        """
+        if os.environ.get("FIFA14_POW_URLS") == "0":
+            return []
+        return [
+            ("ONLINE/POW_CUSTOMURL", self.pow_endpoint),
+            ("ONLINE/POW_CUSTOMCONTENTURL", self.identity_base),
+            ("FIFA_POW_URL", self.pow_endpoint),
+            ("FIFA_POW_CONTENT_SERVER_URL", self.identity_base),
+            ("FIFA_POW_NUCLEUS_PROXY_URL", self.identity_base),
+            # The message manager, found by dumping the module on 27 August
+            # and listing every config name in it against what this server
+            # answers. Five were served and this one was not; serving it
+            # changed nothing, which is recorded as plainly as a fix.
+            ("FIFA_POW_MMM_URI", self.identity_base),
+        ]
+
+    @property
+    def pow_endpoint(self) -> str:
+        """Where POW sends `/pow/auth`, scheme included.
+
+        This key wins over the patched module string, which took a while to
+        establish and is worth writing down. `docs/EASFC_NOT_CONNECTED.md`
+        recorded on 12 August that "the module does not take the configuration"
+        -- both were read back holding retail values, so nothing distinguished
+        them. Then both were pointed at the Blaze port, which is still nothing
+        to distinguish.
+
+        On 28 August they finally disagreed. The launch patch wrote
+        `http://IP:18080` into the string; the config still said
+        `IP:18080`; and the object built from them held the
+        **scheme-less** one. The config is what POW reads.
+
+        The scheme is not optional. Without it the module formats
+        `IP:18080/pow/auth`, and default.xex's ProtoHttp will not open
+        a socket for a URL with no scheme -- which is why hand-patching this
+        value into a live object was what produced the first `POST /pow/auth`
+        this project has ever seen.
+
+        There is no length budget here, unlike the module string: this is a
+        config value, not an in-place overwrite of twenty-four bytes, so it
+        works on any address.
+        """
+        if os.environ.get("FIFA14_POW_CORE_URL") == "1":
+            return f"{self.advertise}:{self.core_port}"
+        return f"http://{self.advertise}:{self.identity_port}"
+
     def fetch_config(
         self,
         request: bytes,
@@ -1587,11 +1968,47 @@ class Fifa14Protocol:
                 # POWService::PowBlazeDisconnected says the session itself is a
                 # Blaze connection, not HTTP, so the session URL points at the
                 # Blaze core port and the content URL at the identity server.
-                ("ONLINE/POW_CUSTOMURL", f"{self.advertise}:{self.core_port}"),
-                ("ONLINE/POW_CUSTOMCONTENTURL", self.identity_base),
-                ("FIFA_POW_URL", f"{self.advertise}:{self.core_port}"),
-                ("FIFA_POW_CONTENT_SERVER_URL", self.identity_base),
-                ("FIFA_POW_NUCLEUS_PROXY_URL", self.identity_base),
+                # POW's own endpoint, and it was pointed at the Blaze core
+                # port until 28 August.
+                #
+                # The PS3 line found this the hard way and wrote it down:
+                # serving `POW_CUSTOMURL` there moved `POST /pow/auth` to the
+                # core port "where nothing speaks HTTP: the request leaves the
+                # console and is never seen again". That console's fix was to
+                # serve no key at all and let the module keep its built-in
+                # `pal.gt.easfc.ea.com:8095`, which a host redirect brings
+                # home. EASFC connects there now -- 1,178 `/pow/` requests in
+                # its journal.
+                #
+                # The Xbox cannot take that fix; there is no host redirect in
+                # front of it, so an unserved key points at EA. It can take the
+                # half that matters: the same host:port shape, aimed at the
+                # port that does speak HTTP.
+                #
+                # This explains all three Xbox observations at once, which is
+                # why it is worth trying before anything subtler. POW "never
+                # opens a socket" -- 10041 is already open, it is the Blaze
+                # connection, so there was never a new one to see. Zero `/pow/`
+                # requests in any journal -- they were not going to the HTTP
+                # server. And the failure is `TXT_EASFC_SERVER_ERROR` rather
+                # than a sign-in gate -- the module ran, sent, and got nothing
+                # it could read back.
+                #
+                # `FIFA14_POW_CORE_URL=1` restores the core port, so the old
+                # behaviour is one variable away if this turns out worse.
+                *self.pow_config_keys,
+                # The sixth key, found by dumping the module on 27 August and
+                # listing every config name in it against what this server
+                # answers. Five were served and this one was not.
+                #
+                # `MMM` is the message manager -- powdllzf holds the path
+                # `/fifa/fltOnlineAssets/2013/pow/mm` beside it, and Impulsum's
+                # working build answers `/pow/mm/message/list`. It gets the
+                # identity server, like the other content URLs.
+                #
+                # Whether a missing key is what stops POW starting is not
+                # known. It is a key the module asks for and this server did
+                # not answer, which is worth closing whatever the answer.
                 ("FUT_ENABLE_MENU", "1"),
                 ("OSDK_EASW_ALLOWED_LOCALES", locale),
                 ("OSDK_EASW_AUTH_URL", self.identity_base),
@@ -4275,8 +4692,54 @@ class IdentityHttpService:
                     # after this one, and therefore what routes them to this
                     # club. `bind_request_club` above has already read the
                     # persona out of this request's own body.
-                    sid = SESSIONS.issue(club.persona_id)
-                    presented = auth_request_identity(body)
+                    # `/pow/auth` is EA Sports Football Club, not FUT.
+                    #
+                    # `normalize_route` folds it into `/ut/auth` because the
+                    # Xbox CardsDLL was believed to call FUT authentication by
+                    # that name. On this console both exist and they are
+                    # different callers: CardsDLL posted `/ut/auth` with 10,762
+                    # bytes at 13:33 and powdllzf posted `/pow/auth` with 373
+                    # at 13:57, in the same session.
+                    #
+                    # Answering the second like the first did real damage. It
+                    # rotated the FUT session -- `issue` replaces the token it
+                    # finds, so the `X-UT-SID` the client was still using for
+                    # every Ultimate Team request stopped resolving -- and it
+                    # adopted the persona out of POW's body, which carries
+                    # `nucleusPersonaId` 1000001 beside the real `nuc`. The
+                    # journal caught both: persona 2533274966877915 adopted at
+                    # 13:33, and 1000001 over the top of it at 13:57.
+                    #
+                    # So POW gets the document it parses -- `sid`, `serverTime`
+                    # and `lastOnlineTime` are the three members powdllzf names,
+                    # measured in the dump -- naming the session that already
+                    # exists, and changes nothing about who the club is.
+                    # Told apart by the body, not by the path.
+                    #
+                    # Both callers use `/pow/auth` -- an older session had
+                    # CardsDLL posting FUT authentication there, which
+                    # `test_fut_auth_adopts_the_persona_the_client_presents`
+                    # pins -- so the path cannot separate them. The EAS FC one
+                    # carries an `identification` object holding `EASW-Session`
+                    # and `EASW-Token`, and a `priorityLevel`; the FUT one
+                    # carries neither. That is the discriminator.
+                    from_pow = False
+                    if parsed.path.rstrip("/").endswith("/pow/auth"):
+                        try:
+                            probe = json.loads(body or b"{}")
+                        except (ValueError, UnicodeDecodeError):
+                            probe = {}
+                        from_pow = isinstance(probe, dict) and (
+                            isinstance(probe.get("identification"), dict)
+                            or "priorityLevel" in probe
+                        )
+                    if from_pow:
+                        sid = SESSIONS.existing(club.persona_id) or SESSIONS.issue(
+                            club.persona_id
+                        )
+                    else:
+                        sid = SESSIONS.issue(club.persona_id)
+                    presented = None if from_pow else auth_request_identity(body)
                     if presented is not None:
                         persona_id, persona_name = presented
                         self.account_store().save_identity(persona_id, persona_name)
@@ -4298,7 +4761,8 @@ class IdentityHttpService:
                         json.dumps(document, separators=(",", ":")) + "\n"
                     ).encode("utf-8")
                     owner.journal.event(
-                        "fut_ut_auth_request",
+                        "easfc_pow_auth_request" if from_pow
+                        else "fut_ut_auth_request",
                         peer=self.client_address[0],
                         method=self.command,
                         path=parsed.path,
@@ -4579,7 +5043,14 @@ class IdentityHttpService:
 
                     count = number("count", 15)
                     group = number("groupId", 0)
-                    payload = tournament_teams_response(count, group)
+                    # The cup the club is actually in, so the draw is that
+                    # cup's own fifteen rather than the Premier League pool
+                    # every cup used to share. The route carries only groupId
+                    # and count, so it comes from the progress store.
+                    open_cups = TOURNAMENT_PROGRESS.active_ids()
+                    payload = tournament_teams_response(
+                        count, group, open_cups[-1] if open_cups else None
+                    )
                     owner.journal.event(
                         "fut_tournament_teams",
                         peer=self.client_address[0],
@@ -4806,10 +5277,82 @@ class IdentityHttpService:
                     # and this document was written for exactly that a while
                     # ago -- `totw_index_with_squad` -- and then never wired
                     # to a route.
+                    # A clientdata route, and its siblings all answer an
+                    # entries document. This carried the 27 kB squad index
+                    # instead, and the screen refused with "there is no Team of
+                    # the Week available at the moment" over a tile that was
+                    # drawing the side correctly. Pressing A fired no request:
+                    # the refusal is decided from this one reply.
                     "/ut/game/fifa14/clientdata/totw": (
-                        lambda: totw_index_with_squad(CARD_CATALOGUE)
+                        lambda: totw_challenge_entries(CARD_CATALOGUE)
+                    ),
+                    # Never yet requested by any console here -- but a screen
+                    # that has decided there is no Team of the Week has no
+                    # reason to ask for one.
+                    "/ut/game/fifa14/totw": (
+                        lambda: totw_challenge_response(CARD_CATALOGUE)
                     ),
                 }
+                # `/user/list?personaIdList=...` asks who owns a squad, and
+                # keys 3 and 4 of the challenge record name the Team of the
+                # Week's club. When that persona is the one asked for, the
+                # answer is that club -- a squad list, one entry per week,
+                # which is what the challenge select screen enumerates.
+                if (
+                    normalized_path == "/ut/game/fifa14/user/list"
+                    and self.command == "GET"
+                    and str(TOTW_PERSONA_ID) in (parsed.query or "")
+                ):
+                    payload = totw_club_info(CARD_CATALOGUE)
+                    owner.journal.event(
+                        "fut_totw_club_request",
+                        peer=self.client_address[0],
+                        path=parsed.path,
+                        query=parsed.query,
+                        bytes=len(payload),
+                    )
+                    self.reply(
+                        200,
+                        payload + b"\n",
+                        {
+                            "Content-Type": "application/json; charset=utf-8",
+                            "Cache-Control": "no-store",
+                        },
+                    )
+                    return
+                # `GET /item?idList=a,b` -- the cards behind those ids. The
+                # duplicate panel asks for the pair it is comparing right
+                # before it draws them, and a static empty list is why the
+                # owned card read "undefined".
+                if (
+                    normalized_path == "/ut/game/fifa14/item"
+                    and self.command == "GET"
+                    and "idlist" in (parsed.query or "").lower()
+                ):
+                    query = urllib.parse.parse_qs(parsed.query)
+                    raw = ",".join(query.get("idList") or query.get("idlist") or [])
+                    ids: list[int] = []
+                    for piece in raw.split(","):
+                        try:
+                            ids.append(int(piece.strip()))
+                        except ValueError:
+                            continue
+                    payload = PACK_SHOP.items_by_id(ids)
+                    owner.journal.event(
+                        "fut_items_by_id",
+                        peer=self.client_address[0],
+                        asked=ids,
+                        found=len(json.loads(payload)["itemData"]),
+                    )
+                    self.reply(
+                        200,
+                        payload + b"\n",
+                        {
+                            "Content-Type": "application/json; charset=utf-8",
+                            "Cache-Control": "no-store",
+                        },
+                    )
+                    return
                 if normalized_path in mode_responses and self.command == "GET":
                     payload = mode_responses[normalized_path]()
                     owner.journal.event(
@@ -5087,6 +5630,43 @@ class IdentityHttpService:
                         {"Content-Type": "application/json; charset=utf-8"},
                     )
                     return
+                # One week of the Team of the Week, by its own club.
+                #
+                #     GET /ut/game/fifa14/squad/<week>/user/<totw persona>
+                #
+                # This is what `RequestSquadsLineup` and `GetSquadsLineup` in
+                # the ION binding table fetch once the client knows the club
+                # exists. It has to be matched before the squad-by-id handler
+                # below, which keys on trailing digits and would read the
+                # persona as a squad id.
+                totw_lineup = re.fullmatch(
+                    r"/ut/game/fifa14/squad/(\d+)/user/(\d+)", normalized_path
+                )
+                if (
+                    totw_lineup
+                    and self.command == "GET"
+                    and int(totw_lineup.group(2)) == TOTW_PERSONA_ID
+                ):
+                    week = int(totw_lineup.group(1))
+                    payload = json.dumps(
+                        totw_hub_squad(CARD_CATALOGUE, week),
+                        separators=(",", ":"),
+                    ).encode()
+                    owner.journal.event(
+                        "fut_totw_lineup_request",
+                        peer=self.client_address[0],
+                        week=week,
+                        bytes=len(payload),
+                    )
+                    self.reply(
+                        200,
+                        payload + b"\n",
+                        {
+                            "Content-Type": "application/json; charset=utf-8",
+                            "Cache-Control": "no-store",
+                        },
+                    )
+                    return
                 # One squad by id. Answering every id with the active side is
                 # why a newly created team came back holding the first team's
                 # players instead of being empty.
@@ -5137,11 +5717,37 @@ class IdentityHttpService:
                         squad_id = int(tail)
                     except ValueError:
                         squad_id = int(squad.get("id") or 0)
+                    # The manager the player put in the slot. Every squad PUT
+                    # carries `"manager":[{"id":N}]` and this read the players,
+                    # the name and the formation out of the same body and
+                    # ignored it -- so the slot filled on screen and the next
+                    # launch had it empty.
+                    #
+                    # None means the body did not mention one and the stored
+                    # value stands; 0 is the player clearing the slot.
+                    manager_id: int | None = None
+                    manager_slot = squad.get("manager")
+                    if isinstance(manager_slot, list):
+                        first = manager_slot[0] if manager_slot else {}
+                        try:
+                            manager_id = int((first or {}).get("id") or 0)
+                        except (TypeError, ValueError):
+                            manager_id = 0
                     saved_id = CLUB_INVENTORY.save_squad(
                         squad_id,
                         chosen,
                         name=(squad.get("squadName") or "").strip() or None,
                         formation=(squad.get("formation") or "").strip() or None,
+                        manager=manager_id,
+                        # The console works chemistry out itself and reports it
+                        # here. Keeping it is what stops the squad selector
+                        # advertising a number the squad screen then disagrees
+                        # with.
+                        chemistry=(
+                            int(squad["chemistry"])
+                            if isinstance(squad.get("chemistry"), (int, float))
+                            else None
+                        ),
                     )
                     CLUB_SAVE.save(CLUB_INVENTORY, WALLET, CARD_ACTIONS, MANAGER_TASKS)
                     owner.journal.event(
@@ -5770,19 +6376,66 @@ class IdentityHttpService:
                         # settled server-side before this reply is built, so
                         # nothing is lost by staying quiet.
                         #
-                        # `FIFA14_MATCH_AWARDS=1` puts them back for whoever
-                        # wants to narrow down which of the four does it --
-                        # they go out together, and one at a time is the next
-                        # experiment.
-                        if os.environ.get("FIFA14_MATCH_AWARDS", "").strip().lower() in {
-                            "1", "true", "yes"
-                        }:
+                        # `FIFA14_MATCH_AWARDS=1` puts them back, and what it
+                        # sends changed on 27 August. It used to be four
+                        # members -- participationAward, gameModeAward,
+                        # matchCoins, coins -- and that is the set that froze.
+                        #
+                        # `MarvelcoCode/Impulsum14` has this screen working and
+                        # sends a different set. Two differences stand out, and
+                        # either could be the hang:
+                        #
+                        #   * it does **not** send `gameModeAward` at all;
+                        #   * it sends `matchCoinPartials` and
+                        #     `matchCoinMultipliers` as empty arrays, and this
+                        #     server sent `matchCoins` without either. A screen
+                        #     that reads a coin total and then walks the two
+                        #     lists behind it has nothing to walk.
+                        #
+                        # Every member below is in CardsDLL's own table --
+                        # including `boostConis`, which is EA's own misspelling
+                        # and is the reason to believe that build read these off
+                        # the real API rather than guessing. Its `allCoins` and
+                        # `matchParamsKeyValues` are **not** in the table and
+                        # stay out.
+                        #
+                        # **On by default from 27 August.** The screen showed
+                        # the coins after an ordinary match, which is the thing
+                        # this has been off for since 17 August.
+                        #
+                        # `FIFA14_MATCH_AWARDS=0` takes it back out. The freeze
+                        # it replaces came after a cup final rather than a
+                        # league match, and one clean match is not proof of
+                        # every path -- a cup final, a loss and a DNF are all
+                        # still first runs. Nothing is risked by finding out:
+                        # the wallet, the cup and the record are settled
+                        # server-side before this reply is built.
+                        if os.environ.get(
+                            "FIFA14_MATCH_AWARDS", "1"
+                        ).strip().lower() not in {"0", "false", "no"}:
                             settled.update(
                                 {
-                                    "participationAward": int(reward["completionAward"]),
-                                    "gameModeAward": int(reward["skillAward"]),
                                     "matchCoins": earned,
+                                    "participationAward": int(
+                                        reward["completionAward"]
+                                    ),
+                                    # The two lists the coin total is broken
+                                    # down into. Empty, because this server
+                                    # awards one figure and does not break it
+                                    # down -- but present, which is the half
+                                    # that may matter.
+                                    "matchCoinPartials": [],
+                                    "matchCoinMultipliers": [],
+                                    "seasonCoins": WALLET.coins,
+                                    "tournamentCoins": prize,
+                                    "boostConis": 0,
+                                    "boostCountLeft": 0,
                                     "coins": WALLET.coins,
+                                    "credits": WALLET.coins,
+                                    "userData": {
+                                        "coins": WALLET.coins,
+                                        "credits": WALLET.coins,
+                                    },
                                 }
                             )
                         if prize:
@@ -6024,6 +6677,8 @@ class IdentityHttpService:
                                         for l in CARD_ACTIONS.listings.values()
                                     }
                                 ),
+                                # The Team of the Week the PLAY tile draws.
+                                totw=totw_hub_squad(CARD_CATALOGUE),
                             ),
                             WALLET.coins,
                         )
@@ -6306,12 +6961,7 @@ class IdentityHttpService:
                     # opposite: no FUT account yet.  That is the NEW_USER path
                     # fcc_login1 already knows how to walk, through the
                     # icebreaker captain selection into club creation.
-                    document = {
-                        "userAccountInfo": {
-                            "personas": [],
-                            "returningUser": False,
-                        }
-                    }
+                    document = account_info_document(persona_id, persona_name)
                     payload = (
                         json.dumps(document, separators=(",", ":")) + "\n"
                     ).encode("utf-8")
@@ -6613,6 +7263,33 @@ class IdentityHttpService:
                     # global online bootstrap.  Keep the local target benign
                     # in case a menu later opens it in the embedded browser.
                     self.reply(204)
+                    return
+                # EA Sports Football Club, everything after the handshake.
+                #
+                # `/pow/auth` is already folded into `/ut/auth` above -- this
+                # console has always called FUT authentication by the POW name
+                # and it is answered as FUT. What lands here is the hub itself,
+                # which no Xbox journal has ever recorded a single request for.
+                #
+                # Journalled per request. If the endpoint change works, this is
+                # where it shows: routes arriving here at all is the result,
+                # before anything about their contents matters.
+                if normalized_path.startswith(POW_ROUTE_PREFIX):
+                    owner.journal.event(
+                        "pow_service_request",
+                        peer=self.client_address[0],
+                        method=self.command,
+                        path=parsed.path,
+                        query=parsed.query,
+                    )
+                    self.reply(
+                        200,
+                        pow_service_document(normalized_path, parsed.query),
+                        {
+                            "Content-Type": "application/json; charset=utf-8",
+                            "Cache-Control": "no-store",
+                        },
+                    )
                     return
                 # An unhandled route is the clearest signal that the retail
                 # client expects a document this server does not model yet.

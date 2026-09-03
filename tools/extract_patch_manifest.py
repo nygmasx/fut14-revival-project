@@ -182,7 +182,10 @@ def stage_easfc(ip: str, core_port: int, identity_port: int) -> dict:
 
     session_addr, session_orig = EF.SESSION
     catalogue_addr, catalogue_orig = EF.CATALOGUE
-    session_new = f"{ip}:{core_port}".encode()
+    # The HTTP port, not the Blaze one -- see the note in
+    # fifa14_easfc_endpoint_patch.patch. `core_port` is left in the signature
+    # so every caller of this manifest keeps working unchanged.
+    session_new = f"http://{ip}:{identity_port}".encode()
     catalogue_new = f"http://{ip}:{identity_port}".encode()
     return {
         "note": "in powdllzf, in place; refuses a replacement longer than the "

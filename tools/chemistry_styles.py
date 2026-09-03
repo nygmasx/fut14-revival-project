@@ -48,7 +48,39 @@ CATALOGUE = REPO / "server" / "fifa14_consumables.json"
 DEFAULT_SOURCE = REPO / "runtime" / "kyro" / "fifa14-consumable-catalog.v2412.json"
 
 CHEMISTRY = range(250, 269)
+
+# The goalkeeper's five, which no source this project had contained.
+#
+# `style_value` deduced them from the card parser months before they could be
+# listed: the member is passed through 0x891AE3F8, which does `value - 250` and
+# rejects anything above 23, so the accepted range is exactly 250-273. Nineteen
+# outfield styles leave five slots, and a goalkeeper has five styles.
+#
+# The ids and names come from MarvelcoCode/Impulsum14's `FUTDB/consumables.tsv`,
+# an extract of the game's own database, and they continue this catalogue's own
+# sequence without a gap -- 268 is resource 5003113, 269 is 5003114. Two
+# independent things agreeing on the same five slots.
+#
+# `member` is `consumablesTrainingGkPlayStyle`, which is in CardsDLL beside the
+# outfield `consumablesTrainingPlayerPlayStyle`. The art asset is 50, the same
+# one every chemistry style renders from here.
+#
+# `amount` continues the catalogue's ordinal at 19-23. It is not what gets
+# applied -- `style_value` writes the subtype, 269-273 -- so a wrong ordinal
+# costs nothing but the catalogue's own numbering.
+GK_STYLES = [
+    (269, 5_003_114, "WALL", 95),
+    (270, 5_003_115, "SHIELD", 95),
+    (271, 5_003_116, "CAT", 95),
+    (272, 5_003_117, "GLOVE", 95),
+    # Basic is the "no style" case for a keeper, and its outfield twin is 75.
+    (273, 5_003_118, "GK BASIC", 75),
+]
 POSITION_BLOCK = list(range(91, 111)) + list(range(121, 137))
+GK_SOURCE_NOTE = (
+    "MarvelcoCode/Impulsum14 FUTDB/consumables.tsv; range confirmed by "
+    "CardsDLL 0x891AE3F8 accepting 250-273"
+)
 SOURCE_NOTE = (
     "KyroGeorge2/FIFA-14-Local-FUT consumable catalogue; "
     "FUT consumable resource schema by koolaidjones"
@@ -120,6 +152,23 @@ def add(source: Path) -> int:
                 "table": "fcc_trainingcards",
                 "name": row.get("kind", ""),
                 "source": SOURCE_NOTE,
+            }
+        )
+
+    for subtype, resource, name, rating in GK_STYLES:
+        added.append(
+            {
+                "definitionId": resource,
+                "assetId": 50,
+                "cardsubtypeid": subtype,
+                "itemType": "playStyle",
+                "member": "consumablesTrainingGkPlayStyle",
+                "rating": rating,
+                "amount": subtype - 250,
+                "rare": False,
+                "table": "fcc_trainingcards",
+                "name": name,
+                "source": GK_SOURCE_NOTE,
             }
         )
 

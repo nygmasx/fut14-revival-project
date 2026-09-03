@@ -1282,12 +1282,21 @@ class TcpServerTests(unittest.TestCase):
                 response = client.getresponse()
                 account = __import__("json").loads(response.read())
                 self.assertEqual(response.status, 200)
-                # No FUT account yet, whatever identity the Blaze side holds.
-                # Offering a persona here claims a club, squad and identity
-                # that this server cannot then produce, and the login helper
-                # waits on them forever.
-                self.assertEqual(account["userAccountInfo"]["personas"], [])
-                self.assertIs(account["userAccountInfo"]["returningUser"], False)
+                # This used to assert an empty persona list, on the grounds
+                # that offering one claims a club, squad and identity "that
+                # this server cannot then produce". It can produce them now,
+                # and a launch on 25 August carried the real persona through a
+                # complete login.
+                #
+                # So the thing that may not exist yet is the *club*, not the
+                # persona: the console says who it is the moment Blaze
+                # authenticates. An account with no club advertises the persona
+                # with an empty `userClubList`, which is the same "no FUT
+                # account yet" statement without lying about the player. See
+                # AccountInfoPersona for that case.
+                persona = account["userAccountInfo"]["personas"][0]
+                self.assertEqual(persona["personaName"], SERVER.ClientState.gamertag)
+                self.assertIn("userClubList", persona)
                 client.close()
             finally:
                 identity.stop()
@@ -1383,10 +1392,15 @@ class TcpServerTests(unittest.TestCase):
                 client.request("GET", "/ut/game/fifa14/user/accountinfo")
                 response = client.getresponse()
                 persona = __import__("json").loads(response.read())
-                # The Blaze side still adopts the persona the client presents
-                # -- that is what this test is about -- but accountinfo does
-                # not advertise it as an existing FUT account.
-                self.assertEqual(persona["userAccountInfo"]["personas"], [])
+                # The Blaze side adopts the persona the client presents --
+                # that is what this test is about -- and accountinfo now
+                # carries it rather than sending an empty list. The gamertag
+                # travelling this far is the point: Impulsum's build hardcodes
+                # "FUT14" here, and this console has already said who it is.
+                self.assertEqual(
+                    persona["userAccountInfo"]["personas"][0]["personaName"],
+                    SERVER.ClientState.gamertag,
+                )
                 client.close()
             finally:
                 identity.stop()
@@ -1692,13 +1706,27 @@ class TrophyItemTests(unittest.TestCase):
         self.assertIsNotNone(re.fullmatch(pattern, "/fut/items/xbl2/-1.json"))
         self.assertIsNotNone(re.fullmatch(pattern, "/fut/items/xbl2/1102.json"))
 
+        # The shape is flat from 25 August -- tournamentId, assetName,
+        # silName, locString -- which is what Impulsum's build answers and it
+        # has a working trophy screen behind it. The `itemData` wrapper it
+        # replaced never rendered a trophy in any session recorded here.
         document = json.loads(SERVER.trophy_item_response(-1))
-        entry = document["itemData"][0]
-        self.assertEqual(entry["resourceId"], -1)
         # The basename is what the console builds the archive path from, so
         # the only thing that matters is that there is one.
-        self.assertTrue(entry["assetName"])
-        self.assertEqual(entry["assetName"], entry["image"])
+        self.assertEqual(document["assetName"], "trophy_-1_gold")
+        self.assertEqual(document["silName"], "trophy_-1_dark")
+        # -1 is the seasons screen asking, not a cup. It belongs to no
+        # tournament and says so rather than borrowing the first cup's name.
+        self.assertEqual(document["tournamentId"], 0)
+        self.assertEqual(document["locString"], [])
+
+        # A real cup carries its name here, which is the second route a name
+        # travels -- TOURNY_LOC_%d is the first.
+        starter = json.loads(SERVER.trophy_item_response(1100))
+        self.assertEqual(starter["tournamentId"], 1)
+        self.assertEqual(
+            starter["locString"], [{"lang": "ENG_US", "label": "Starter Cup"}]
+        )
 
 
 class ConsumableByItemIdTests(unittest.TestCase):
@@ -3467,3 +3495,191 @@ class TwoConsolesTests(unittest.TestCase):
             self.assertEqual(json.loads(pairs.read_text())["pairs"], [])
         finally:
             os.environ.pop("FIFA14_RELAY_PAIRS", None)
+
+
+class AccountInfoPersona(unittest.TestCase):
+    """`/user/accountinfo`, which the console asks for 142 times over.
+
+    The empty persona list was right when it was written -- a populated one
+    sends the login helper looking for a club that did not exist. The club
+    exists now, so the flag states the true thing instead.
+    """
+
+    def tearDown(self) -> None:
+        os.environ.pop("FIFA14_ACCOUNT_PERSONA", None)
+        SERVER.CLUB_IDENTITY.name = ""
+        SERVER.CLUB_IDENTITY.abbr = "FUT"
+
+    def test_the_empty_list_is_still_reachable(self) -> None:
+        # On by default now -- a launch carried the real persona end to end and
+        # the login completed. `FIFA14_ACCOUNT_PERSONA=0` goes back, because
+        # the failure mode this route can have is a login that never finishes
+        # and one launch is one launch.
+        os.environ["FIFA14_ACCOUNT_PERSONA"] = "0"
+        document = SERVER.account_info_document(2305837508020095216, "Mosebee")
+        self.assertEqual(document["userAccountInfo"]["personas"], [])
+        self.assertFalse(document["userAccountInfo"]["returningUser"])
+
+    def test_the_persona_is_the_console_gamertag_not_an_invented_one(self) -> None:
+        # Blaze carries the gamertag in DSNM and PersistentAccountStore writes
+        # it down; this route used to throw it away. Impulsum's build hardcodes
+        # personaName to "FUT14" with personaId 1000 -- there is no reason to
+        # invent a persona when the console has already said who it is.
+        os.environ.pop("FIFA14_ACCOUNT_PERSONA", None)
+        SERVER.CLUB_IDENTITY.name = "Mosebeest FC"
+        SERVER.CLUB_IDENTITY.abbr = "MOS"
+        persona = SERVER.account_info_document(
+            2305837508020095216, "Mosebee"
+        )["userAccountInfo"]["personas"][0]
+        self.assertEqual(persona["personaId"], 2305837508020095216)
+        self.assertEqual(persona["personaName"], "Mosebee")
+        self.assertTrue(persona["isReturningUser"])
+
+        club = persona["userClubList"][0]
+        self.assertEqual(club["clubName"], "Mosebeest FC")
+        self.assertEqual(club["clubAbbr"], "MOS")
+        # The Xbox SKU, which is the one in CardsDLL's string table. Impulsum
+        # sends FFA14PCC and FFA14PS3 beside it; this console is neither.
+        self.assertEqual(club["skuAccessList"], {"FFA14XBX": 1})
+        # No invented club id. Inventing ids is what drew NOT FOUND on every
+        # club item until the four families were measured.
+        self.assertNotIn("clubId", club)
+        self.assertNotIn("teamId", club)
+
+    def test_a_club_that_does_not_exist_yet_is_not_claimed(self) -> None:
+        # An unestablished club sends an empty userClubList -- the same "no FUT
+        # account yet" statement the empty persona list was making, one level
+        # down and without lying about who the player is.
+        os.environ.pop("FIFA14_ACCOUNT_PERSONA", None)
+        SERVER.CLUB_IDENTITY.name = ""
+        persona = SERVER.account_info_document(
+            2305837508020095216, "Mosebee"
+        )["userAccountInfo"]["personas"][0]
+        self.assertEqual(persona["userClubList"], [])
+        self.assertFalse(persona["isReturningUser"])
+        self.assertEqual(persona["personaName"], "Mosebee")
+
+
+
+class EasFcPowSurface(unittest.TestCase):
+    """EA Sports Football Club, ported from the PS3 line on 28 August.
+
+    That console has EASFC connected and this same handler answering it --
+    1,178 `/pow/` requests across sixteen routes in its journal. The Xbox has
+    never recorded one, and the reason was not that the module never starts:
+    it starts, and reports `TXT_EASFC_SERVER_ERROR`.
+    """
+
+    def test_the_endpoint_keys_point_at_a_port_that_speaks_http(self) -> None:
+        # The whole change, in one assertion.
+        #
+        # `POW_CUSTOMURL` and `FIFA_POW_URL` were `<advertise>:<core_port>` --
+        # the Blaze port, where nothing answers HTTP. The PS3 line hit exactly
+        # this and recorded that the request "leaves the console and is never
+        # seen again", which is what a journal with zero `/pow/` requests looks
+        # like from the server side.
+        class Stub:
+            advertise = "10.0.0.119"
+            core_port = 10041
+            identity_port = 18080
+
+        endpoint = SERVER.Fifa14Protocol.pow_endpoint.fget(Stub())
+        self.assertEqual(endpoint, "http://10.0.0.119:18080")
+        # The scheme is the whole fix, and this assertion used to say the
+        # opposite. Without it the module formats `10.0.0.119:18080/pow/auth`
+        # and default.xex's ProtoHttp opens no socket at all -- no request, no
+        # error, a retry window that doubles each attempt.
+        self.assertTrue(endpoint.startswith("http://"))
+
+        # And the way back, should this prove worse than what it replaced.
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"FIFA14_POW_CORE_URL": "1"}):
+            self.assertEqual(
+                SERVER.Fifa14Protocol.pow_endpoint.fget(Stub()),
+                "10.0.0.119:10041",
+            )
+
+    def test_the_pow_endpoint_keys_are_served(self) -> None:
+        # Withholding them was tried on 28 August, to match Zamboni, which
+        # serves none and has EASFC connected. It does not port: with the keys
+        # unserved this console made no `/pow/` request at all -- not even the
+        # handshake it had been making an hour before -- while the patched
+        # module string beside it read the right URL the whole time.
+        #
+        # POW reads the config, and the string is not a fallback it reaches.
+        # The PS3 can serve nothing because RPCS3 redirects the EASFC hostname
+        # back to the host; nothing sits in front of the Xbox, so an unserved
+        # key points at EA.
+        class Stub:
+            advertise = "10.0.0.119"
+            core_port = 10041
+            identity_port = 18080
+            identity_base = property(
+                lambda self: SERVER.Fifa14Protocol.identity_base.fget(self)
+            )
+            pow_endpoint = property(
+                lambda self: SERVER.Fifa14Protocol.pow_endpoint.fget(self)
+            )
+
+        keys = dict(SERVER.Fifa14Protocol.pow_config_keys.fget(Stub()))
+        self.assertEqual(len(keys), 6)
+        # The two that decide where the handshake goes carry the scheme.
+        for name in ("ONLINE/POW_CUSTOMURL", "FIFA_POW_URL"):
+            self.assertEqual(keys[name], "http://10.0.0.119:18080", name)
+
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"FIFA14_POW_URLS": "0"}):
+            self.assertEqual(
+                SERVER.Fifa14Protocol.pow_config_keys.fget(Stub()), []
+            )
+
+    def test_every_route_the_ps3_asks_for_is_answered(self) -> None:
+        # The sixteen routes, by request count, out of the PS3's journal. A
+        # console that asks 302 times is not idly curious.
+        for path in (
+            "/pow/chal/user/prog",
+            "/pow/lvl/user/tiergp/businessunit/tiertp/fifa",
+            "/pow/mm/game/fifa14/message/list",
+            "/pow/bank/user/account",
+            "/pow/pfyc/user",
+            "/pow/v2/activity",
+            "/pow/store/game/fifa14/catalog/list",
+            "/pow/news/user",
+            "/pow/communication/all",
+            "/pow/lvl/weight/tiergp/businessunit/tiertp/fifa",
+            "/pow/inventory/item/list",
+            "/pow/bank/currency/pow_funds/cap/info",
+            "/pow/pfyc/user/prefs/shareinfo",
+            "/pow/news/opt/off",
+            "/pow/pfyc/user/club",
+        ):
+            with self.subTest(path=path):
+                # Parseable JSON, always. An unmodelled route answers `{}`
+                # rather than 404: the distinction the PS3 established is
+                # between "nothing here" and "no answer", and a datacache
+                # treats them differently.
+                json.loads(SERVER.pow_service_document(path))
+
+    def test_the_catalogue_is_one_store_and_not_none(self) -> None:
+        # Measured on the PS3, 2026-08-27: `{"catalogs":[]}` was answered and
+        # the console re-asked every sixteen seconds. A cache filled with
+        # nothing reads as a fetch that produced nothing.
+        doc = json.loads(
+            SERVER.pow_service_document("/pow/store/game/fifa14/catalog/list")
+        )
+        self.assertEqual(len(doc["catalogs"]), 1)
+        # EA's own id, out of the module's canned response, rather than a
+        # plausible number this server invented.
+        self.assertEqual(doc["catalogs"][0]["catalogId"], 45635)
+
+    def test_the_handshake_is_not_swallowed_by_the_new_surface(self) -> None:
+        # `/pow/auth` is FUT authentication wearing the POW name, and this
+        # console has always called it that. It normalises to `/ut/auth`
+        # before anything tests for a `/pow/` prefix -- if that order ever
+        # inverts, login breaks and EASFC gains nothing.
+        self.assertEqual(SERVER.normalize_route("/pow/auth"), "/ut/auth")
+        self.assertFalse(
+            SERVER.normalize_route("/pow/auth").startswith(SERVER.POW_ROUTE_PREFIX)
+        )

@@ -1,0 +1,17 @@
+{
+  "_comment": [
+    "Club-item resource ids that draw the green NOT FOUND placeholder.",
+    "",
+    "The four family ranges in tools/build_clubitems.py were established by",
+    "finding where each family STOPS -- the probe visited 24 kit ids and every",
+    "one of them was above 6300860 -- and the interior was then assumed",
+    "contiguous. It is not. These are the holes found since, one card at a time.",
+    "",
+    "Add an id here the moment a NOT FOUND card comes out of a pack. Both the",
+    "builder and the running server read this file, so a new id takes effect on",
+    "the next server start without rebuilding the catalogue."
+  ],
+  "blank": [
+    6300772
+  ]
+}

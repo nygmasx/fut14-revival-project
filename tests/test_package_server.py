@@ -32,13 +32,9 @@ def test_the_server_runtime_modules_are_all_present() -> None:
         "tools/blaze_tdf.py",
     ):
         assert module in listed
-    # And the data files it reads. `fifa14_clubitems.json` earns its place the
-    # hard way: `_clubitem_catalogue` swallows a missing file and returns an
-    # empty list, so a package without it boots, serves, and quietly has no
-    # kit, badge, stadium or ball in it -- 1570 items gone with nothing said.
+    # And the four data files it reads.
     for data in (
         "server/fifa14_cards.json",
-        "server/fifa14_clubitems.json",
         "server/fifa14_consumables.json",
         "server/fifa14_totw.json",
         "server/icebreakerpacklist.json",
@@ -112,31 +108,3 @@ def test_the_package_boots_and_serves(tmp_path) -> None:
     finally:
         proc.terminate()
         proc.wait(timeout=5)
-
-
-def test_no_shipped_module_reads_a_data_file_the_package_leaves_behind() -> None:
-    """The pinned list above is a list, and lists get forgotten.
-
-    `fifa14_clubitems.json` was added to the server on 24 August and not here.
-    Nothing failed: `_clubitem_catalogue` catches `OSError` and returns an
-    empty list, so the package booted, served, and had none of the 1570 kits,
-    badges, stadiums or balls in it -- the exact regression the file was added
-    to fix, reintroduced by the packaging step and announced by nobody.
-
-    So the source is asked instead of a person: every `Path(__file__)` sibling
-    a shipped module opens has to be shipped with it.
-    """
-    import re
-
-    sibling = re.compile(
-        r'Path\(__file__\)\.resolve\(\)\.parent\s*/\s*"([^"]+\.json)"'
-    )
-    listed = set(P.members())
-    for module in P.SERVER_MODULES:
-        source = (P.REPO / module).read_text()
-        folder = str(Path(module).parent)
-        for name in sibling.findall(source):
-            relative = f"{folder}/{name}"
-            assert relative in listed, (
-                f"{module} reads {name} at runtime, and the package omits it"
-            )

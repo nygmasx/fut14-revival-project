@@ -377,8 +377,10 @@ def test_withdrawing_puts_the_card_back() -> None:
 
     pile = json.loads(actions.trade_pile(wallet.coins))
     assert pile["total"] == 1
-    assert (pile["auctionInfo"][0]["tradeId"]
-            >= inventory.UNLISTED_TRADE_ID_BASE), "an unlisted row needs an id"
+    # Back on the list and unlisted again: tradeId 0, the shape the console
+    # accepted on 26 August.
+    assert pile["auctionInfo"][0]["tradeId"] == 0
+    assert pile["auctionInfo"][0]["tradeState"] is None
     assert pile["auctionInfo"][0]["itemData"]["id"] == first
 
 
@@ -510,9 +512,19 @@ def test_seasons_serve_the_clubs_own_division_by_default() -> None:
     # it could not resume a season: the single row was sliced off a table
     # ordered the other way, so it carried `id` 10 and `season/user` pointed at
     # season 10 on a list of one. Measured 21 August.
+    import os
+
     import fut_inventory as inventory
 
-    doc = json.loads(inventory.seasons_response())
+    # Division 10 first is what `kyro-data` does. `native`, the default since
+    # 25 August, orders Division 1 first -- it is the mode the screen opens on,
+    # and this test is about the other one.
+    os.environ["FIFA14_SEASON_MODE"] = "kyro-data"
+    try:
+        doc = json.loads(inventory.seasons_response())
+        user_doc = inventory.season_user_response()
+    finally:
+        os.environ.pop("FIFA14_SEASON_MODE", None)
     seasons = doc["seasons"]
     assert len(seasons) == 10
     assert seasons[0]["divisionId"] == 10, "FUT starts a club in Division 10"
@@ -520,7 +532,7 @@ def test_seasons_serve_the_clubs_own_division_by_default() -> None:
     assert len(seasons[0]["matches"]) == 10
     assert len(seasons[0]["prizeSet"]) == 4
 
-    user = json.loads(inventory.season_user_response())
+    user = json.loads(user_doc)
     # seasonId is a 1-based position in the list served, and the row it selects
     # has to be the division the user document names.
     assert user["seasonId"] == seasons[0]["id"] == 1
@@ -641,11 +653,15 @@ def test_the_club_starts_in_the_bottom_division(monkeypatch) -> None:
     # restants : 10" and "12 PTS TITRE", none of which is in the record served
     # for it. So the index is into the client's table, not into ours, and
     # SEASON_DIVISIONS is ordered to agree.
-    assert standing["divisionId"] == 9
+    # 10, not 9: `divisionId` names the division of the row `seasonId`
+    # selects, and its number minus one made a played season read as no
+    # season at all. See the 25 August note in `season_user_response`.
+    assert standing["divisionId"] == 10
     assert standing["round"] == 1
-    # A club in division 5 is the fifth record, and index four.
+    # A club in division 5 is the fifth record, and it reports division 5 --
+    # the member names the division, not that number minus one.
     higher = json.loads(inventory.season_user_response(5))
-    assert (higher["seasonId"], higher["divisionId"]) == (5, 4)
+    assert (higher["seasonId"], higher["divisionId"]) == (5, 5)
     assert json.loads(inventory.season_user_response(10, played=3))["round"] == 4
 
 
@@ -664,7 +680,9 @@ def test_a_season_under_way_is_reported_where_it_actually_stands(monkeypatch) ->
         standing = json.loads(inventory.season_user_response())
         assert standing["round"] == 4
         # Still the division's number minus one.
-        assert (standing["seasonId"], standing["divisionId"]) == (10, 9)
+        # (10, 10): the row `seasonId` selects carries divisionId 10, and
+        # this has to agree with it, or a played season reads as absent.
+        assert (standing["seasonId"], standing["divisionId"]) == (10, 10)
 
         # Promoted: division 9 is the ninth record, and index eight.
         inventory.SEASON_PROGRESS.entries.clear()
@@ -672,9 +690,11 @@ def test_a_season_under_way_is_reported_where_it_actually_stands(monkeypatch) ->
             2, 9, {"round": 2, "data": "QUJD", "progressData": "REVG"}
         )
         promoted = json.loads(inventory.season_user_response())
+        # Division 9 reports `divisionId` 9, not 8: the member names the
+        # division of the row `seasonId` selects, not that number minus one.
         assert (promoted["seasonId"], promoted["divisionId"], promoted["round"]) == (
             9,
-            8,
+            9,
             2,
         )
 
@@ -684,7 +704,9 @@ def test_a_season_under_way_is_reported_where_it_actually_stands(monkeypatch) ->
             1, 10, {"round": 3, "data": "QUJD", "progressData": "REVG"}
         )
         back = json.loads(inventory.season_user_response())
-        assert (back["seasonId"], back["divisionId"], back["round"]) == (10, 9, 3)
+        # Division 10 reports 10, not 9 -- the member names the division of
+        # the row seasonId selects, not that number minus one.
+        assert (back["seasonId"], back["divisionId"], back["round"]) == (10, 10, 3)
     finally:
         inventory.SEASON_PROGRESS.entries.clear()
 
@@ -1187,20 +1209,28 @@ def test_a_cup_entered_but_never_played_is_not_a_run_to_resume(monkeypatch) -> N
 
 
 def test_team_of_the_week_is_a_full_side() -> None:
-    # A real Team of the Week is not simply the 23 best rares -- TOTW 1 carries
-    # ordinary in-form cards down into the sixties. Assert the shape, not a
-    # rating floor the real data does not meet.
+    # A real Team of the Week is eighteen: the eleven and seven subs. It used
+    # to be 23, because the side was six real ids padded out of the catalogue.
     import fut_inventory as inventory
 
     squad = json.loads(inventory.totw_response(inventory.CardCatalogue()))
-    assert len(squad["itemData"]) == 23
-    assert squad["formation"]
+    assert len(squad["itemData"]) == 18
+    # Week 1 is f343, not f442. The formation is the week's own.
+    assert squad["formation"] == "f343"
+    assert squad["squadName"] == "TOTW 1"
     ids = [card["id"] for card in squad["itemData"]]
     assert len(set(ids)) == len(ids)
     assert all(
         card["resourceId"] & 0x00FF_FFFF == card["assetId"]
         for card in squad["itemData"]
     )
+    # In-forms are not the base card's version 1, and they carry rareflag 3 so
+    # the client draws the in-form art. The band is the card's own -- 8, 9, 10
+    # or 11 -- out of `specials.tsv`, not the flat 50 the PC build falls back
+    # to for players its specials table does not hold.
+    bands = {card["resourceId"] >> 24 for card in squad["itemData"]}
+    assert bands <= {8, 9, 10, 11}, bands
+    assert all(card["rareflag"] == 3 for card in squad["itemData"])
 
 
 def _players(opened: dict) -> list:
@@ -1387,7 +1417,10 @@ def test_the_transfer_tiles_separate_the_market_from_the_club_listings() -> None
     doc = json.loads(hub_response(inventory, market=20000, selling=2, sold=13))
     assert doc["auctionCount"] == 20000        # the market, not the listings
     assert doc["selling"] == 2 and doc["sold"] == 13
-    assert doc["transferListCount"] == 15      # the club's own list total
+    # Nested, because that is what the tile reads. transferListCount,
+    # tradePileCount and tradePileItems are none of them in CardsDLL's table,
+    # so the tile read 0 ITEMS over a club with cards on the pile.
+    assert doc["tradePile"]["count"] == 15     # the club's own list total
     # The market count is never the club's sold count.
     assert doc["auctionCount"] != doc["sold"]
 
@@ -1864,14 +1897,125 @@ def test_consumables_use_the_member_names_the_binary_carries() -> None:
             # cards already report under the play-style members. The comment
             # above says exactly this about fallbacks.
             "consumablesTrainingPlayerPlayStyle",
-            # `consumablesTrainingGkPlayStyle` is absent now. The sixteen cards
-            # that reported under it were the art-35 manager formation
-            # modifiers, which draw "Formation Modifier -- Manager" and no art,
-            # and are held out of the club. Nothing else carries that member:
-            # goalkeeper chemistry styles, subtypes 269-273, are in neither
-            # catalogue.
+            # And the keeper's. `consumablesTrainingGkPlayStyle` was empty for
+            # a while: the sixteen cards that had reported under it were the
+            # art-35 manager formation modifiers, which draw no art and are
+            # held out of the club, and the real goalkeeper styles were in no
+            # catalogue this project had.
+            #
+            # They are now. `style_value` deduced subtypes 269-273 from the
+            # card parser -- 0x891AE3F8 does `value - 250` and rejects above
+            # 23, so 250-273 is the accepted range, and nineteen outfield
+            # styles leave a keeper's five. Impulsum14's extract of the game's
+            # own database names them: Wall, Shield, Cat, Glove, GK Basic, at
+            # resources 5003114-5003118, continuing this catalogue's sequence
+            # without a gap.
+            "consumablesTrainingGkPlayStyle",
+            # And the manager's league modifiers, subtypes 300-326. This
+            # member reported the training family's count until 25 August
+            # while the catalogue held none of its cards, which is what the
+            # club's manager-league tab was doing when it offered sixty-nine
+            # and then found nothing. The fallback is gone and the twenty-seven
+            # cards are real, so the count belongs in the total like any other
+            # family's.
+            "consumablesTrainingManagerLeagueModifier",
         )
     )
+
+
+def test_manager_league_modifiers_are_counted_not_stood_in_for() -> None:
+    # The club's manager-league tab said sixty-nine and then found nothing.
+    # Both halves were true: `CONSUMABLE_FALLBACKS` had this member report the
+    # training family's count, and the catalogue held none of its cards. The
+    # count was a stand-in for stock that did not exist.
+    #
+    # Subtypes 300-326 at resources 5003119-5003145, from Impulsum14's extract
+    # of the game's database and confirmed on six rows by Kyro's, which also
+    # tags the block "Manager League". See `tools/manager_league_mods.py`.
+    from fut_inventory import (
+        CONSUMABLE_FALLBACKS,
+        UNDRAWN_CONSUMABLE_TYPES,
+        ClubInventory,
+        _club_extras,
+        _consumable_catalogue,
+        consumable_family,
+        consumable_stats_response,
+    )
+
+    member = "consumablesTrainingManagerLeagueModifier"
+    assert member not in CONSUMABLE_FALLBACKS
+
+    rows = [r for r in _consumable_catalogue()
+            if r["itemType"] == "managerLeagueModifier"]
+    assert len(rows) == 27
+    assert sorted(r["cardsubtypeid"] for r in rows) == list(range(300, 327))
+    assert sorted(r["definitionId"] for r in rows) == list(range(5003119, 5003146))
+    # One art id for the whole block, read out of the database rather than
+    # invented. An invented one draws NOT FOUND.
+    assert {r["assetId"] for r in rows} == {32}
+    assert all(r["member"] == member for r in rows)
+
+    # Seeded first so they could be looked at, then packed once all
+    # twenty-seven were seen rendering on the console -- the treatment squad
+    # training, managers and staff each got.
+    assert "managerLeagueModifier" not in UNDRAWN_CONSUMABLE_TYPES
+    seeded = [i for i in _club_extras()
+              if consumable_family(i) == "managerLeagueModifier"]
+    assert len(seeded) == 27
+
+    # The count is now the stock, and every card behind it is real.
+    inventory = ClubInventory()
+    inventory.items = _club_extras()
+    document = json.loads(consumable_stats_response(inventory))
+    assert document[member] == len(seeded)
+
+    # And the list agrees with the count. These are two different routes --
+    # the tab's header reads the stats response, the tab's body reads
+    # `/club/consumables/<category>` -- and on 25 August they disagreed: the
+    # header said 27 and the body was empty, because CONSUMABLE_CATEGORIES
+    # still mapped this category to the empty string from when the club really
+    # did hold none of them.
+    #
+    # The console asks by the family name, not by the wire type: the journal
+    # has `GET /ut/game/fifa14/club/consumables/managerLeagueModifier`.
+    from fut_inventory import consumables_response
+
+    listed = json.loads(consumables_response(inventory, "managerLeagueModifier"))
+    assert listed["total"] == document[member]
+    assert sorted(r["cardsubtypeid"] for r in listed["itemData"]) == list(range(300, 327))
+    # A family the club really does hold none of still lists none, rather than
+    # falling through to everything.
+    assert json.loads(consumables_response(inventory, "managerContract"))["total"] == 0
+
+
+def test_manager_league_modifiers_are_gold_pack_only() -> None:
+    # Rated 95, so `_extra_tier` calls them gold and the low packs cannot
+    # reach them. This is the thing that put a 99-rated chemistry style in a
+    # Silver Pack when the tier was relaxed after the family was chosen.
+    import random
+
+    from fut_inventory import (
+        CONSUMABLE_DRAW_WEIGHT,
+        _draw_extra,
+        consumable_family,
+        pack_extras,
+    )
+
+    templates = pack_extras()[("consumable", "managerLeagueModifier")]
+    assert len(templates) == 27
+    assert {t["_tier"] for t in templates} == {"gold"}
+    assert CONSUMABLE_DRAW_WEIGHT["managerLeagueModifier"] > 0
+
+    drawn = {"bronze": 0, "silver": 0, "gold": 0}
+    rng = random.Random(3)
+    for tier in drawn:
+        for _ in range(3000):
+            card = _draw_extra(tier, False, 1, rng, set())
+            if card and consumable_family(card) == "managerLeagueModifier":
+                drawn[tier] += 1
+    assert drawn["bronze"] == 0
+    assert drawn["silver"] == 0
+    assert drawn["gold"] > 0
 
 
 def _unused_consumable_counts_are_not_the_club_counters() -> None:
@@ -2147,7 +2291,10 @@ def test_a_chemistry_style_writes_the_value_the_parser_accepts() -> None:
     document = json.loads(consumables_response(inventory, "playStyle"))
     offered = {i.get("cardsubtypeid") for i in document["itemData"]}
     assert offered
-    assert all(250 <= s <= 268 for s in offered), sorted(offered)
+    # 250-273, not 250-268: the parser's own range is `value - 250 <= 23`, and
+    # the five slots past the outfield styles are the goalkeeper's -- Wall,
+    # Shield, Cat, Glove, GK Basic, now in the catalogue.
+    assert all(250 <= s <= 273 for s in offered), sorted(offered)
 
 
 def test_an_outfield_chemistry_style_will_not_go_on_a_goalkeeper() -> None:
@@ -2591,10 +2738,22 @@ def test_club_user_carries_the_cards_the_picker_binds_against() -> None:
     # client will not show a squad that belongs to somebody else.
     import fut_inventory as _inventory
 
-    assert document["user"] == [
-        {"persona": "Fondateur FUT", "personaId": _inventory.PERSONA.id,
-         "public": False}
-    ]
+    assert document["user"][0] == {
+        "persona": "Fondateur FUT",
+        "personaId": _inventory.PERSONA.id,
+        "public": False,
+    }
+    # The Team of the Week's club is announced beside the player's, and this
+    # is the only place the client is told it exists. The challenge record
+    # carries that persona in keys 3 and 4, but the console was never seen
+    # asking /user/list for it -- a persona in no user list is not a club the
+    # client knows about, and "there's no Team of the Week available" is a
+    # true statement about a club it has never been told exists.
+    assert document["user"][1] == {
+        "persona": "TOTW",
+        "personaId": _inventory.TOTW_PERSONA_ID,
+        "public": True,
+    }
     items = document["itemData"]
     kinds = collections.Counter(item["itemType"] for item in items)
 
@@ -2651,13 +2810,19 @@ def test_each_consumable_category_answers_with_that_category() -> None:
 
 
 def test_a_category_this_club_has_nothing_for_answers_empty() -> None:
-    # The console asks for managerLeagueModifier, and this club holds none --
-    # manager cards are left out of the catalogue. An unknown category used to
-    # fall through to "everything", so a tab headed one thing listed another.
+    # An unknown category used to fall through to "everything", so a tab
+    # headed one thing listed another.
+    #
+    # `managerLeagueModifier` was the example here until 25 August, when the
+    # club started holding all twenty-seven of them -- see
+    # `test_manager_league_modifiers_are_counted_not_stood_in_for`. These
+    # three are the ones still genuinely empty: manager contracts are left out
+    # of the catalogue, and the formation modifiers are in it but held out of
+    # the club because art 35 draws NOT FOUND.
     from fut_inventory import ClubInventory, consumables_response
 
     club = ClubInventory()
-    for category in ("managerLeagueModifier", "managerContract", "nonsense"):
+    for category in ("formationManager", "managerContract", "nonsense"):
         document = json.loads(consumables_response(club, category))
         assert document["itemData"] == [], category
         assert document["total"] == 0
@@ -2755,7 +2920,8 @@ def test_a_cup_advances_on_a_win_and_starts_again_on_a_loss() -> None:
     from fut_inventory import TOURNAMENTS, TournamentProgress
 
     cup = 3
-    final_award = next(a for i, _t, _l, a, _r in TOURNAMENTS if i == cup)
+    # (id, name, trophy design, difficulty, final award, retail unlock)
+    final_award = next(a for i, _n, _d, _f, a, _u in TOURNAMENTS if i == cup)
 
     progress = TournamentProgress()
     progress.apply(cup, {"round": 1})
@@ -2863,8 +3029,10 @@ def test_a_card_on_the_transfer_list_but_not_listed_is_still_shown() -> None:
     # `expired`, because that is a state the screen has actions for. `inactive`
     # is what Kyro sends and what this served for two months, and it is why
     # pressing A did nothing -- see UNLISTED_TRADE_ID_BASE.
-    assert entry["tradeId"] >= inventory.UNLISTED_TRADE_ID_BASE
-    assert entry["tradeState"] == "expired"
+    # tradeId 0 and no state. Served as a lapsed auction until 26 August,
+    # which is why every card the player had never listed read as expired.
+    assert entry["tradeId"] == 0
+    assert entry["tradeState"] is None
     assert entry["buyNowPrice"] == 0
     # The card knows it is on the transfer list and available.
     assert entry["itemData"]["pile"] == inventory.PILE_TRANSFER
@@ -2886,8 +3054,10 @@ def test_a_card_on_the_transfer_list_but_not_listed_is_still_shown() -> None:
 
     pile = json.loads(actions.trade_pile(wallet.coins))
     assert pile["total"] == 1
-    assert (pile["auctionInfo"][0]["tradeId"]
-            >= inventory.UNLISTED_TRADE_ID_BASE), "an unlisted row needs an id"
+    # Back on the list and unlisted again: tradeId 0, the shape the console
+    # accepted on 26 August.
+    assert pile["auctionInfo"][0]["tradeId"] == 0
+    assert pile["auctionInfo"][0]["tradeState"] is None
 
 
 # The real body this console PUT to /ut/game/fifa14/match/end on 11 August at
@@ -2956,19 +3126,37 @@ def test_a_match_writes_fitness_goals_and_assists_back_to_the_club() -> None:
     players[1]["lifetimeAssists"] = 9
 
     touched = inventory.apply_match_items(club, REAL_MATCH_END["items"])
-    # `played` counts appearances: every card the client reports on at the
-    # whistle was on the pitch, and `gamesPlayed` is a member CardsDLL's name
-    # table carries that nothing here wrote until 16 August 2026.
+    # `played` counts appearances, and the `items` array is **not** the team
+    # sheet -- it is the whole eighteen. Treating it as the sheet took a
+    # contract off every substitute who never left the bench, reported from the
+    # console on 26 August.
+    #
+    # Fitness separates them: a card that was on the pitch comes back with less
+    # of it, one that sat on the bench comes back untouched. This capture's
+    # first item is at 99 and did not play; the other two lost fitness and did.
+    #
     # `contracts` counts the matches taken off a contract. The client reports
     # fitness, goals and assists per player and never mentions contracts, so
     # nothing else counts them down -- every card sat at 99 for ever, which is
     # what left the contract cards with nothing to restore.
+    import fut_inventory as inventory
+
+    # All three are in this club's starting eleven, so all three played --
+    # including the one the capture reports at fitness 99. A goalkeeper can
+    # finish a comfortable win having lost none, which is the case that broke
+    # the first version of this rule.
     assert touched == {
         "fitness": 3, "goals": 1, "assists": 1, "played": 3,
-        "contracts": 3, "unknown": [],
+        "contracts": 3, "unknown": [], "manager": 0,
     }
     assert all(player["gamesPlayed"] == 1 for player in players)
-    assert all(player["contract"] == 98 for player in players)
+    # One match off whatever the card arrived with, rather than a literal 98:
+    # a card starts at DEFAULT_CONTRACT now, and what is being tested is that
+    # a match spends one of them.
+    assert all(
+        player["contract"] == inventory.DEFAULT_CONTRACT - 1
+        for player in players
+    )
     assert players[0]["fitness"] == 99
     # Fitness is written, not subtracted: the client sends what it is *after*.
     assert players[1]["fitness"] == 95
@@ -3003,22 +3191,25 @@ def test_the_team_of_the_week_bench_matches_the_team() -> None:
 
     catalogue = inventory.CardCatalogue()
     squad = json.loads(inventory.totw_response(catalogue))
-    ratings = sorted(
-        (card.get("rating", 0) for card in squad["itemData"]), reverse=True
-    )
-    real = [
-        card["rating"]
-        for card in catalogue.cards
-        if card["assetId"] in set(inventory._totw_asset_ids())
-    ]
-    if real:
-        # Nobody on the bench is better than the best real in-form.
-        assert ratings[0] <= max(real)
-    assert len(ratings) == 23
+    ratings = [card.get("rating", 0) for card in squad["itemData"]]
+    assert len(ratings) == 18
 
-    # And the challenge it advertises is a side you could actually face.
+    # There is no padding any more: every card is a slot the week actually
+    # names, and it carries that slot's own in-form rating.
+    week = inventory.totw_week()
+    expected = [
+        int(slot["rating"]) for slot in inventory._totw_slots(week)
+    ]
+    assert ratings == expected
+    assert max(ratings) <= 99
+
+    # And the challenge it advertises is a side you could actually face --
+    # every week, not just the active one.
+    assert len(squad["squadChallenge"]) == len(inventory.totw_squads())
     for challenge in squad["squadChallenge"]:
         assert 60 <= challenge["opponentRating"] <= 90
+        assert challenge["formation"]
+        assert challenge["opponentTeam"] > 0
 
 
 def test_the_empty_big_archive_declares_its_size_the_way_a_real_one_does() -> None:
@@ -3076,8 +3267,9 @@ def test_the_added_packs_hold_what_they_advertise() -> None:
                     specials += 1
         return kinds, families, specials / runs
 
-    # Consumables packs hold no players at all.
-    for pack_id in (108, 109):
+    # The consumables pack holds no players at all. There was a plain one
+    # beside it until 26 August; two is one more than a club needs.
+    for pack_id in (109,):
         kinds, _, _ = contents(pack_id)
         assert kinds["player"] == 0
         # Consumables and club items, and nothing else. Club items came back
@@ -3086,27 +3278,33 @@ def test_the_added_packs_hold_what_they_advertise() -> None:
         # retail `custom` family rather than `badge`.
         club_kinds = {
             "kit", inventory.BADGE_WIRE_TYPE, "stadium", "ball",
-            "manager", "staff",
+            # The four families the game actually has. `staff` was listed here
+            # and nothing has ever carried it as an itemType -- the same
+            # assumption that made `club_stats_response` count only managers
+            # and the club search return none of them.
+            "manager", "headCoach", "gkCoach", "fitnessCoach", "physio",
         }
         assert set(kinds) <= inventory.CONSUMABLE_TYPES | club_kinds | {"club"}
 
-    # The 100 000 pack is rare golds, all twelve of them.
-    _, families, _ = contents(308)
-    assert families["non-rare gold"] == 0
-    assert families["rare gold"] > 0
+    # The special group, rewritten 26 August. The Team of the Week and Team of
+    # the Season packs that were here are gone at the player's request.
+    #
+    # Every one of them is all-rare, which is what each of their descriptions
+    # promises.
+    for pack_id in (308, 405, 406):
+        kinds, families, _ = contents(pack_id)
+        assert families["non-rare gold"] == 0, pack_id
+        assert families["rare gold"] > 0, pack_id
 
-    # A Team of the Week pack owes one every time, and cannot hand out another
-    # family instead.
-    _, families, per_pack = contents(309)
-    assert per_pack >= 1.0
-    assert families["team of the week"] > 0
-    assert families["team of the year"] == 0
-    assert families["team of the season"] == 0
+    # And the two all-player packs hold nothing else.
+    for pack_id in (405, 406):
+        kinds, _, _ = contents(pack_id)
+        assert set(kinds) == {"player"}, pack_id
 
-    # The Team of the Season pack promises two, weighted to its own name.
-    _, families, per_pack = contents(310)
-    assert per_pack >= 2.0
-    assert families["team of the season"] > families["team of the year"]
+    # The Mega Pack is the big one: thirty items, and it says eighteen rare.
+    kinds, _, _ = contents(404)
+    assert sum(kinds.values()) == 30 * 30
+    assert inventory.PACK_SPECS[404]["rares"] == 18
 
 
 def test_the_store_groups_are_written_out_not_left_as_tiers() -> None:
@@ -3135,17 +3333,32 @@ def test_the_store_groups_are_written_out_not_left_as_tiers() -> None:
     # "Consommables", "Packs Speciaux" -- left over from the project this was
     # forked from, and the console drew them verbatim over an otherwise English
     # store.
+    # Capitals, like the pack names, and four groups rather than five.
     assert headings == [
-        "Bronze Packs", "Silver Packs", "Gold Packs",
-        "Consumables", "Special Packs",
+        "BRONZE PACKS", "SILVER PACKS", "GOLD PACKS", "SPECIAL PACKS",
     ]
     # The added packs get headings of their own rather than being filed under a
     # tier they only nominally belong to.
-    assert groups["Consumables"] == [108, 109]
-    assert groups["Special Packs"] == [309, 310]
+    # The consumables group is gone: one pack does not need a tab of its own,
+    # and the premium consumables pack is a special pack by price.
+    assert "Consumables" not in groups
+    assert list(groups) == ["BRONZE PACKS", "SILVER PACKS", "GOLD PACKS",
+                            "SPECIAL PACKS"]
+    # Rewritten 26 August: rare golds, rare players, the Mega Pack and the
+    # jumbo, cheapest first. The Team of the Week and Team of the Season packs
+    # that were here are gone.
+    # Cheapest first: consumables, rare golds, the Mega Pack, rare players,
+    # then the jumbo.
+    assert groups["SPECIAL PACKS"] == [109, 308, 404, 405, 406]
     # The tier still names the artwork.
     for entry in catalogue["purchase"]:
-        assert entry["displayGroupAssetId"] in (1, 2, 3)
+        # Bronze 1, silver 2, gold 3 -- and the special packs carry covers of
+        # their own, 4, 5 and 6, which is why that group's tiles no longer look
+        # like the gold ones.
+        # Bronze 1, silver 2, gold 3, and one cover for the whole special
+        # group -- 4, the Rare Gold Pack's.
+        assert entry["displayGroupAssetId"] in (1, 2, 3, 4)
+        assert entry["assetId"] == entry["displayGroupAssetId"]
 
 
 def test_packing_the_same_player_twice_says_so_the_second_time() -> None:
@@ -3239,7 +3452,11 @@ def test_a_pack_never_hands_out_the_same_player_twice() -> None:
                 item for item in opened["itemList"]
                 if item.get("itemType") == "player"
             ]
-            keys = [(item.get("assetId"), item.get("rareflag")) for item in players]
+            # The player, not the card. Two versions of one man in a single
+            # pack is the same face twice on the pack screen, whatever the club
+            # would call them -- fifteen of those in 5,600 opens while this
+            # keyed on the rare flag as well.
+            keys = [item.get("assetId") for item in players]
             repeats += len(keys) - len(set(keys))
     assert repeats == 0
 
@@ -3900,7 +4117,7 @@ def test_an_unlisted_transfer_card_is_tradeable_so_a_can_list_it() -> None:
     actions.move({"itemData": [{"id": card_id, "pile": inventory.PILE_TRANSFER}]})
 
     entry = json.loads(actions.trade_pile(wallet.coins))["auctionInfo"][0]
-    assert entry["tradeId"] >= inventory.UNLISTED_TRADE_ID_BASE
+    assert entry["tradeId"] == 0
     assert entry["itemData"]["tradeable"] is True
     assert entry["itemData"]["untradeable"] is False
 
@@ -3916,7 +4133,7 @@ def test_the_transfer_tile_counts_unlisted_cards_as_items() -> None:
     doc = json.loads(hub_response(inventory, market=12771, selling=2, sold=3, unlisted=5))
     assert doc["selling"] == 2 and doc["sold"] == 3
     # 2 listed + 3 sold + 5 unlisted = 10 on the list.
-    assert doc["transferListCount"] == 10
+    assert doc["tradePile"]["count"] == 10
 
 
 def test_an_unlisted_entry_carries_the_shape_the_console_acts_on() -> None:
@@ -3939,24 +4156,31 @@ def test_an_unlisted_entry_carries_the_shape_the_console_acts_on() -> None:
 
     entries = [
         e for e in json.loads(actions.trade_pile(wallet.coins))["auctionInfo"]
-        if e["tradeId"] >= inventory.UNLISTED_TRADE_ID_BASE
+        if e["tradeId"] == 0
     ]
     assert len(entries) == 2
-    ids = {entry["tradeId"] for entry in entries}
-    assert len(ids) == 2, "two rows sharing an id cannot both be selected"
+    # The rows are told apart by the card, not by a trade id: every unlisted
+    # row carries tradeId 0 and the screen resolves the selection through
+    # `itemData.id`. Distinct pseudo ids were this server's own invention, and
+    # they are what made a card the player never listed read as expired.
+    ids = {entry["itemData"]["id"] for entry in entries}
+    assert len(ids) == 2, "two rows sharing a card cannot both be selected"
 
     for entry in entries:
         # The two members that carry the behaviour, together. Neither works
         # alone: an id alone makes the row an auction the screen can describe
         # but not act on, and a state alone has no card behind it to act with.
-        assert entry["tradeId"] >= inventory.UNLISTED_TRADE_ID_BASE
-        assert entry["tradeState"] == "expired"
-        # A lapsed auction, which is what "expired" has to mean to be relistable.
+        assert entry["tradeId"] == 0
+        assert entry["tradeState"] is None
         assert entry["expires"] == -1
-        # Unchanged, and still true of the card itself.
-        assert entry["endtime"] == 2147483647
         assert entry["tradeOwner"] is True
-        assert entry["sellerName"], "the club is the seller, not a blank"
+        # No seller and no clock. The six members this server used to add on
+        # top -- sellerId, sellerEstablished, endtime, startTime, EXPIRE_TIME,
+        # expireTime -- are what made the earlier reading of tradeId 0 come out
+        # wrong, so they stay out.
+        assert entry["sellerName"] == ""
+        assert "endtime" not in entry
+        assert "sellerEstablished" not in entry
         assert entry["itemData"]["tradeable"] is True
         assert entry["itemData"]["pile"] == inventory.PILE_TRANSFER
 
@@ -3986,11 +4210,11 @@ def test_the_shape_switch_falls_back_to_the_measured_default() -> None:
             os.environ.pop("FIFA14_UNLISTED_SHAPE", None)
         unlisted = [
             e for e in pile["auctionInfo"]
-            if e["tradeId"] >= inventory.UNLISTED_TRADE_ID_BASE
+            if e["tradeId"] == 0
         ]
         assert len(unlisted) == 2, name
         for entry in unlisted:
-            assert entry["tradeState"] == "expired", name
+            assert entry["tradeState"] is None, name
             assert entry["itemData"]["id"], name
 
     # Held state is untouched whatever was served.
@@ -4065,24 +4289,12 @@ def test_a_probe_run_never_writes_the_save() -> None:
     wallet = Wallet(coins=999)
     actions = CardActions(PackShop(CardCatalogue(), wallet), wallet, inventory)
 
-    # The roster the probe sweeps is written by the operator and gitignored, so
-    # a checkout does not have one -- and without one `_club_item_probe` reads
-    # nothing and returns a falsy roster, so the guard does not fire and this
-    # test asserted a machine rather than the code. It gets its own roster.
-    import fut_inventory
-
-    roster = Path(tempfile.mkdtemp()) / "club-item-probe.json"
-    roster.write_text(json.dumps({"kit": [1], "badge": [], "stadium": [], "ball": []}))
-    kept = fut_inventory.PROBE_FILE
-    fut_inventory.PROBE_FILE = roster
-
     os.environ["FIFA14_CLUB_ITEM_PROBE"] = "1"
     try:
         ClubSave(path).save(inventory, wallet, actions, None)
         assert path.read_text() == before, "a probe run wrote the save"
     finally:
         os.environ.pop("FIFA14_CLUB_ITEM_PROBE", None)
-        fut_inventory.PROBE_FILE = kept
 
     # And with the probe off it saves as normal.
     ClubSave(path).save(inventory, wallet, actions, None)
@@ -4090,26 +4302,73 @@ def test_a_probe_run_never_writes_the_save() -> None:
 
 
 def test_the_club_item_catalogue_matches_what_the_console_rendered() -> None:
-    # 1570 club items across four contiguous resource runs, each edge confirmed
-    # on the console during the probe sessions of 18-19 August 2026.
-    from fut_inventory import _clubitem_catalogue
+    # Five resource runs, each with a bound that something measured rather than
+    # assumed. A run is its bounds and its holes; the holes are named in
+    # `server/fifa14_clubitems_blank.json` rather than assumed away.
+    #
+    # Kits are two runs, not one. Home kits are asset 14 at 6300000; **away
+    # kits are asset 15 at 6400000**, and this catalogue had none of them while
+    # `PRESENTATION_ACTIVES` was already dressing the club in 6400001. The club
+    # wore a kit the catalogue did not contain.
+    #
+    # The home bound moved from 6300860 to 6300740. The probe's `good` list
+    # claims 861 -- but it is not exhaustive (badges record 28 sampled entries
+    # against 601 served), 6300772 drew NOT FOUND out of a pack on 25 August,
+    # and MarvelcoCode/Impulsum14's extract of the game's own database stops at
+    # 6300740 independently. A sighting and a database beat a list that reads
+    # as written rather than probed.
+    #
+    # Badges and balls are deliberately NOT taken from that database. It stops
+    # at 6000586 where the probe recorded 6000600 rendering, and it carries
+    # eight balls past 8120137 that the probe never tested. A measurement here
+    # beats a database read elsewhere, and untested is not the same as present.
+    from fut_inventory import _clubitem_catalogue, blank_club_items
 
     catalogue = _clubitem_catalogue()
-    assert len(catalogue) == 1570
+    blank = blank_club_items()
 
-    runs = {
-        "kit": (6_300_000, 6_300_860, 861),
-        "badge": (6_000_000, 6_000_600, 601),
-        "stadium": (6_200_000, 6_200_060, 61),
-        "ball": (8_120_091, 8_120_137, 47),
-    }
-    for kind, (first, last, count) in runs.items():
-        ids = sorted(c["resourceId"] for c in catalogue if c["itemType"] == kind)
-        assert len(ids) == count, kind
-        assert ids[0] == first and ids[-1] == last, kind
-        # Contiguous: the probe sampled across each run and both edges are sharp.
-        assert ids == list(range(first, last + 1)), kind
+    runs = [
+        ("kit", 14, 6_300_000, 6_300_740, 741),
+        ("kit", 15, 6_400_000, 6_400_585, 586),
+        ("badge", 241, 6_000_000, 6_000_600, 601),
+        ("stadium", 6, 6_200_000, 6_200_060, 61),
+        # 8120137 came out of a pack as a grey placeholder captioned
+        # `*BallName_83` -- the asterisk is the client saying it built the
+        # string key and found no string. The probe called it good and its ball
+        # list ends at exactly the served range, the same tell that made its
+        # kit list wrong.
+        ("ball", 23, 8_120_091, 8_120_136, 46),
+    ]
+    holes_inside = {b for _, _, f, l, _ in runs for b in blank if f <= b <= l}
+    assert len(catalogue) == sum(c for *_, c in runs) - len(holes_inside)
 
+    for kind, asset, first, last, count in runs:
+        ids = sorted(
+            c["resourceId"]
+            for c in catalogue
+            if c["itemType"] == kind and first <= c["resourceId"] <= last
+        )
+        holes = {b for b in blank if first <= b <= last}
+        assert len(ids) == count - len(holes), (kind, asset)
+        # An excluded id is never an edge: an edge that failed would move the
+        # bound rather than punch a hole.
+        assert ids[0] == first and ids[-1] == last, (kind, asset)
+        assert ids == [n for n in range(first, last + 1) if n not in holes], (kind, asset)
+        # Each run carries its own anchor asset. Home and away kits differ by
+        # exactly that, which is how the client tells them apart.
+        assets = {
+            c["assetId"]
+            for c in catalogue
+            if c["itemType"] == kind and first <= c["resourceId"] <= last
+        }
+        assert assets == {asset}, (kind, assets)
+
+    # The kit that drew NOT FOUND is gone with the bound rather than blocked.
+    assert not any(c["resourceId"] == 6_300_772 for c in catalogue)
+    # And the away kit the club actually wears is present.
+    assert any(
+        c["itemType"] == "kit" and c["resourceId"] == 6_400_001 for c in catalogue
+    )
 
 def test_a_badge_resource_is_an_index_into_the_games_badge_table() -> None:
     # Not a club id. The console drew these crests at these resources, and
@@ -4170,7 +4429,7 @@ def test_every_ball_is_silver_and_reaches_every_pack() -> None:
     from fut_inventory import CardCatalogue, PackShop, Wallet, _clubitem_catalogue
 
     balls = [c for c in _clubitem_catalogue() if c["itemType"] == "ball"]
-    assert len(balls) == 47
+    assert len(balls) == 46
     assert {c["rating"] for c in balls} == {68}
     assert {c["rare"] for c in balls} == {0}
     assert {c["discardValue"] for c in balls} == {15}
@@ -4266,7 +4525,8 @@ def test_the_store_serves_english_pack_descriptions() -> None:
     # string table would live, and TOURNY_LOC has never resolved from the other.
     from fut_inventory import TOURNAMENT_NAMES
 
-    assert len(units) == len(PACK_SPECS) + len(TOURNAMENT_NAMES)
+    # Two per pack now -- a _DESC and a _NAME -- plus the cup names.
+    assert len(units) == 2 * len(PACK_SPECS) + len(TOURNAMENT_NAMES)
     names = {u.get("resname") for u in units}
     for cup in TOURNAMENT_NAMES:
         assert f"TOURNY_LOC_{cup}" in names
@@ -4299,8 +4559,9 @@ def test_a_reduced_season_rung_points_at_a_season_it_actually_serves() -> None:
         # record carries id 10 whether it is served alone or beside nine
         # others, and the client saves to /season/10/division/10/user.
         assert user["seasonId"] == seasons[0]["id"] == 10, mode
-        # divisionId indexes the client's own table: 10 hangs, 0-9 hold.
-        assert 0 <= user["divisionId"] <= 9, mode
+        # The division's own number, 1 to 10 -- not an index into a table of
+        # ten, which is the reading the console disproved on 21 August.
+        assert 1 <= user["divisionId"] <= 10, mode
 
 
 def test_the_native_rung_still_points_at_the_last_of_ten() -> None:
@@ -4467,9 +4728,15 @@ def test_a_season_keeps_its_progress_after_a_match() -> None:
     # both said season 10. A progress document beside a season that is not
     # there reads as no season at all.
     import json
+    import os
 
     import fut_inventory as inventory
 
+    # `kyro-data`: this is the resume shape, and the default became `native`
+    # on 25 August because `kyro-data` froze the screen on entry. What is
+    # tested here -- that a played season is reported as played -- belongs to
+    # the shape that resumes.
+    os.environ["FIFA14_SEASON_MODE"] = "kyro-data"
     fresh = json.loads(inventory.season_user_response())
     assert fresh["round"] == 1
 
@@ -4498,9 +4765,17 @@ def test_a_season_keeps_its_progress_after_a_match() -> None:
     finally:
         inventory.SEASON_PROGRESS.entries.clear()
         inventory.SEASON_PROGRESS.entries.update(entries)
+        os.environ.pop("FIFA14_SEASON_MODE", None)
 
 
 def test_each_unlisted_card_gets_a_stable_id_of_its_own() -> None:
+    # Pinned to the measured shape. `runtime/unlisted-shape.txt` is a live
+    # experiment the console can be mid-way through -- it was set to
+    # `impulsum` on 26 August to try the PC build's entry -- and a test must
+    # not depend on which candidate is being tried at the time.
+    import os
+
+    os.environ["FIFA14_UNLISTED_SHAPE"] = "plain"
     # `GetCardIdFromTradeId` is how the standalone Transfer List screen gets
     # from the selected row to a card, so every row needs an id: distinct (two
     # rows sharing one is the fault this replaces), stable across polls (the
@@ -4522,15 +4797,17 @@ def test_each_unlisted_card_gets_a_stable_id_of_its_own() -> None:
     first = json.loads(actions.trade_pile(wallet.coins))["auctionInfo"]
     again = json.loads(actions.trade_pile(wallet.coins))["auctionInfo"]
 
-    rows = [e for e in first if e["tradeId"] >= inventory.UNLISTED_TRADE_ID_BASE]
+    rows = [e for e in first if e["tradeId"] == 0]
     assert len(rows) == 3
-    assert len({r["tradeId"] for r in rows}) == 3
+    # Told apart by the card, not by a trade id -- every unlisted row is
+    # tradeId 0 and the screen resolves the selection through `itemData.id`.
+    assert len({r["itemData"]["id"] for r in rows}) == 3
 
     by_card = {r["itemData"]["id"]: r["tradeId"] for r in rows}
     repeat = {
         r["itemData"]["id"]: r["tradeId"]
         for r in again
-        if r["tradeId"] >= inventory.UNLISTED_TRADE_ID_BASE
+        if r["tradeId"] == 0
     }
     assert by_card == repeat, "an id that moves under the cursor is no id"
 
@@ -4549,6 +4826,13 @@ def test_each_unlisted_card_gets_a_stable_id_of_its_own() -> None:
 
 
 def test_removing_an_unlisted_card_from_the_list_returns_it_to_the_club() -> None:
+    # Pinned to the measured shape. `runtime/unlisted-shape.txt` is a live
+    # experiment the console can be mid-way through -- it was set to
+    # `impulsum` on 26 August to try the PC build's entry -- and a test must
+    # not depend on which candidate is being tried at the time.
+    import os
+
+    os.environ["FIFA14_UNLISTED_SHAPE"] = "plain"
     # Now that the screen binds a menu, "remove from the transfer list" can be
     # sent for a card that was never listed -- with the id this server invented.
     # There is no auction to withdraw, and leaving the card on the list is how
@@ -4565,9 +4849,13 @@ def test_removing_an_unlisted_card_from_the_list_returns_it_to_the_club() -> Non
 
     row = [
         e for e in json.loads(actions.trade_pile(wallet.coins))["auctionInfo"]
-        if e["tradeId"] >= inventory.UNLISTED_TRADE_ID_BASE
+        if e["tradeId"] == 0
     ][0]
-    actions.withdraw(row["tradeId"])
+    assert row["itemData"]["id"] == card_id
+    # `withdraw` is for a real auction. A card that was never listed has no
+    # trade id to withdraw -- it goes back the way it came, as a move to the
+    # club pile, which is what the console sends.
+    actions.move({"itemData": [{"id": card_id, "pile": inventory.PILE_CLUB}]})
 
     assert [c["id"] for c in actions.transfer] == []
     held = [c for c in actions.club if c["id"] == card_id]
@@ -4627,7 +4915,7 @@ def test_a_candidate_can_be_written_as_data_without_a_relaunch() -> None:
             os.environ.pop("FIFA14_UNLISTED_SHAPE", None)
         return [
             e for e in pile["auctionInfo"]
-            if e["tradeId"] >= inventory.UNLISTED_TRADE_ID_BASE
+            if e["tradeId"] == 0
         ][0]
 
     written = inventory.UNLISTED_SHAPES_FILE
@@ -4644,7 +4932,7 @@ def test_a_candidate_can_be_written_as_data_without_a_relaunch() -> None:
     try:
         row = unlisted("probe")
         # The base was applied first...
-        assert row["tradeState"] == "expired", "base candidate did not run"
+        assert row["tradeState"] is None, "base candidate did not run"
         assert row["expires"] == -1
         # ...then the overlay on top of it.
         assert row["startingBid"] == 150
@@ -4654,7 +4942,7 @@ def test_a_candidate_can_be_written_as_data_without_a_relaunch() -> None:
 
         # No base means the current shape, changed only where the spec says.
         plain = unlisted("nobase")
-        assert plain["tradeState"] == "expired"
+        assert plain["tradeState"] is None
         assert plain["confidenceValue"] == 42
 
         # Nothing held is mutated, whatever was served.
@@ -4722,30 +5010,35 @@ def test_the_kyro_season_mode_matches_the_reference_build() -> None:
     assert selected[0]["divisionId"] == user["divisionId"]
 
 
-def test_the_default_season_shape_is_the_one_that_resumes() -> None:
-    # Measured on the console, 21 August 2026. A season survived a match and
+def test_the_resume_season_shape_agrees_with_itself() -> None:
+    # Measured on the console, 22 August 2026. A season survived a match and
     # came back with the score drawn and NEXT on the second fixture, on this
     # document and no other:
     #
     #     {"seasonId":1,"divisionId":10,"round":2,"data":<blob>,"dataVersion":1}
     #
-    # Three things have to agree, and every earlier attempt had at least one of
-    # them wrong:
+    # Three things have to agree, and every earlier attempt had one wrong:
     #
     #   the list      ten rows, Division 10 first, so row 1 IS Division 10
     #   seasonId      1, selecting that row -- the client decrements it
     #   divisionId    10, naming the same division as the row selected
     #
-    # `divisionId` 9 with the same list and the same seasonId did NOT resume,
-    # which is what proves the member has to match the row rather than merely
-    # being in range.
+    # `kyro-data` by name rather than by default: on 25 August this shape froze
+    # the seasons screen on entry and `native` opened it on the same console,
+    # so `native` is the default now. What this pins is unchanged -- that the
+    # resume shape is internally consistent.
     import json
+    import os
 
     import fut_inventory as inventory
 
-    assert inventory.season_wire_mode() == "kyro-data"
-    listed = json.loads(inventory.seasons_response())["seasons"]
-    user = json.loads(inventory.season_user_response())
+    os.environ["FIFA14_SEASON_MODE"] = "kyro-data"
+    try:
+        assert inventory.season_wire_mode() == "kyro-data"
+        listed = json.loads(inventory.seasons_response())["seasons"]
+        user = json.loads(inventory.season_user_response())
+    finally:
+        os.environ.pop("FIFA14_SEASON_MODE", None)
 
     assert len(listed) == 10
     assert [row["id"] for row in listed] == list(range(1, 11))
@@ -4755,9 +5048,30 @@ def test_the_default_season_shape_is_the_one_that_resumes() -> None:
         "the user document must name the division of the row it selects"
     )
     assert user["divisionId"] == 10, "a new club starts in Division 10"
-    assert user["round"] >= 1, "wire round 0 becomes the client's invalid sentinel"
+    assert user["round"] >= 1, "wire round 0 is the client's invalid sentinel"
 
 
+def test_the_default_season_shape_is_the_one_that_opens() -> None:
+    # `native`, because it is the one the screen opens on. Two measurements on
+    # this console disagree and both stand: `kyro-data` resumed a season on
+    # 22 August and froze the screen on 25 August, where `native` opened it --
+    # same console, same disc, same club, same LIVE session.
+    #
+    # Found by trying nygmasx's server from the same console: seasons opened
+    # there, and his `deploy/run.sh` pins `native`, so he had never run the
+    # default this repository set.
+    import json
+
+    import fut_inventory as inventory
+
+    assert inventory.season_wire_mode() == "native"
+    listed = json.loads(inventory.seasons_response())["seasons"]
+    assert len(listed) == 10
+    assert [row["id"] for row in listed] == list(range(1, 11))
+    # Division 1 first, which is what `native` means and what `kyro-data`
+    # reversed. The screen opens on the first tile, so this one opens on
+    # Division 1 rather than on the division a new club is actually in.
+    assert listed[0]["divisionId"] == 1
 def test_a_played_season_carries_its_blob_back() -> None:
     # The scores live in the client's own blob. Without it the fixture list
     # drew `-` for a match that had been won 4-0, even once the record was
@@ -4935,3 +5249,1884 @@ def test_client_data_is_handed_back_exactly_as_the_client_wrote_it() -> None:
     revived = inventory.ClientData()
     revived.restore(store.state())
     assert json.loads(revived.read("userHubData")) == json.loads(written)
+
+
+def test_the_market_narrows_consumables_by_quality_and_by_modifier() -> None:
+    # The consumables tab sends more than the category, and only the category
+    # was read. Picking "LB >> LWB" returned all twenty position modifiers, and
+    # picking Bronze returned every card of the family.
+    #
+    # These are the queries the console actually sent, off the journal:
+    #
+    #     type=training&cat=position&pos=LB-LWB
+    #     type=training&cat=playerTraining&lev=bronze
+    import fut_inventory as inventory
+
+    def rows(**query):
+        return inventory.market_consumables(query)
+
+    # One modifier means one card, and the one asked for. `from`/`to` are read
+    # in the order the query names them: LB-LWB takes a left back and makes him
+    # a left wing back, which is a different card from its opposite number.
+    one = rows(cat="position", pos="LB-LWB")
+    assert len(one) == 1
+    assert (one[0]["from"], one[0]["to"]) == ("LB", "LWB")
+    assert len(rows(cat="position")) > 1, "the family is still there unfiltered"
+    # The reverse card exists and is not this one.
+    other = rows(cat="position", pos="LWB-LB")
+    assert len(other) == 1
+    assert other[0]["definitionId"] != one[0]["definitionId"]
+
+    # Quality is the rating, on the same boundaries a pack uses.
+    family = rows(cat="playerTraining")
+    tiers = {
+        tier: rows(cat="playerTraining", lev=tier)
+        for tier in ("bronze", "silver", "gold")
+    }
+    assert sum(len(v) for v in tiers.values()) == len(family), (
+        "every card belongs to exactly one tier"
+    )
+    for tier, cards in tiers.items():
+        low, high = inventory.TIER_RATINGS[tier]
+        assert cards, tier
+        for card in cards:
+            assert low <= card["rating"] <= high, (tier, card["rating"])
+
+    # "Any" is the screen's default and must not filter.
+    assert len(rows(cat="playerTraining", lev="any")) == len(family)
+    assert len(rows(cat="playerTraining", lev="")) == len(family)
+
+    # A modifier asked for in a family that has none is nothing, not everything.
+    assert rows(cat="playerTraining", pos="LB-LWB") == []
+
+    # And the two filters compose.
+    both = rows(cat="contract", lev="bronze")
+    assert both and all(
+        c["rating"] <= inventory.TIER_RATINGS["bronze"][1] for c in both
+    )
+
+
+def test_the_player_market_filters_on_price_quality_and_style() -> None:
+    # Three faults, all on the same screen.
+    #
+    # `minb`/`maxb` were read as a minimum and maximum **rating**, and this
+    # screen has no rating filter -- it offers Quality, Position, Chemistry
+    # Style, Nationality, League, Club and Pricing. A Min. Price of 1000 asked
+    # for cards rated at least a thousand and emptied the market.
+    #
+    # Quality matched the rarity string as a substring, so "Non-Rare Bronze"
+    # worked and "Team of the Year" did not: a Gold search excluded every
+    # special in the game.
+    #
+    # Chemistry Style was not read at all, and could not be -- the catalogue
+    # holds no style, because a style is applied by a consumable rather than
+    # born with the card.
+    import json
+
+    import fut_inventory as inventory
+
+    catalogue = inventory.CardCatalogue()
+
+    def total(**query):
+        return catalogue.search({"type": "player", **{k: str(v) for k, v in query.items()}})[1]
+
+    everything = total()
+
+    # Price bounds narrow, and do not empty.
+    dear = total(minb=1000)
+    assert 0 < dear < everything
+    assert total(minb=1000, maxb=5000) < dear
+    # Both spellings reach the same value.
+    assert total(micr=50_000) == total(minb=50_000)
+
+    # The three tiers partition the catalogue exactly -- every card is one of
+    # them, and none is two.
+    tiers = {t: total(lev=t) for t in ("bronze", "silver", "gold")}
+    assert sum(tiers.values()) == everything
+
+    # And a special is gold, which is what a Gold search is usually after.
+    for rarity in ("Team of the Year", "Team of the Season", "iMOTM", "Legend"):
+        card = next(c for c in catalogue.cards if c.get("rarity") == rarity)
+        assert inventory._card_tier(card) == "gold", rarity
+
+    # An ordinary card still follows its own name rather than its rating.
+    bronze = next(c for c in catalogue.cards
+                  if (c.get("rarity") or "").lower().endswith("bronze"))
+    assert inventory._card_tier(bronze) == "bronze"
+
+    # The style asked for is the style served, because the market is where
+    # somebody else's applied style would be on sale.
+    listed = json.loads(catalogue.auctions(
+        {"type": "player", "num": "3", "playStyle": "268"}, 0))
+    assert listed["auctionInfo"]
+    assert {a["itemData"]["playStyle"] for a in listed["auctionInfo"]} == {268}
+    plain = json.loads(catalogue.auctions({"type": "player", "num": "3"}, 0))
+    assert {a["itemData"]["playStyle"] for a in plain["auctionInfo"]} == {250}
+
+
+def test_a_packed_player_arrives_with_seven_contracts() -> None:
+    # Every card this server made carried 99, from every source. Nothing ever
+    # needed a contract, so the contracts tab, the market's development
+    # category and the apply-consumable screen were all pointless against a
+    # squad that never ran down.
+    import json
+    import random
+
+    import fut_inventory as inventory
+
+    _, shop, _ = _actions()
+    opened = json.loads(shop.open_pack(GOLD_PACK_ID, random.Random(11)))
+    players = [i for i in opened["itemList"] if i.get("itemType") == "player"]
+    assert players
+    for card in players:
+        assert card["contract"] == inventory.DEFAULT_CONTRACT == 7
+        # Fitness is not a contract: it is spent by playing, not handed out
+        # at nought, so it stays full.
+        assert card["fitness"] == 99
+
+    # A card off the market arrives the same way.
+    listed = json.loads(inventory.CardCatalogue().auctions(
+        {"type": "player", "num": "3"}, 0))
+    for auction in listed["auctionInfo"]:
+        assert auction["itemData"]["contract"] == 7
+
+
+def test_a_club_item_known_to_draw_not_found_is_never_packed() -> None:
+    # Kit 6300772 came out of a Gold Pack on 24 August drawing the green NOT
+    # FOUND placeholder. It is inside the range the catalogue calls good --
+    # and that range was never measured. The probe visited 24 kit ids, every
+    # one above 6300860, hunting for where the family stops; the interior was
+    # assumed contiguous and is not.
+    #
+    # So bad ids are removed one at a time as they are found. Both the builder
+    # and the server read the same file, so an id added after a bad pack takes
+    # effect on the next server start without a rebuild.
+    import fut_inventory as inventory
+
+    blank = inventory.blank_club_items()
+    assert 6300772 in blank, "the id that started this must stay excluded"
+
+    catalogue = inventory._clubitem_catalogue()
+    assert catalogue, "the catalogue still has items in it"
+    served = {item.get("resourceId") for item in catalogue}
+    assert not (served & blank), "a blank id reached the catalogue"
+
+    # And the shipped file agrees, so a rebuild does not put it back.
+    import json
+    from pathlib import Path
+
+    built = json.loads(
+        (Path(inventory.__file__).parent / "fifa14_clubitems.json").read_text()
+    )["clubitems"]
+    assert not ({i.get("resourceId") for i in built} & blank)
+
+
+def test_an_unreadable_blank_list_leaves_the_catalogue_alone() -> None:
+    # The file is edited by hand between sessions. A half-saved one must serve
+    # the catalogue as it stands rather than empty it.
+    import fut_inventory as inventory
+
+    kept = inventory.CLUBITEM_BLANK_FILE
+    try:
+        inventory.CLUBITEM_BLANK_FILE = kept.parent / "does-not-exist.json"
+        assert inventory.blank_club_items() == set()
+        assert inventory._clubitem_catalogue(), "no exclusions is not no items"
+    finally:
+        inventory.CLUBITEM_BLANK_FILE = kept
+
+
+def test_the_club_search_reports_how_many_the_club_holds() -> None:
+    # The item screen's CLUB tab read 0 over a club of 485. The response
+    # carried no count at all -- `itemData` and `duplicateItemIdList` and
+    # nothing else -- so there was nothing for it to draw.
+    #
+    # Retail settles what the number is: a capture of FIFA 14 shows
+    # "CLUB 352" on a tab that is greyed out, so it is the club's size and not
+    # the page, and not what the client happens to be holding.
+    #
+    # `total` is the member the trade pile and the market already use for this.
+    # `totalResults` and `itemCount` are not in CardsDLL's name table at all.
+    import json
+
+    import fut_inventory as fut
+
+    inventory = fut.ClubInventory()
+    assert inventory.items, "the seeded club has cards to count"
+
+    whole = json.loads(inventory.club_response())
+    assert whole["total"] > 0
+
+    # `total` describes the list the client is paging, so paging the whole way
+    # through has to arrive at exactly that many rows. Asserting against the
+    # raw item count would be wrong: consumables stack before they are shown,
+    # and the client pages the stacked list.
+    rows, start = 0, 0
+    while True:
+        page = json.loads(
+            inventory.club_response({"count": "25", "start": str(start)})
+        )
+        got = len(page["itemData"])
+        if not got:
+            break
+        rows += got
+        start += got
+        assert page["total"] == whole["total"], "the total moved between pages"
+    assert rows == whole["total"]
+
+    # A filter narrows the total to what it matched, not to the page.
+    players = json.loads(inventory.club_response({"type": "player", "count": "5"}))
+    assert 0 < players["total"] <= whole["total"]
+    assert len(players["itemData"]) <= 5
+    assert all(i.get("itemType") == "player" for i in players["itemData"])
+
+
+def test_a_duplicate_points_at_a_copy_the_console_is_holding() -> None:
+    # "MY CURRENT ITEM" drew `undefined` in every field. The pairing is two
+    # numbers -- the client is told which id repeats which -- and it then draws
+    # the owned card by looking that id up in its own memory. It holds the
+    # active squad, the pack, and whatever club pages somebody scrolled past;
+    # a card at position 176 of 987 was in none of them, so the panel had a
+    # number and no card behind it.
+    #
+    # The squad is the only part of the club the console is always holding:
+    # `/squad/active` is fetched every session and in full, where the club is
+    # paged eleven at a time and only as far as somebody scrolled.
+    import fut_inventory as inventory
+
+    def card(item_id):
+        return {"itemType": "player", "assetId": 100, "rarity": "Rare Gold",
+                "rating": 80, "teamid": 9, "id": item_id}
+
+    owned = [card(10), card(20), card(30)]
+    pending = [card(99)]
+
+    # Oldest id when nothing is known to be loaded -- unchanged behaviour.
+    assert inventory.pile_duplicate_pairs(list(pending), owned) == [
+        {"itemId": 99, "duplicateItemId": 10}
+    ]
+
+    # A copy in the squad wins, because it is one the client can actually draw.
+    assert inventory.pile_duplicate_pairs(list(pending), owned, {30}) == [
+        {"itemId": 99, "duplicateItemId": 30}
+    ]
+
+    # And it falls back rather than pointing at nothing.
+    assert inventory.pile_duplicate_pairs(list(pending), owned, {777}) == [
+        {"itemId": 99, "duplicateItemId": 10}
+    ]
+
+    # Stability: the same inputs give the same answer, so the marker does not
+    # move from one copy to another between two openings of the screen.
+    assert inventory.pile_duplicate_pairs(list(pending), owned, {30}) == \
+        inventory.pile_duplicate_pairs(list(pending), list(reversed(owned)), {30})
+
+
+def test_seasonid_and_divisionid_name_the_same_row_in_every_mode() -> None:
+    # A season played to round 2, with its record and its blob both present and
+    # correct, still came back as "are you sure you want to start this Single
+    # Player Season?" -- because `seasonId` selected a row whose `divisionId`
+    # was 10 while the user document said 9.
+    #
+    # Minus one was the "index into the client's own table of ten" reading,
+    # settled against the console on 21 August and answered no: the shield
+    # reads DIV 1 for 0, for 9 and for 10, so it never followed this member.
+    # What the member does is identify the record.
+    #
+    # Both modes are checked, because the two have disagreed before and the
+    # rule is the same for each.
+    import json
+    import os
+
+    import fut_inventory as inventory
+
+    saved = dict(inventory.SEASON_PROGRESS.entries)
+    try:
+        inventory.SEASON_PROGRESS.entries.clear()
+        inventory.SEASON_PROGRESS.apply(10, 10, {"round": 2, "data": "BLOB",
+                                                 "dataVersion": 1})
+        inventory.SEASON_PROGRESS.settle(10, 10, "WIN", 693)
+        for mode in ("native", "kyro-data"):
+            os.environ["FIFA14_SEASON_MODE"] = mode
+            try:
+                user = json.loads(inventory.season_user_response())
+                rows = json.loads(inventory.seasons_response())["seasons"]
+            finally:
+                os.environ.pop("FIFA14_SEASON_MODE", None)
+            picked = [r for r in rows if r["id"] == user["seasonId"]]
+            assert len(picked) == 1, f"{mode}: seasonId selects exactly one row"
+            assert picked[0]["divisionId"] == user["divisionId"], (
+                f"{mode}: the user document must name the division of the row "
+                f"it selects -- row says {picked[0]['divisionId']}, document "
+                f"says {user['divisionId']}"
+            )
+            # And the club's actual division, not an index into anything.
+            assert user["divisionId"] == 10
+            # A played season reports as played, whichever mode is serving.
+            assert user["round"] == 2, mode
+    finally:
+        inventory.SEASON_PROGRESS.entries.clear()
+        inventory.SEASON_PROGRESS.entries.update(saved)
+
+
+def test_a_manager_card_carries_only_members_this_binary_knows() -> None:
+    # Managers were never served at all: four club-item families and no staff,
+    # so the STAFF tab was empty and the squad's manager slot could not be
+    # filled. The catalogue is the game's own, through
+    # MarvelcoCode/Impulsum14's `FUTDB/managers.tsv`.
+    #
+    # The point of this test is the envelope rather than the count. That build
+    # sends `dream`, `marketDataMinPrice` and `marketDataMaxPrice` on every
+    # manager and **none of the three is a member of this console's CardsDLL**.
+    # An unknown member on a card is the shape that froze the match-award
+    # screen and the trade-offer screen in this project, so they stay out.
+    import os
+
+    import fut_inventory as inventory
+
+    catalogue = inventory.manager_catalogue()
+    assert len(catalogue) == 166
+    resources = [m["resourceId"] for m in catalogue]
+    assert len(set(resources)) == len(resources)
+
+    card = inventory._manager_item(catalogue[0], 1)
+    for banned in ("dream", "marketDataMinPrice", "marketDataMaxPrice"):
+        assert banned not in card, banned
+
+    # A manager's art is addressed by its own resource, the way a stadium's is,
+    # rather than by a family asset the way a kit's is.
+    assert card["assetId"] == card["resourceId"]
+    assert card["itemType"] == "manager"
+    assert card["cardsubtypeid"] == 4
+    # The quick-sell value comes from the same table every other card uses.
+    assert card["discardValue"] == inventory.club_discard_value(card["rating"], 1)
+
+    # Seeding is off unless asked for: managers belong in packs, and this exists
+    # only to find out whether the card draws at all.
+    os.environ.pop("FIFA14_SEED_MANAGERS", None)
+    assert inventory.seed_managers() == []
+    os.environ["FIFA14_SEED_MANAGERS"] = "1"
+    try:
+        seeded = inventory.seed_managers()
+    finally:
+        os.environ.pop("FIFA14_SEED_MANAGERS", None)
+    assert len(seeded) == len(catalogue)
+    # Ids are derived from the resource, not counted out, so a manager keeps
+    # its id in a save written last week -- the rule the club-item blocks exist
+    # for. And they sit clear of those blocks.
+    assert len({c["id"] for c in seeded}) == len(seeded)
+    assert all(c["id"] >= inventory.MANAGER_ID_BASE for c in seeded)
+
+
+def test_staff_cards_carry_their_family_and_fill_their_own_counters() -> None:
+    # Four families the game has and this server never served: head coaches,
+    # goalkeeping coaches, fitness coaches and physios. All four `itemType`
+    # values are in CardsDLL, and so are the four counters they report under --
+    # `staffHeadCoach`, `staffGKCoach`, `staffFitnessCoach`, `staffPhysio` --
+    # which read zero for weeks because nothing carried them.
+    import os
+
+    import fut_inventory as inventory
+
+    catalogue = inventory.staff_catalogue()
+    assert len(catalogue) == 150
+    assert len({s["resourceId"] for s in catalogue}) == 150
+
+    card = inventory._staff_item(catalogue[0], 1)
+    # `attr` is in the source and is NOT a member of this binary, unlike
+    # `amount`, `posbonus` and `fieldpos` which all are. Same rule that kept
+    # `dream` off the manager card.
+    assert "attr" not in card
+    for member in ("amount", "posbonus", "fieldpos"):
+        assert member in card, member
+    # Art by the card's own resource, as for a manager or a stadium.
+    assert card["assetId"] == card["resourceId"]
+
+    os.environ.pop("FIFA14_SEED_STAFF", None)
+    assert inventory.seed_staff() == []
+    os.environ["FIFA14_SEED_STAFF"] = "1"
+    os.environ["FIFA14_SEED_MANAGERS"] = "1"
+    try:
+        club = inventory.ClubInventory()
+        document = json.loads(inventory.club_stats_response(club))
+        seeded = inventory.seed_staff()
+        managers = inventory.seed_managers()
+    finally:
+        os.environ.pop("FIFA14_SEED_STAFF", None)
+        os.environ.pop("FIFA14_SEED_MANAGERS", None)
+
+    # Ids sit in their own block and cannot collide with a manager's, which is
+    # the rule the club-item blocks exist for.
+    assert len({c["id"] for c in seeded}) == len(seeded)
+    assert not ({c["id"] for c in seeded} & {m["id"] for m in managers})
+    assert all(c["id"] >= inventory.STAFF_ID_BASE for c in seeded)
+
+    # Each family counts under its own name, and `staff` is their sum plus the
+    # managers -- not one lump.
+    assert document["staffHeadCoach"] == 36
+    assert document["staffGKCoach"] == 36
+    assert document["staffFitnessCoach"] == 36
+    assert document["staffPhysio"] == 42
+    assert document["staffManager"] == 166
+    assert document["staff"] == 36 + 36 + 36 + 42 + 166
+
+
+def test_managers_and_staff_come_out_of_packs_and_respect_their_tier() -> None:
+    # They were absent from packs because nothing served them at all -- the
+    # weight table said so in as many words: "Manager and staff are absent:
+    # they are not in CLUB_ITEM_KINDS, so there is nothing to weight." Seeded
+    # into a club on 25 August, all 316 rendered, so they belong in packs the
+    # way kits and badges do rather than being handed over in bulk.
+    import collections
+    import random
+
+    import fut_inventory as inventory
+
+    pool = inventory.pack_extras()
+    for family, expected in (
+        ("manager", 166), ("headCoach", 36), ("gkCoach", 36),
+        ("fitnessCoach", 36), ("physio", 42),
+    ):
+        cards = pool.get(("club", family)) or []
+        assert len(cards) == expected, family
+        # Tier from the card's own rating, not from a quality slot: the game's
+        # database rates every one of them, so a Bronze Pack cannot hand out an
+        # 88-rated manager.
+        for card in cards:
+            assert card["_tier"] == inventory._extra_tier(card["rating"]), family
+            assert "id" not in card, family
+
+    # A bronze pack draws no gold staff, which is the whole point of the tier.
+    bronze = [
+        c for family in ("manager", "headCoach", "gkCoach", "fitnessCoach", "physio")
+        for c in (pool.get(("club", family)) or [])
+        if c["_tier"] == "bronze"
+    ]
+    assert bronze
+    assert all(c["rating"] < 65 for c in bronze)
+
+    # And they actually come out, without swamping the cosmetic families.
+    drawn = collections.Counter()
+    for seed in range(60):
+        _, shop, _ = _actions()
+        for item in json.loads(
+            shop.open_pack(GOLD_PACK_ID, random.Random(seed))
+        )["itemList"]:
+            drawn[item.get("itemType")] += 1
+    total = sum(drawn.values())
+    staff = sum(
+        drawn[k] for k in ("manager", "headCoach", "gkCoach", "fitnessCoach", "physio")
+    )
+    assert staff > 0, drawn
+    # Below the collection families: there are 1327 kits against 166 managers,
+    # and drawing them evenly would bury the kits nobody has yet.
+    assert staff / total < 0.15, drawn
+
+
+def test_a_renamed_club_keeps_its_name_across_a_restart() -> None:
+    # `_open` restored the saved name and then overwrote it with
+    # CLUB_NAME_DEFAULT on the very next line, so every club came back called
+    # "Fondateur FUT" however it had been renamed.
+    #
+    # The abbreviation is what gave it away. `PUT /user/club` carries both,
+    # `adopt` took both, the save held both -- and a club renamed to
+    # "Classic XI"/"CXI" on 25 August came back "Fondateur FUT"/"CXI". Only
+    # the half that line writes reverted.
+    from fut_inventory import CLUB_NAME_DEFAULT, ClubIdentity
+
+    identity = ClubIdentity()
+    identity.restore({"name": "Classic XI", "abbr": "CXI"})
+    assert identity.name == "Classic XI"
+
+    # The default only fills a name in, it never replaces one.
+    if not identity.name:
+        identity.name = CLUB_NAME_DEFAULT
+    assert identity.name == "Classic XI"
+
+    # A save with no name still gets one, which is what that line is for:
+    # saying nothing tells the client no club exists.
+    blank = ClubIdentity()
+    blank.restore({"name": "", "abbr": "FUT"})
+    if not blank.name:
+        blank.name = CLUB_NAME_DEFAULT
+    assert blank.name == CLUB_NAME_DEFAULT
+
+
+def test_the_user_document_carries_the_currencies_array_the_header_binds_to() -> None:
+    """Settled on the console 25 August 2026: with this array on `/user`, the
+    balance is on the club header at login, before any navigation.
+
+    It had read zero there since the project began. Seven routes were swept
+    across both shapes and every one was fed by `with_balance`; `/user` builds
+    its own document, so the sweep never reached the one route that is fetched
+    twice in the fan-out, is demonstrably parsed, and carries the club name,
+    the badge and the record.
+    """
+    from fut_inventory import Wallet
+
+    document = json.loads(Wallet(5_621_119).user_info("Mosebeest FC", "MOS", 1))
+
+    # Lower case. "COINS" -- which the PC reference's fixture uses -- matches
+    # nothing, so the balance is never written.
+    assert document["currencies"] == [
+        {"name": "coins", "funds": 5_621_119, "finalFunds": 5_621_119},
+        {"name": "points", "funds": 0, "finalFunds": 0},
+    ]
+    # Beside the flat members, not instead of them. Wrapping this document is
+    # what made the header print 0xCDCDCDCD.
+    for member in ("credits", "coins", "totalCredits", "funds", "finalFunds"):
+        assert document[member] == 5_621_119, member
+    assert document["clubName"] == "Mosebeest FC"
+
+
+def test_a_cup_backed_out_of_before_a_match_is_not_offered_for_resume() -> None:
+    # Both cups saved on 25 August sat at round one with progressData
+    # "AAAAAA==" -- four zero bytes, the length header of an empty payload.
+    # That is a cup opened, its bracket drawn, and walked out of before a ball
+    # was kicked.
+    #
+    # Handing that back freezes the title. It froze twice on it, the second
+    # time on a reply byte for byte identical to what the client itself had
+    # PUT, so the document was never the problem: the client cannot resume a
+    # run with no first match in it.
+    import os
+
+    from fut_inventory import (
+        TOURNAMENT_PROGRESS,
+        TournamentProgress,
+        active_tournaments_response,
+        tournaments_response,
+    )
+
+    progress = TournamentProgress()
+    progress.apply(3, {"round": 1, "progressData": "AAAAAA=="})
+    assert progress.unplayed(progress.entries[3])
+    assert progress.active_ids() == []
+
+    # One match played and it is a real run, which is what the screen should
+    # call underway.
+    progress.apply(3, {"round": 2, "progressData": "AAAAAA=="})
+    assert not progress.unplayed(progress.entries[3])
+    assert progress.active_ids() == [3]
+
+    # The tile can still say "joined" without the resume being offered -- the
+    # two travel different routes. Off by default: `lock` is the field that
+    # says why a cup cannot be entered, so JOINED may refuse entry instead of
+    # labelling it.
+    previous = os.environ.pop("FIFA14_CUP_JOINED", None)
+    saved_entries = dict(TOURNAMENT_PROGRESS.entries)
+    try:
+        TOURNAMENT_PROGRESS.entries.clear()
+        TOURNAMENT_PROGRESS.apply(3, {"round": 1, "progressData": "AAAAAA=="})
+
+        off = json.loads(tournaments_response())["tournament"]
+        assert {entry["lock"] for entry in off} == {"UNLOCKED"}
+
+        os.environ["FIFA14_CUP_JOINED"] = "1"
+        on = {e["id"]: e["lock"] for e in json.loads(tournaments_response())["tournament"]}
+        assert on[3] == "JOINED"
+        assert on[1] == "UNLOCKED"
+
+        # And the resume list is untouched either way -- that is the half that
+        # freezes.
+        assert json.loads(active_tournaments_response())["tournamentId"] == []
+    finally:
+        os.environ.pop("FIFA14_CUP_JOINED", None)
+        if previous is not None:
+            os.environ["FIFA14_CUP_JOINED"] = previous
+        TOURNAMENT_PROGRESS.entries.clear()
+        TOURNAMENT_PROGRESS.entries.update(saved_entries)
+
+
+def test_a_won_cup_counts_a_trophy_and_the_count_survives_a_restart() -> None:
+    # `trophyUserCount` went out as a flat 0 forever, and the later cups are
+    # gated on it: one trophy for the Quad-League Classic, ten for the
+    # Ultimate Cup. Nothing counted them until 25 August.
+    from fut_inventory import TournamentProgress
+
+    progress = TournamentProgress()
+    assert progress.trophies == 0
+
+    # Winning a round is not winning the cup.
+    progress.apply(1, {"round": 1})
+    progress.advance(1, "WIN")
+    assert progress.trophies == 0
+
+    # The fourth win is.
+    progress.apply(1, {"round": 4})
+    progress.advance(1, "WIN")
+    assert progress.trophies == 1
+
+    # Losing one does not take it away.
+    progress.apply(2, {"round": 2})
+    progress.advance(2, "LOSS")
+    assert progress.trophies == 1
+
+    # It rides in the save under a name no cup id can collide with.
+    restored = TournamentProgress()
+    restored.restore(json.loads(json.dumps(progress.state())))
+    assert restored.trophies == 1
+
+
+def test_the_cup_unlocks_are_off_until_the_count_means_something() -> None:
+    # The retail unlock counts reached this file twice, from sources that had
+    # not seen each other -- Impulsum's table and the player's own list of
+    # retail requirements -- and all fourteen agree.
+    #
+    # Enforcing them is still off by default. The counter only started counting
+    # on 25 August, so every cup won before that is uncounted, and gating on a
+    # zero would lock eleven cups that are playable today.
+    import os
+
+    from fut_inventory import TOURNAMENT_PROGRESS, tournaments_response
+
+    previous = os.environ.pop("FIFA14_CUP_UNLOCKS", None)
+    held = TOURNAMENT_PROGRESS.trophies
+    try:
+        TOURNAMENT_PROGRESS.trophies = 0
+        off = json.loads(tournaments_response())["tournament"]
+        assert {entry["lock"] for entry in off} == {"UNLOCKED"}
+        # The label is retail's number whether or not the gate is on. Tying
+        # the two together made every tile read "Unlock: 0 Trophies", which is
+        # what the console showed on 26 August. `lock` decides entry; this is
+        # only what the tile prints.
+        by_id = {entry["id"]: entry["unlockreq"] for entry in off}
+        assert by_id[1] == 0
+        assert by_id[4] == 1
+        assert by_id[14] == 10
+
+        os.environ["FIFA14_CUP_UNLOCKS"] = "1"
+        locked = {
+            entry["id"]
+            for entry in json.loads(tournaments_response())["tournament"]
+            if entry["lock"] == "LOCKED_TROPHIES"
+        }
+        # The first three ask for nothing; the other eleven all ask for at
+        # least one trophy.
+        assert locked == set(range(4, 15))
+
+        TOURNAMENT_PROGRESS.trophies = 2
+        still = {
+            entry["id"]
+            for entry in json.loads(tournaments_response())["tournament"]
+            if entry["lock"] == "LOCKED_TROPHIES"
+        }
+        # Two trophies opens everything asking for one or two.
+        assert still == {9, 10, 11, 12, 13, 14}
+
+        TOURNAMENT_PROGRESS.trophies = 10
+        opened = json.loads(tournaments_response())["tournament"]
+        assert {entry["lock"] for entry in opened} == {"UNLOCKED"}
+        assert opened[0]["trophyUserCount"] == 10
+    finally:
+        os.environ.pop("FIFA14_CUP_UNLOCKS", None)
+        if previous is not None:
+            os.environ["FIFA14_CUP_UNLOCKS"] = previous
+        TOURNAMENT_PROGRESS.trophies = held
+
+
+def test_the_eligibility_probe_reads_one_key_per_cup() -> None:
+    # CardsDLL carries `ELIGIBILITY_STRING%d` beside the elgReq vocabulary --
+    # the same shape as `TOURNY_LOC_%d`, which is how a cup's name is drawn. So
+    # a requirement's text comes from a number, and nothing here knows which
+    # number means which requirement.
+    #
+    # Guessing would put the wrong requirement on the wrong cup, which is the
+    # mistake the invented tournament ids made. This reads them instead.
+    import os
+
+    from fut_inventory import TOURNAMENT_REQUIREMENTS, tournaments_response
+
+    previous = os.environ.pop("FIFA14_ELIGIBILITY_PROBE", None)
+    try:
+        # Nothing goes out until the keys are known. A cup with no stated
+        # requirement is enterable, which is what all fourteen are.
+        quiet = json.loads(tournaments_response())["tournament"]
+        assert all(entry["elgReq"] == [] for entry in quiet)
+
+        os.environ["FIFA14_ELIGIBILITY_PROBE"] = "1"
+        fine = json.loads(tournaments_response())["tournament"]
+        assert [e["elgReq"][0]["eligibilityKey"] for e in fine] == list(range(1, 15))
+        # A value every squad passes, so the probe reads the requirement's
+        # name without locking the cup behind it.
+        assert fine[0]["elgReq"][0]["eligibilityValue"] == 0
+
+        os.environ["FIFA14_ELIGIBILITY_PROBE"] = "1:10"
+        coarse = json.loads(tournaments_response())["tournament"]
+        assert [e["elgReq"][0]["eligibilityKey"] for e in coarse][:3] == [1, 11, 21]
+    finally:
+        os.environ.pop("FIFA14_ELIGIBILITY_PROBE", None)
+        if previous is not None:
+            os.environ["FIFA14_ELIGIBILITY_PROBE"] = previous
+
+    # The eleven cups retail gates, recorded in plain terms against the day the
+    # wire values are known.
+    assert sorted(TOURNAMENT_REQUIREMENTS) == list(range(4, 15))
+    assert ("chemistry", "exact", 100, "xi") in TOURNAMENT_REQUIREMENTS[14]
+
+
+def test_the_team_of_the_week_is_week_one_by_default() -> None:
+    # TOTW 1 went out on 18 September 2013 and one followed every Wednesday.
+    # Week 1 is the default deliberately, for testing: the console's clock is
+    # not this season's, and a real schedule would have to decide what "now"
+    # means on a title whose season ended in 2014.
+    import os
+
+    from fut_inventory import (
+        totw_active_week,
+        totw_index,
+        totw_squads,
+        totw_week,
+    )
+
+    previous = os.environ.pop("FIFA14_TOTW_WEEK", None)
+    try:
+        weeks = totw_squads()
+        assert len(weeks) == 49
+        assert [int(w["week"]) for w in weeks] == list(range(1, 50))
+
+        assert totw_active_week() == 1
+        first = totw_week()
+        assert first["name"] == "TOTW 1"
+        assert first["released"] == "2013-09-18"
+        assert first["formation"] == "f343"
+        assert len(first["slots"]) == 18
+
+        # Every week is a Wednesday, seven days apart.
+        from datetime import date
+
+        for entry in weeks:
+            released = date.fromisoformat(entry["released"])
+            assert released.weekday() == 2, entry["week"]
+            assert (released - date(2013, 9, 18)).days == 7 * (int(entry["week"]) - 1)
+
+        # The list offers all forty-nine and says which is showing.
+        index = json.loads(totw_index())
+        assert len(index["squad"]) == 49
+        assert index["activeSquadId"] == 1
+        assert index["squad"][0]["formation"] == "f343"
+        # A squad with no rating is not one the screen will offer.
+        assert all(entry["rating"] > 0 for entry in index["squad"])
+
+        os.environ["FIFA14_TOTW_WEEK"] = "7"
+        assert totw_active_week() == 7
+        assert totw_week()["name"] == "TOTW 7"
+
+        # An unknown week falls back rather than serving an empty side.
+        os.environ["FIFA14_TOTW_WEEK"] = "999"
+        assert totw_active_week() == 1
+    finally:
+        os.environ.pop("FIFA14_TOTW_WEEK", None)
+        if previous is not None:
+            os.environ["FIFA14_TOTW_WEEK"] = previous
+
+
+def test_the_eligibility_probe_publishes_numbered_strings() -> None:
+    # Measured on the console 26 August: a cup served `eligibilityKey` 4 drew
+    # `*LOC_TOURN_ELG_KEY_16` in its Entry Requirements panel. The leading `*`
+    # is an unresolved localisation key -- the mark the cup names carried
+    # before this server answered them -- so the disc has no text for these.
+    #
+    # One reading is not a mapping: key 4 produced index 16, and a single point
+    # fits any number of formulas. The strings go out numbered so one pass
+    # along the fourteen tiles reads the relation off the screen.
+    import os
+    import re
+
+    from fut_inventory import store_pack_descriptions
+
+    previous = os.environ.pop("FIFA14_ELIGIBILITY_PROBE", None)
+    try:
+        quiet = store_pack_descriptions().decode()
+        assert "LOC_TOURN_ELG_KEY_" not in quiet
+        # The cup names are in this document either way.
+        assert 'TOURNY_LOC_1"' in quiet
+
+        os.environ["FIFA14_ELIGIBILITY_PROBE"] = "1"
+        loud = store_pack_descriptions().decode()
+        assert len(re.findall("LOC_TOURN_ELG_KEY_", loud)) == 256
+        assert len(re.findall("LOC_TOURN_ELG_SCOPE_", loud)) == 16
+        # Each string names its own index, so the screen reads back the number
+        # the client asked for.
+        assert re.search(
+            r'resname="LOC_TOURN_ELG_KEY_16"><source>KEY 16<', loud
+        )
+        assert 'TOURNY_LOC_1"' in loud
+    finally:
+        os.environ.pop("FIFA14_ELIGIBILITY_PROBE", None)
+        if previous is not None:
+            os.environ["FIFA14_ELIGIBILITY_PROBE"] = previous
+
+
+def test_the_team_of_the_week_reaches_the_play_tile() -> None:
+    # The PLAY screen's Team of the Week tile was an empty pitch: no cards and
+    # no "Active Challenge" line. `/hub` is fetched 499 times across these
+    # journals and carried no squad at all.
+    #
+    # Built on this server's own squad document rather than copied. Four of the
+    # members the PC build sends are not in CardsDLL's table -- loyaltyBonus,
+    # dreamSquad, squadType, newSquad -- and a member this binary does not
+    # carry is what froze the match-award and trade-offer screens.
+    from fut_inventory import (
+        CardCatalogue,
+        ClubInventory,
+        hub_response,
+        totw_hub_squad,
+        totw_week,
+    )
+
+    catalogue = CardCatalogue()
+    squad = totw_hub_squad(catalogue)
+
+    assert squad["squadName"] == "TOTW 1"
+    assert squad["formation"] == "f343"
+    assert squad["rating"] == totw_week()["rating"]
+    assert len(squad["players"]) == 18
+    # The eleven wear shirt numbers; the bench does not, as retail does.
+    assert [p["kitNumber"] for p in squad["players"][:11]] == list(range(1, 12))
+    assert all(p["kitNumber"] == 0 for p in squad["players"][11:])
+
+    # The tile leads with the best card in the week.
+    ratings = [p["itemData"]["rating"] for p in squad["players"]]
+    captain = next(
+        p["itemData"] for p in squad["players"] if p["itemData"]["id"] == squad["captain"]
+    )
+    assert captain["rating"] == max(ratings)
+    assert [k["id"] for k in squad["kicktakers"]] == [squad["captain"]] * 5
+
+    # Nothing the binary does not carry.
+    for absent in ("loyaltyBonus", "dreamSquad", "squadType", "newSquad"):
+        assert absent not in squad
+
+    # And it rides on /hub, which is one of the three routes measured to
+    # tolerate an unrecognised sibling.
+    hub = json.loads(hub_response(ClubInventory(), 10, 1, 2, totw=squad))
+    assert hub["squad"]["squadName"] == "TOTW 1"
+    # Without one the member is simply absent rather than empty.
+    assert "squad" not in json.loads(hub_response(ClubInventory(), 10, 1, 2))
+
+
+def test_the_probe_offsets_the_tournament_level_key() -> None:
+    # Measured 26 August: with keys 1-14 on the fourteen cups, every tile drew
+    # *LOC_TOURN_ELG_KEY_16. The same index on all fourteen, so the index is
+    # not derived from the key -- 16 is a constant the client reached on its
+    # own, and the first reading was a coincidence of the selected tile.
+    #
+    # Either the client is not parsing these entries, or the requirement is not
+    # read from `elgReq` at all: eligibilityKey/Value/Slot are single members
+    # in CardsDLL's table and may belong to the tournament, with
+    # LOC_TOURN_ELG_DOMAIN_LIST_%d suggesting elgReq is a list of domains for
+    # one requirement rather than a list of requirements.
+    #
+    # The probe writes the key in both places, offset, so the drawn index names
+    # which one was read.
+    import os
+
+    from fut_inventory import ELG_TOP_LEVEL_OFFSET, tournaments_response
+
+    previous = os.environ.pop("FIFA14_ELIGIBILITY_PROBE", None)
+    try:
+        quiet = json.loads(tournaments_response())["tournament"]
+        assert all("eligibilityKey" not in entry for entry in quiet)
+        assert all(entry["elgReq"] == [] for entry in quiet)
+
+        os.environ["FIFA14_ELIGIBILITY_PROBE"] = "1"
+        loud = json.loads(tournaments_response())["tournament"]
+        for entry in loud:
+            inner = entry["elgReq"][0]["eligibilityKey"]
+            assert inner == entry["id"]
+            assert entry["eligibilityKey"] == inner + ELG_TOP_LEVEL_OFFSET
+    finally:
+        os.environ.pop("FIFA14_ELIGIBILITY_PROBE", None)
+        if previous is not None:
+            os.environ["FIFA14_ELIGIBILITY_PROBE"] = previous
+
+
+def test_the_totw_clientdata_route_answers_an_entries_document() -> None:
+    # `/clientdata/totw` is a clientdata route and its siblings all answer an
+    # entries document -- `clientdata/pileSize` is
+    # {"entries":[{"key":2,"value":20000},...]} here and works.
+    #
+    # This server answered it with the 27 kB squad index instead, and the
+    # screen said "there is no Team of the Week available at the moment" over a
+    # tile that was drawing the side correctly. Pressing A fired **no request
+    # at all**: the document is fetched once at login and the refusal is
+    # decided from it, so what the screen was missing was already in that
+    # reply.
+    from fut_inventory import (
+        CardCatalogue,
+        totw_challenge_entries,
+        totw_challenge_response,
+    )
+
+    document = json.loads(totw_challenge_entries())
+    assert [e["key"] for e in document["entries"]] == list(range(1, 15))
+
+    # Keys 7, 8 and 9 are the challenge's name, packed little-endian, four
+    # characters to an integer. Impulsum's decode to "TOTS LA LIGA" with its
+    # key 6 at 12 -- that name's length -- and this server was sending those
+    # three integers verbatim, so the entries announced a Team of the Season La
+    # Liga squad while the tile drew TOTW 1.
+    import struct
+
+    pairs = {entry["key"]: entry["value"] for entry in document["entries"]}
+    packed = b"".join(struct.pack("<i", pairs[key]) for key in (7, 8, 9))
+    assert packed.decode().rstrip() == "TOTW 1"
+    # Key 6 is the **padded** width, not the name's own length. The two have to
+    # agree or everything after them moves: a client reading six characters
+    # consumes two integers and takes key 9 -- four spaces -- as the first
+    # value of the tail. Sending the real length is what moved the refusal
+    # backwards from "no Team of the Week to play" to "available at the
+    # moment".
+    assert pairs[6] == 12
+    assert len(packed) == 12
+    # Every key but the name matches the working build exactly.
+    impulsum = {1: 3, 2: 1, 3: 2147483647, 4: -2, 5: 1, 6: 12,
+                10: 1, 11: 3, 12: 0, 13: 1, 14: 0}
+    for key, value in impulsum.items():
+        assert pairs[key] == value, key
+
+    # Entries alone, which is measured. Three documents were served here and
+    # the refusal names which got furthest: the squad index gave "no Team of
+    # the Week available at the moment", the entries alone gave "no Team of the
+    # Week to play", and entries plus squad went back to the first. The middle
+    # one is past a check the other two fail.
+    assert sorted(document) == ["entries"]
+    assert len(totw_challenge_entries()) < 1000
+
+    # And the challenge route carries the side. `squadChallenge` is an object
+    # wrapping the squad, not the list of descriptors this server used to send
+    # -- that list was invented, and its own comment said so.
+    challenge = json.loads(totw_challenge_response(CardCatalogue()))
+    assert challenge["matchDifficulty"] == 2
+    assert challenge["grantsGameModePrizes"] is True
+    assert isinstance(challenge["squadChallenge"], dict)
+    assert challenge["squadChallenge"]["squad"]["squadName"] == "TOTW 1"
+    assert len(challenge["squad"]["players"]) == 18
+
+
+def test_keys_three_and_four_are_the_totw_clubs_persona() -> None:
+    # Impulsum sends 2147483647 and -2 for keys 3 and 4. Read as one
+    # little-endian 64-bit value, low word first, they are
+    #
+    #     0xFFFFFFFE | 0x7FFFFFFF << 32  ==  9223372036854775806
+    #
+    # which is exactly the persona its Totw.PersonaId() defaults to. The record
+    # carries the id of the club that owns the challenge, and the client then
+    # asks /user/list for it -- that club's squad list is what the challenge
+    # select screen enumerates as "WEEK 41/49 ... WEEK 49/49".
+    import struct
+
+    from fut_inventory import (
+        TOTW_PERSONA_ID,
+        CardCatalogue,
+        totw_challenge_entries,
+        totw_club_info,
+        totw_hub_squad,
+        totw_squads,
+    )
+
+    pairs = {e["key"]: e["value"] for e in json.loads(totw_challenge_entries())["entries"]}
+    rebuilt = struct.unpack(
+        "<q", struct.pack("<i", pairs[4]) + struct.pack("<i", pairs[3])
+    )[0]
+    assert rebuilt == TOTW_PERSONA_ID
+    # Still the values the working build sends, now derived rather than copied
+    # so the three cannot drift apart.
+    assert pairs[3] == 2147483647
+    assert pairs[4] == -2
+
+    # The squad belongs to that club, and that club has one squad per week.
+    assert totw_hub_squad(CardCatalogue())["personaId"] == TOTW_PERSONA_ID
+    club = json.loads(totw_club_info())["user"][0]
+    assert club["personaId"] == TOTW_PERSONA_ID
+    assert len(club["squadList"]["squad"]) == len(totw_squads()) == 49
+
+
+def test_a_totw_week_can_be_fetched_by_its_own_club() -> None:
+    # GET /ut/game/fifa14/squad/<week>/user/<totw persona> -- what
+    # RequestSquadsLineup and GetSquadsLineup in the ION binding table fetch
+    # once the client knows the club exists.
+    from fut_inventory import CardCatalogue, totw_hub_squad
+
+    catalogue = CardCatalogue()
+    for week, formation, rating in ((1, "f343", 81), (4, "f433", 80), (49, "f3412", 83)):
+        squad = totw_hub_squad(catalogue, week)
+        assert squad["squadName"] == f"TOTW {week}"
+        assert squad["formation"] == formation
+        assert squad["rating"] == rating
+        assert len(squad["players"]) == 18
+
+    # Week 4 at f433 rating 80 is what the working build's own screenshot
+    # shows for TOTW 4 -- two extracts and a screen agreeing on the same team.
+    assert totw_hub_squad(catalogue, 4)["rating"] == 80
+
+    # No week asked for is the active one.
+    assert totw_hub_squad(catalogue)["squadName"] == "TOTW 1"
+
+
+def test_the_manager_the_player_picks_stays_in_the_slot() -> None:
+    # Reported from the console on 26 August: a manager put in the slot was
+    # gone on the next launch.
+    #
+    # The console had been sending it all along -- every squad PUT carries
+    # `"manager":[{"id":N}]`, and an assignment on 25 August arrived as id
+    # 1950009476 -- and this server read the players, the name and the
+    # formation out of that body and ignored the manager. So the slot filled on
+    # screen and the save was written without it.
+    import os
+    import tempfile
+
+    previous = os.environ.get("FIFA14_SEED_MANAGERS")
+    os.environ["FIFA14_SEED_MANAGERS"] = "1"
+    try:
+        import importlib
+
+        import fut_inventory as inventory
+
+        importlib.reload(inventory)
+        club = inventory.ClubInventory()
+        managers = [i for i in club.items if i.get("itemType") == "manager"]
+        assert managers
+        chosen = managers[0]["id"]
+        eleven = [item["id"] for item in club.squad[:11]]
+
+        club.save_squad(1, eleven, manager=chosen)
+        assert club._squads()[1]["manager"] == chosen
+        document = json.loads(club.squad_document(1, "Mosebeest FC"))
+        assert [m["id"] for m in document["manager"]] == [chosen]
+        # The active-squad document agrees; the two used to disagree about
+        # everything the squad store held.
+        active = json.loads(club.active_squad_response("Mosebeest FC"))
+        assert [m["id"] for m in active["manager"]] == [chosen]
+
+        # A PUT that does not mention a manager leaves the stored one alone.
+        club.save_squad(1, eleven)
+        assert club._squads()[1]["manager"] == chosen
+
+        # A zero is the player clearing the slot, not "unset".
+        club.save_squad(1, eleven, manager=0)
+        assert club._squads()[1]["manager"] == 0
+        assert json.loads(club.squad_document(1, "x"))["manager"] == []
+
+        # And it survives a restart: the squad store is saved whole, so the
+        # manager rides with it.
+        club.save_squad(1, eleven, manager=chosen)
+        saved = {str(k): v for k, v in club._squads().items()}
+        fresh = inventory.ClubInventory()
+        squads = fresh._squads()
+        squads.clear()
+        for key, value in saved.items():
+            squads[int(key)] = value
+        reloaded = json.loads(fresh.squad_document(1, "Mosebeest FC"))
+        assert [m["id"] for m in reloaded["manager"]] == [chosen]
+
+        # A manager the club no longer holds resolves to nothing rather than
+        # to a stale entry.
+        club.save_squad(1, eleven, manager=999_999_999)
+        assert json.loads(club.squad_document(1, "x"))["manager"] == []
+    finally:
+        os.environ.pop("FIFA14_SEED_MANAGERS", None)
+        if previous is not None:
+            os.environ["FIFA14_SEED_MANAGERS"] = previous
+        import importlib
+
+        import fut_inventory as inventory
+
+        importlib.reload(inventory)
+
+
+def test_the_totw_card_carries_its_own_position_not_the_formation_slot() -> None:
+    # Reported off the console for TOTW 4: the two centre-backs drew blank,
+    # Cabella had no position, Totti read CM and James Rodriguez had none.
+    #
+    # `totw_teams.tsv`'s `pos` column is the **formation slot** -- RCB, LCB,
+    # RCM, RW -- and this server served it as `preferredPosition`. RCB is not
+    # a position the client knows, which is exactly a blank card.
+    #
+    # `specials.tsv` carries each in-form's real position, its own six face
+    # stats and its own art band, and it matches 882 of 882 slots across all
+    # 49 weeks. It also settles the two the base card gets wrong: Totti's TOTW
+    # 4 card is a CF where his base card is an LW, and James Rodriguez's is an
+    # RM where his base is a CAM.
+    from fut_inventory import CardCatalogue, _totw_slots, totw_response, totw_week
+
+    week = totw_week(4)
+    slots = {slot["order"]: slot for slot in _totw_slots(week)}
+    document = json.loads(totw_response(CardCatalogue(), week=4))
+
+    wanted = {2: "CB", 3: "CB", 5: "RM", 6: "CF", 7: "CAM"}
+    for index, position in wanted.items():
+        assert document["itemData"][index]["preferredPosition"] == position, index
+
+    # The formation slot is kept beside it, and it is not what goes out.
+    assert slots[2]["slot"] == "RCB"
+    assert slots[5]["slot"] == "RCM"
+    assert slots[2]["position"] == "CB"
+
+    # No slot ships a formation-only label as a position.
+    for entry in _totw_slots(week):
+        assert entry["position"] not in ("RCB", "LCB", "RCM", "LCM", "RW", "LW ")
+
+    # The in-form's own face stats, not the base card's.
+    totti = document["itemData"][6]
+    assert [a["value"] for a in totti["attributeList"]] == [53, 89, 90, 86, 49, 54]
+
+
+def test_every_totw_week_fields_a_full_eighteen() -> None:
+    # A slot whose base card is not in this catalogue was dropped, and five
+    # weeks came up short: week 10 fielded sixteen with no goalkeeper at all,
+    # because Andriy Pyatov's base card is not here.
+    #
+    # The in-form's position, rating and face stats are on the slot itself, so
+    # the card can be built without the base one. What the base card supplies
+    # is the club, nation and league -- a zero there renders a card without a
+    # crest, which beats a squad with a hole in it.
+    from fut_inventory import CardCatalogue, totw_response, totw_squads
+
+    catalogue = CardCatalogue()
+    for week in totw_squads():
+        document = json.loads(totw_response(catalogue, week=week["week"]))
+        assert len(document["itemData"]) == 18, week["week"]
+        # And no card loses its identity on the way.
+        assert all(card["assetId"] for card in document["itemData"]), week["week"]
+
+    keeper = json.loads(totw_response(catalogue, week=10))["itemData"][0]
+    assert keeper["assetId"] == 142902
+    assert keeper["preferredPosition"] == "GK"
+    assert keeper["rating"] == 78
+
+
+def test_every_totw_slot_resolves_to_one_of_this_servers_own_cards() -> None:
+    # `totw_teams.tsv`'s baseId is not always this catalogue's asset id. The
+    # player checked thirteen by hand against fifa14_cards.json -- Cuadrado is
+    # 193082 here where the extract says 188612, Seedorf 1256 against 1001,
+    # Coutinho 189242 against 213439 -- and the builder resolves the rest by
+    # name and rating against the in-forms.
+    from fut_inventory import _totw_slots, totw_squads, totw_week
+
+    for week in totw_squads():
+        for slot in _totw_slots(week):
+            assert slot.get("cardId"), (week["week"], slot["order"])
+            # Club, nation and league are resolved at build time, so a card
+            # never renders crestless.
+            assert slot["clubId"], (week["week"], slot["order"])
+            assert slot["nationId"], (week["week"], slot["order"])
+
+    # The thirteen the player gave, by the file's own cardId.
+    given = {
+        (3, 16): (2392, 11858), (4, 15): (213432, 11876),
+        (5, 2): (175092, 11879), (7, 1): (139997, 11914),
+        (7, 10): (193082, 11923), (10, 0): (142902, 12153),
+        (10, 7): (1256, 12160), (25, 6): (193130, 13370),
+        (31, 6): (189242, 13881), (33, 7): (193082, 13994),
+        (35, 10): (189963, 14090), (37, 8): (7743, 14245),
+        (38, 2): (107715, 15303),
+    }
+    for (week, index), (asset, card_id) in given.items():
+        slot = next(s for s in _totw_slots(totw_week(week)) if s["order"] == index)
+        assert slot["assetId"] == asset, (week, index)
+        assert slot["cardId"] == card_id, (week, index)
+
+
+def test_a_league_modifier_applies_to_a_manager() -> None:
+    # Reported off the console on 26 August: applying a manager league
+    # modifier came back "this card can only be applied to a player".
+    #
+    #     POST /ut/game/fifa14/item/resource/5003123
+    #     {"apply":[{"id":1950009502}]}
+    #     -> refused: this card can only be applied to a player
+    #
+    # 1950009502 is David Moyes, pulled from a pack. The dispatcher required a
+    # player for everything except a contract, so the one card in the game
+    # whose whole purpose is to change a manager could never be applied to one.
+    #
+    # A manager card carries `leagueId` and `leagueid`, which is how it gives
+    # chemistry to players from that league, and the modifier's `amount` is the
+    # league it names -- 13 the Premier League, 16 Ligue 1, 53 La Liga.
+    import os
+    import tempfile
+
+    previous = os.environ.get("FIFA14_SEED_MANAGERS")
+    saved = os.environ.get("FIFA14_CLUB_SAVE")
+    os.environ["FIFA14_SEED_MANAGERS"] = "1"
+    os.environ["FIFA14_CLUB_SAVE"] = tempfile.mktemp(suffix=".json")
+    try:
+        import importlib
+
+        import fut_inventory as inventory
+
+        importlib.reload(inventory)
+        club = inventory.ClubInventory()
+        rack = inventory.ConsumableRack(club)
+        manager = next(i for i in club.items if i.get("itemType") == "manager")
+        player = next(i for i in club.items if i.get("itemType") == "player")
+
+        card = next(
+            row for row in inventory._consumable_catalogue()
+            if row.get("cardsubtypeid") == 304
+        )
+        assert card["amount"] == 13  # England Premier League
+
+        before = manager["leagueId"]
+        result = rack.apply(card["definitionId"], [manager["id"]])
+        assert result["effect"] == "league 13"
+        # Both spellings, because the card carries both.
+        assert manager["leagueId"] == 13
+        assert manager["leagueid"] == 13
+        assert before != 13
+
+        # And it is still refused on a player, with a message that says why.
+        other = next(
+            row for row in inventory._consumable_catalogue()
+            if row.get("cardsubtypeid") == 305
+        )
+        try:
+            rack.apply(other["definitionId"], [player["id"]])
+        except inventory.ConsumableRefused as refused:
+            assert "manager" in str(refused)
+        else:
+            raise AssertionError("a league modifier should refuse a player")
+    finally:
+        for key, value in (("FIFA14_SEED_MANAGERS", previous),
+                           ("FIFA14_CLUB_SAVE", saved)):
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+        import importlib
+
+        import fut_inventory as inventory
+
+        importlib.reload(inventory)
+
+
+def test_the_formation_counter_stops_advertising_cards_that_are_held_out() -> None:
+    # The formation tab announced twenty and had nothing behind it: the
+    # modifiers are subtypes 121-136 on art 35, art 35 draws NOT FOUND, and
+    # they are in both UNDRAWN_CONSUMABLE_TYPES and UNSEEDED_CONSUMABLE_TYPES
+    # because of it. So the counter borrowed the position family's count for a
+    # family this server serves none of -- which is exactly what the
+    # manager-league tab was doing when it said sixty-nine.
+    from fut_inventory import (
+        CONSUMABLE_FALLBACKS,
+        UNDRAWN_CONSUMABLE_TYPES,
+        UNSEEDED_CONSUMABLE_TYPES,
+        ClubInventory,
+        _club_extras,
+        consumable_family,
+        consumable_stats_response,
+    )
+
+    assert "consumablesFormationManager" not in CONSUMABLE_FALLBACKS
+    assert "formationManager" in UNDRAWN_CONSUMABLE_TYPES
+    assert "formationManager" in UNSEEDED_CONSUMABLE_TYPES
+
+    seeded = [i for i in _club_extras()
+              if consumable_family(i) == "formationManager"]
+    assert seeded == []
+
+    inventory = ClubInventory()
+    inventory.items = _club_extras()
+    document = json.loads(consumable_stats_response(inventory))
+    assert document.get("consumablesFormationManager", 0) == 0
+
+
+def test_only_the_players_who_took_the_pitch_pay_a_contract() -> None:
+    # Reported from the console 26 August: substitutes were losing contracts
+    # without ever coming on. The rule retail follows, in the player's words:
+    #
+    #     Starting XI                     -1
+    #     Sub who stays on the bench       0
+    #     Reserve who does not play        0
+    #     Substitute who comes on         -1
+    #     Player who starts and is subbed -1
+    #
+    # The `items` array is the whole eighteen, not the team sheet. A full
+    # capture from 25 August:
+    #
+    #     0-10  the eleven      fitness 90-97
+    #     11-17 the substitutes fitness 99 on every one
+    #
+    # so fitness is what separates them. Compared against the card's own
+    # fitness rather than against 99, so a player who starts a match already
+    # tired still counts as having played.
+    import fut_inventory as inventory
+
+    club = inventory.ClubInventory()
+    squad = [item for item in club.items if item.get("itemType") == "player"][:18]
+    for player in squad:
+        player["fitness"] = 99
+        player["contract"] = 7
+        player["gamesPlayed"] = 0
+    # The eleven who start come from the squad, so the squad has to say who
+    # they are. `club.items` is not in squad order.
+    club.save_squad(1, [p["id"] for p in squad])
+    club.set_active(1)
+
+    sheet = [{"id": p["id"], "fitness": 99 - 4} for p in squad[:11]]
+    # A substitute who comes on loses fitness like anyone else.
+    sheet.append({"id": squad[11]["id"], "fitness": 94})
+    # The rest never move.
+    sheet += [{"id": p["id"], "fitness": 99} for p in squad[12:]]
+
+    touched = inventory.apply_match_items(club, sheet)
+    assert touched["played"] == 12
+    assert touched["contracts"] == 12
+
+    for player in squad[:12]:
+        assert player["contract"] == 6, player["id"]
+        assert player["gamesPlayed"] == 1
+    for player in squad[12:]:
+        assert player["contract"] == 7, player["id"]
+        assert player["gamesPlayed"] == 0
+
+    # A goalkeeper who starts and keeps a clean sheet can come back at 99.
+    # He still played, because he is in the eleven -- this is the case that
+    # broke the first version of this rule, reported off a cup tie where the
+    # keeper's card recorded no appearance at all.
+    for player in squad[:11]:
+        player["fitness"] = 99
+        player["contract"] = 7
+        player["gamesPlayed"] = 0
+    keeper_sheet = [{"id": p["id"], "fitness": 99} for p in squad[:11]]
+    keeper_sheet += [{"id": p["id"], "fitness": 99} for p in squad[11:]]
+    again = inventory.apply_match_items(club, keeper_sheet)
+    assert again["played"] == 11
+    assert squad[0]["gamesPlayed"] == 1
+    assert squad[0]["contract"] == 6
+
+    # A goal counts as an appearance even if the fitness line says nothing.
+    scorer = squad[13]
+    inventory.apply_match_items(
+        club, [{"id": scorer["id"], "fitness": 99, "goals": 1}]
+    )
+    assert scorer["contract"] == 6
+    assert scorer["gamesPlayed"] == 1
+
+
+def test_team_fitness_restores_the_squad_that_is_actually_active() -> None:
+    # A team fitness card restored `inventory.squad`, the list built at load
+    # time and only ever rewritten for squad 1. A club with squad 2 active --
+    # "Classic XI", 22 players, on 26 August -- had the card spent on squad
+    # 1's eleven, so the side about to play got nothing.
+    import fut_inventory as inventory
+
+    club = inventory.ClubInventory()
+    players = [item for item in club.items if item.get("itemType") == "player"]
+    first, second = [p["id"] for p in players[:11]], [p["id"] for p in players[11:29]]
+
+    club.save_squad(1, first)
+    club.save_squad(2, second)
+    club.set_active(2)
+    for player in players:
+        player["fitness"] = 50
+
+    rack = inventory.ConsumableRack(club)
+    changed = rack._squad_fitness(30)
+
+    assert {c["id"] for c in changed} == set(second)
+    assert all(c["fitness"] == 80 for c in changed)
+    # And squad 1, which is not being fielded, is untouched.
+    by_id = {p["id"]: p for p in players}
+    assert all(by_id[i]["fitness"] == 50 for i in first)
+
+
+def test_managers_and_staff_repeat_the_way_club_items_do() -> None:
+    # Reported from the console 26 August: a second manager was neither marked
+    # in the pack nor offered for quick sell, while a second kit was.
+    #
+    # The four cosmetic families were in CLUB_ITEM_TYPES from the start. The
+    # manager and the four staff families were added on 25 August and nothing
+    # brought them in, so `_repeats` said no and they fell through to the
+    # player branch of `card_signature` -- which reads `rarity` and `rating`,
+    # neither of which tells two managers apart.
+    import fut_inventory as inventory
+
+    for kind in ("manager", "headCoach", "gkCoach", "fitnessCoach", "physio"):
+        item = {"itemType": kind, "resourceId": 1_000_597, "assetId": 1_000_597}
+        assert inventory._repeats(item), kind
+        # Keyed by the resource, like a kit: the manager's own database id.
+        assert inventory.card_signature(item) == ("club", kind, 1_000_597)
+
+    # Two of the same manager agree; two different ones do not.
+    moyes = {"itemType": "manager", "resourceId": 1_000_597, "assetId": 1_000_597}
+    again = {"itemType": "manager", "resourceId": 1_000_597, "assetId": 1_000_597}
+    rodgers = {"itemType": "manager", "resourceId": 1_000_595, "assetId": 1_000_595}
+    assert inventory.card_signature(moyes) == inventory.card_signature(again)
+    assert inventory.card_signature(moyes) != inventory.card_signature(rodgers)
+
+    # Consumables still stack rather than repeat. A club is meant to pile up
+    # contracts, and offering to quick-sell the second one is wrong.
+    for kind in ("development", "training"):
+        assert not inventory._repeats({"itemType": kind, "resourceId": 5_001_007})
+
+    # And the cosmetic four are unchanged.
+    for kind in ("kit", "custom", "stadium", "ball"):
+        assert inventory._repeats({"itemType": kind, "resourceId": 6_300_000})
+
+
+def test_a_packed_manager_is_marked_against_the_one_already_owned() -> None:
+    # The pack screen reads `duplicateItemIdList`, and the pairing has to name
+    # the owned card -- a bare list of the new ids is what froze the title.
+    import os
+
+    import fut_inventory as inventory
+
+    previous = os.environ.get("FIFA14_SEED_MANAGERS")
+    os.environ["FIFA14_SEED_MANAGERS"] = "1"
+    try:
+        import importlib
+
+        importlib.reload(inventory)
+        club = inventory.ClubInventory()
+        wallet = inventory.Wallet()
+        shop = inventory.PackShop(inventory.CardCatalogue(), wallet, club)
+
+        owned = next(i for i in club.items if i.get("itemType") == "manager")
+        drawn = [
+            dict(owned, id=990_000_001),
+            {"itemType": "manager", "resourceId": 999_999,
+             "assetId": 999_999, "id": 990_000_002},
+        ]
+        pairs = shop._mark_duplicates(drawn)
+
+        assert pairs == [{"itemId": 990_000_001, "duplicateItemId": owned["id"]}]
+        assert drawn[0]["duplicateItemId"] == owned["id"]
+        # A manager the club does not hold is not a repeat of anything.
+        assert "duplicateItemId" not in drawn[1]
+    finally:
+        os.environ.pop("FIFA14_SEED_MANAGERS", None)
+        if previous is not None:
+            os.environ["FIFA14_SEED_MANAGERS"] = previous
+        import importlib
+
+        importlib.reload(inventory)
+
+
+def test_the_manager_spends_a_contract_on_every_match() -> None:
+    # The client reports the eighteen and says nothing about the man in the
+    # dugout, so if this does not count his match down nothing does. Reported
+    # from the console 26 August: a manager still on the contract he arrived
+    # with after a cup tie.
+    #
+    # Retail spends one per match, which is why manager contract cards exist
+    # and are a family of their own (subtype 202).
+    import os
+
+    previous = os.environ.get("FIFA14_SEED_MANAGERS")
+    os.environ["FIFA14_SEED_MANAGERS"] = "1"
+    try:
+        import importlib
+
+        import fut_inventory as inventory
+
+        importlib.reload(inventory)
+        club = inventory.ClubInventory()
+        squad = [i for i in club.items if i.get("itemType") == "player"][:18]
+        manager = next(i for i in club.items if i.get("itemType") == "manager")
+        manager["contract"] = 7
+        manager["gamesPlayed"] = 0
+        for player in squad:
+            player["fitness"] = 99
+            player["contract"] = 7
+
+        club.save_squad(1, [p["id"] for p in squad], manager=manager["id"])
+        club.set_active(1)
+
+        sheet = [{"id": p["id"], "fitness": 95} for p in squad[:11]]
+        sheet += [{"id": p["id"], "fitness": 99} for p in squad[11:]]
+        touched = inventory.apply_match_items(club, sheet)
+
+        assert touched["manager"] == 1
+        assert manager["contract"] == 6
+        assert manager["gamesPlayed"] == 1
+
+        # A manager on no contract is not taken below zero, the same rule the
+        # players follow.
+        manager["contract"] = 0
+        touched = inventory.apply_match_items(club, sheet)
+        assert touched["manager"] == 0
+        assert manager["contract"] == 0
+        assert manager["gamesPlayed"] == 2
+
+        # A squad with no manager in the slot spends nothing and does not fail.
+        club.save_squad(1, [p["id"] for p in squad], manager=0)
+        touched = inventory.apply_match_items(club, sheet)
+        assert touched["manager"] == 0
+    finally:
+        os.environ.pop("FIFA14_SEED_MANAGERS", None)
+        if previous is not None:
+            os.environ["FIFA14_SEED_MANAGERS"] = previous
+        import importlib
+
+        import fut_inventory as inventory
+
+        importlib.reload(inventory)
+
+
+def test_a_match_publishes_appearances_where_the_bio_reads_them() -> None:
+    # The bio reads Games Played out of `statsList[0]` and `lifetimeStats[0]`
+    # -- settled on the console 17 August -- and `apply_match_items` writes the
+    # `gamesPlayed` member. `sync_stat_slots` is what joins the two, and a card
+    # bought off the market carries the same five-slot arrays a seeded one
+    # does, so nothing special is needed for it.
+    import fut_inventory as inventory
+
+    club = inventory.ClubInventory()
+    squad = [i for i in club.items if i.get("itemType") == "player"][:18]
+    for player in squad:
+        player["fitness"] = 99
+        player["gamesPlayed"] = 0
+        player["goals"] = 0
+    club.save_squad(1, [p["id"] for p in squad])
+    club.set_active(1)
+
+    sheet = [{"id": p["id"], "fitness": 95} for p in squad[:11]]
+    sheet[3]["goals"] = 2
+    sheet += [{"id": p["id"], "fitness": 99} for p in squad[11:]]
+    inventory.apply_match_items(club, sheet)
+
+    def slot(card, index):
+        return next(s["value"] for s in card["statsList"] if s["index"] == index)
+
+    def lifetime(card, index):
+        return next(s["value"] for s in card["lifetimeStats"] if s["index"] == index)
+
+    played = squad[0]
+    assert played["gamesPlayed"] == 1
+    assert slot(played, inventory.STAT_SLOT_GAMES) == 1
+    assert lifetime(played, inventory.STAT_SLOT_GAMES) == 1
+
+    scorer = squad[3]
+    assert slot(scorer, inventory.STAT_SLOT_GOALS) == 2
+    assert lifetime(scorer, inventory.STAT_SLOT_GOALS) == 2
+
+    # A card that sat on the bench reports nothing.
+    benched = squad[15]
+    assert slot(benched, inventory.STAT_SLOT_GAMES) == 0
+
+
+def test_the_duplicate_panel_can_ask_for_the_card_it_is_comparing() -> None:
+    # "MY CURRENT ITEM: undefined", reported off the console 26 August with a
+    # Puyol 83 out of a pack and a blank NOT FOUND card beside it.
+    #
+    # The panel asks for both cards by id right before it draws them, and every
+    # one of the 48 such requests in these journals carries exactly two ids --
+    # the new card and the owned one it repeats:
+    #
+    #     GET /ut/game/fifa14/item?idList=1950012526,1700000002
+    #
+    # This server answered a static {"itemData":[]} to all of them. The new
+    # card drew because the pack response had already handed it over; the owned
+    # one had a number and no card.
+    import random
+
+    import fut_inventory as inventory
+
+    club = inventory.ClubInventory()
+    wallet = inventory.Wallet()
+    shop = inventory.PackShop(inventory.CardCatalogue(), wallet)
+    shop.inventory = club
+
+    owned = club.items[0]
+    opened = json.loads(shop.open_pack(inventory.GOLD_PACK_ID, random.Random(11)))
+    fresh = opened["itemList"][0]
+
+    pair = json.loads(shop.items_by_id([fresh["id"], owned["id"]]))
+    assert [card["id"] for card in pair["itemData"]] == [fresh["id"], owned["id"]]
+    # A real card, not a stub: the panel draws a rating, a position and a face.
+    drawn = pair["itemData"][1]
+    assert drawn["assetId"] == owned["assetId"]
+    assert drawn["rating"] == owned["rating"]
+
+    # An id this club does not hold is left out rather than answered with a
+    # blank -- a card that is not there is not a card with no members.
+    missing = json.loads(shop.items_by_id([owned["id"], 999_999_999]))
+    assert [card["id"] for card in missing["itemData"]] == [owned["id"]]
+
+    # And the pile's own cards answer too, which is where a duplicate sits
+    # before it is sent on.
+    from_pile = json.loads(shop.items_by_id([fresh["id"]]))
+    assert from_pile["itemData"][0]["id"] == fresh["id"]
+
+
+def test_a_pack_carries_its_own_name_for_the_detail_pane() -> None:
+    # Retail draws "PREMIUM GOLD PACK" on the line beside the FUT 14 logo and
+    # the description underneath it. This server sent no name member at all, so
+    # that line fell back to the group heading -- every gold pack read "Gold
+    # Packs" -- and the name was visible only because the description text
+    # prepends it.
+    #
+    # `name` and `title` are both in CardsDLL's table and neither had ever been
+    # sent. Which the pane reads is untested, so both go out; an unrecognised
+    # sibling at the top level is skipped.
+    import fut_inventory as inventory
+
+    catalogue = json.loads(inventory.store_catalogue())
+    packs = {entry["id"]: entry for entry in catalogue["purchase"]}
+
+    # A key, not the text. Written out first and the line came back blank,
+    # which is what says the member is read and looked up: "Premium Gold Pack"
+    # is not a key any table holds, and had it been ignored the group heading
+    # would still have been there.
+    premium = packs[304]
+    assert premium["name"] == "FUT_STORE_PACK_304_NAME"
+    assert premium["title"] == "FUT_STORE_PACK_304_NAME"
+    # And it resolves, in the same document `description` beside it does.
+    import xml.etree.ElementTree as ET
+
+    table = {
+        unit.get("resname"): (unit.findtext("source") or "")
+        for unit in ET.fromstring(
+            inventory.store_pack_descriptions().decode()
+        ).iter("trans-unit")
+    }
+    # Capitals, which is how FIFA 14's store had it.
+    assert table[premium["name"]] == "PREMIUM GOLD PACK"
+    assert premium["displayGroup"]["value"] == "GOLD PACKS"
+    assert table[packs[303]["name"]] == "GOLD PACK"
+    # The group is the category tab and stays the category.
+    assert premium["displayGroup"]["value"] == "GOLD PACKS"
+    # Two packs in one group have different names and the same heading, which
+    # is the whole point.
+    assert packs[303]["displayGroup"]["value"] == premium["displayGroup"]["value"]
+
+    # Every pack names itself, and every key resolves.
+    for entry in catalogue["purchase"]:
+        assert entry["name"], entry["id"]
+        assert table[entry["name"]] == inventory.PACK_SPECS[entry["id"]]["name"]
+        # The member is a key; the text behind it is what is drawn, and it is
+        # in capitals because that is how FIFA 14's store had it.
+        assert entry["name"].startswith("FUT_STORE_PACK_")
+        assert inventory.PACK_SPECS[entry["id"]]["name"].isupper()
+
+
+def test_no_pack_ever_hands_out_the_same_player_twice() -> None:
+    # "No packs should be able to draw the same player twice (ever)." Twenty
+    # seeds is not "ever" -- these are the counts that found the last two
+    # faults, so the guarantee is asserted at the size that would catch a third.
+    import collections
+    import random
+
+    import fut_inventory as inventory
+
+    club = inventory.ClubInventory()
+    club.items = []
+    shop = inventory.PackShop(
+        inventory.CardCatalogue(), inventory.Wallet(coins=10**12), club
+    )
+
+    repeats = 0
+    short = 0
+    runs = 120
+    for pack_id, spec in inventory.PACK_SPECS.items():
+        for seed in range(runs):
+            opened = json.loads(shop.open_pack(pack_id, random.Random(seed)))
+            items = opened["itemList"]
+            # A pack that avoids a repeat by handing over fewer cards has not
+            # kept the promise either.
+            if len(items) != spec["count"]:
+                short += 1
+            faces = [i["assetId"] for i in items if i.get("itemType") == "player"]
+            counted = collections.Counter(faces)
+            repeats += sum(n - 1 for n in counted.values() if n > 1)
+    assert repeats == 0
+    assert short == 0
+
+
+def test_the_squad_selector_reports_the_chemistry_the_console_worked_out() -> None:
+    # The selector advertised a flat 100 for every side, so "Fondateur FUT"
+    # read 100 in the list and 67 the moment you opened it. Reported from the
+    # console 27 August.
+    #
+    # This server does not compute chemistry and should not pretend to: it is
+    # links by club, league and nation, the manager's own league, loyalty and
+    # position, and the console already does all of it. It also tells us the
+    # answer -- every squad PUT carries the number, and these journals hold
+    # everything from 0 to 100.
+    import fut_inventory as inventory
+
+    club = inventory.ClubInventory()
+    eleven = [i["id"] for i in club.items if i.get("itemType") == "player"][:18]
+
+    # A side the console has never *saved* has no number yet, and nought is
+    # how that is said. 100 was the fallback until 27 August and it is not a
+    # placeholder, it is a claim: a squad read 100 in the selector and 67 the
+    # moment it was opened.
+    #
+    # The console reports chemistry on a save, not on an open -- a session that
+    # opened both squads made no squad write at all.
+    club.save_squad(1, eleven)
+    assert json.loads(club.squad_summaries())["squad"][0]["chemistry"] == 0
+
+    club.save_squad(1, eleven, chemistry=67)
+    assert json.loads(club.squad_summaries())["squad"][0]["chemistry"] == 67
+    # And the squad screen agrees with the selector, which is the whole point.
+    assert json.loads(club.squad_document(1, "Fondateur FUT"))["chemistry"] == 67
+
+    # A save that does not mention chemistry leaves the stored one alone.
+    club.save_squad(1, eleven)
+    assert json.loads(club.squad_summaries())["squad"][0]["chemistry"] == 67
+
+    # Zero is a real answer, not "unset".
+    club.save_squad(1, eleven, chemistry=0)
+    assert json.loads(club.squad_summaries())["squad"][0]["chemistry"] == 0
+
+
+def test_the_market_has_club_items_and_staff_to_search() -> None:
+    # The CLUB ITEMS and STAFF tabs fell through to the player search and found
+    # nothing, so both were empty however they were filtered. The console asks
+    # for them the way it asks for consumables, and the journals have the exact
+    # queries:
+    #
+    #     type=clubInfo&start=0&num=12&cat=badge
+    #     type=staff&start=0&num=12&cat=manager
+    import fut_inventory as inventory
+
+    catalogue = inventory.CardCatalogue()
+
+    def kinds(query):
+        doc = json.loads(catalogue.auctions(dict(query, num="50"), coins=1000))
+        counted = {}
+        for listing in doc["auctionInfo"]:
+            kind = listing["itemData"]["itemType"]
+            counted[kind] = counted.get(kind, 0) + 1
+        return doc, counted
+
+    # Five of each family, not the catalogue: there are 2,035 club items and
+    # listing them all makes the tab a directory rather than a market.
+    # The whole catalogue, paged -- a market that holds six kits is a sample
+    # rather than a market. What the six buys is the *first page*: one of each
+    # grade leads each family so the tab opens on a spread.
+    doc, counted = kinds({"type": "clubInfo"})
+    n = inventory.MARKET_CLUB_ITEM_COPIES
+    assert doc["total"] == len(inventory._clubitem_catalogue())
+    assert set(counted) == {inventory.BADGE_WIRE_TYPE, "kit", "ball", "stadium"}
+
+    doc, counted = kinds({"type": "staff"})
+    assert set(counted) == {"manager", "headCoach", "gkCoach",
+                            "fitnessCoach", "physio"}
+    assert doc["total"] == len(inventory.manager_catalogue()) + len(
+        inventory.staff_catalogue()
+    )
+
+    # `cat` narrows it to one family, which is what the tab's filter sends.
+    doc, counted = kinds({"type": "clubInfo", "cat": "badge"})
+    assert set(counted) == {inventory.BADGE_WIRE_TYPE}
+    assert doc["total"] == sum(
+        1 for row in inventory._clubitem_catalogue() if row["itemType"] == "badge"
+    )
+    _, counted = kinds({"type": "staff", "cat": "manager"})
+    assert set(counted) == {"manager"}
+
+    # A stadium and a ball name themselves in `type` and send no `cat`. They
+    # were not routed here at all, so searching for either turned up the
+    # player list -- reported from the console 27 August.
+    for family in ("stadium", "ball"):
+        doc, counted = kinds({"type": family})
+        assert set(counted) == {family}, family
+        assert doc["total"] == sum(
+            1 for row in inventory._clubitem_catalogue()
+            if row["itemType"] == family
+        ), family
+
+    # Every listing is buyable: a real trade id, a price, and an active state.
+    doc, _ = kinds({"type": "clubInfo"})
+    for listing in doc["auctionInfo"]:
+        assert listing["tradeState"] == "active"
+        assert listing["buyNowPrice"] > listing["startingBid"] > 0
+        assert listing["tradeId"] > 0
+
+    # A better item costs more. Anchoring on the quick-sell value alone put
+    # every one of them on the 200 floor -- a kit is worth 3.
+    prices = {
+        listing["itemData"]["rating"]: listing["buyNowPrice"]
+        for listing in doc["auctionInfo"]
+        if listing["itemData"]["itemType"] == "kit"
+    }
+    assert prices[78] > prices[48]
+
+    # Every family reaches the first page. Listed one after another, a page of
+    # twelve held five badges, five balls and two kits and never reached the
+    # stadiums -- reported from the console 27 August.
+    page = json.loads(
+        catalogue.auctions({"type": "clubInfo", "num": "12"}, coins=1000)
+    )["auctionInfo"]
+    assert len(page) == 12
+    assert {listing["itemData"]["itemType"] for listing in page} == {
+        inventory.BADGE_WIRE_TYPE, "kit", "ball", "stadium"
+    }
+
+    # And across qualities rather than off the top of the catalogue, which is
+    # in resource order and so in quality order: the first five of every family
+    # were its five lowest-rated bronzes, so the tab was a wall of bronze and
+    # its quality filter had nothing to sort.
+    kits = [
+        listing["itemData"] for listing in
+        json.loads(catalogue.auctions(
+            {"type": "clubInfo", "cat": "kit", "num": "50"}, coins=1000
+        ))["auctionInfo"]
+    ]
+    assert len({kit["rating"] for kit in kits}) > 1
+    assert len({kit["rareflag"] for kit in kits}) > 1
+
+    # The quality filter narrows to one tier, and the key is `lev` -- which is
+    # what the console sends. Reading `level` alone is why it did nothing.
+    for level, span in (("bronze", (48, 58)), ("silver", (68, 72)),
+                        ("gold", (78, 84))):
+        page = json.loads(catalogue.auctions(
+            {"type": "clubInfo", "lev": level, "cat": "kit", "num": "50"},
+            coins=1000,
+        ))["auctionInfo"]
+        assert page, level
+        assert {listing["itemData"]["rating"] for listing in page} <= set(span), level
+
+    # Each family leads with one of every tier, so a short page is not three
+    # bronzes. Five copies left the gold rare off the end.
+    lead = [
+        listing["itemData"]["rating"] for listing in
+        json.loads(catalogue.auctions(
+            {"type": "clubInfo", "cat": "kit", "num": "50"}, coins=1000
+        ))["auctionInfo"]
+    ][:n]
+    assert sorted(lead) == [48, 58, 68, 72, 78, 84]
+
+
+def test_the_famous_crests_are_gold_and_the_small_clubs_bronze() -> None:
+    # FC Barcelona's badge was bronze non-rare. The grades were cycled by
+    # index -- `GRADES[index % 6]` -- so resource 6000000 took the first one,
+    # and 6000000 is Barcelona.
+    #
+    # The badge table is a standing order: Barcelona, Real Madrid, Bayern,
+    # Manchester City at the top and Drogheda United at 6000600. So the
+    # position in the range is what says which crest is the gold one, and the
+    # builder bands it best-first instead.
+    #
+    # This was equally true of what the packs were handing out -- the market
+    # and the draw read the same catalogue -- which is what "they need to match
+    # what is going into packs" meant.
+    import fut_inventory as inventory
+
+    badges = {
+        row["resourceId"]: row
+        for row in inventory._clubitem_catalogue()
+        if row["itemType"] == "badge"
+    }
+    for resource in (6_000_000, 6_000_001, 6_000_002, 6_000_003):
+        assert badges[resource]["tier"] == "gold", resource
+        assert badges[resource]["rare"] == 1, resource
+    # Drogheda United, at the bottom of the table.
+    assert badges[6_000_600]["tier"] == "bronze"
+    assert badges[6_000_600]["rare"] == 0
+
+    # Every family keeps a full spread, so every pack tier still has something
+    # of its own to hand out.
+    import collections
+
+    for kind in ("kit", "badge", "stadium"):
+        tiers = collections.Counter(
+            row["tier"] for row in inventory._clubitem_catalogue()
+            if row["itemType"] == kind
+        )
+        assert set(tiers) == {"bronze", "silver", "gold"}, kind
+        assert min(tiers.values()) > 0, kind
+

@@ -39,13 +39,12 @@ SERVER_MODULES = [
 SERVER_DATA = [
     "server/fifa14_cards.json",
     "server/fifa14_clubitems.json",
+    "server/fifa14_clubitems_blank.json",
+    "server/fifa14_managers.json",
     "server/fifa14_consumables.json",
     "server/fifa14_totw.json",
     "server/icebreakerpacklist.json",
 ]
-# `server/fifa14_cards_worldcup.json` is deliberately absent: the World Cup
-# cards are held *out* of the catalogue, and only `tools/worldcup_cards.py`
-# reads that file. Nothing the server does at runtime opens it.
 SUPPORT = [
     "tools/revival_config.py",
     "fifa14revival.example.ini",

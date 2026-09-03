@@ -47,8 +47,43 @@ CATALOGUE = (0x897061B0, b"content.lt.easfc.ea.com:8080")
 
 
 def patch(host: str, local: str, core_port: int, identity_port: int) -> bool:
+    # The session endpoint goes to the HTTP port, not the Blaze one.
+    #
+    # It was `{local}:{core_port}` until 28 August, and the retail value it
+    # replaces says why that is wrong: `pal.gt.easfc.ea.com:8094` is an HTTP
+    # endpoint. POW speaks HTTP here -- `POST /pow/auth`, then the hub -- and
+    # the core port is Blaze, where nothing answers it.
+    #
+    # The PS3 line found the same thing from the other side and wrote it down:
+    # sending POW at the Blaze core port means "the request leaves the console
+    # and is never seen again". That console has EASFC connected today, with
+    # 1,178 `/pow/` requests in its journal, and this one has never made a
+    # single one.
+    #
+    # It also explains what the trace found and could not place. POW never
+    # opened a socket because 10041 was already open -- it is the Blaze
+    # connection -- so there was never a new one to see. And the failure was
+    # `TXT_EASFC_SERVER_ERROR` rather than a sign-in gate, which is what a
+    # module that ran, sent, and got nothing readable back reports.
+    #
+    # `core_port` stays in the signature: every caller passes it, and the
+    # budget check below is the only reason this ever fitted -- 16 bytes of
+    # `10.0.0.119:18080` into 24 of `pal.gt.easfc.ea.com:8094`.
     replacements = (
-        (SESSION, f"{local}:{core_port}".encode()),
+        # `http://`, and it is the difference between EAS FC working and not.
+        #
+        # The session string was written scheme-less for months, matching the
+        # retail value it replaces -- `pal.gt.easfc.ea.com:8094` carries no
+        # scheme either. The module formats it as `"%s/%s"` with `pow/auth`,
+        # so what reached the transport was `10.0.0.119:18080/pow/auth`, and
+        # default.xex's ProtoHttp will not open a socket for that. No
+        # connection, no error, a 40-second retry window that doubled on each
+        # attempt, and a Connect button that appeared to do nothing.
+        #
+        # Adding the scheme produced `POST /pow/auth` on the first press --
+        # the first EAS FC request this console has ever made. 23 bytes into
+        # a 24-byte budget, with nothing to spare.
+        (SESSION, f"http://{local}:{identity_port}".encode()),
         (CATALOGUE, f"http://{local}:{identity_port}".encode()),
     )
     client = Xbdm(host)
@@ -59,10 +94,27 @@ def patch(host: str, local: str, core_port: int, identity_port: int) -> bool:
             if current[: len(replacement)] == replacement:
                 written += 1
                 continue
-            if current[: len(original)] != original:
+            # Either the retail string, or one this patcher wrote earlier.
+            #
+            # Only the retail value was accepted until 28 August, which made
+            # the endpoint unrepointable on a running title: the session
+            # string was found holding `10.0.0.119:10041` from a previous
+            # launch, did not match the retail host, and the patcher refused
+            # rather than correcting it. That is exactly the case worth
+            # handling -- the value is wrong and this tool exists to fix it.
+            #
+            # An address this patcher wrote is recognisable without guessing:
+            # it starts with the local IP. Anything else is still refused,
+            # because writing over content nobody recognises is how a live
+            # title gets corrupted.
+            settled = current[: len(original)]
+            ours = settled.startswith(local.encode()) or settled.startswith(
+                f"http://{local}".encode()
+            )
+            if settled != original and not ours:
                 print(
                     f"0x{address:08X}: unexpected content "
-                    f"{current[: len(original)]!r}; nothing written"
+                    f"{settled!r}; nothing written"
                 )
                 return False
             if len(replacement) > len(original):

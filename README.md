@@ -1,44 +1,60 @@
 # FIFA 14 FUT Offline Revival — Xbox 360
 
 Research toolkit and technical notes for restoring the FIFA 14 Ultimate Team
-front-end on a personally owned Xbox 360 RGH/JTAG after the official services
-were shut down.
+front-end on a personally owned Xbox 360 after the official services were shut
+down. Developed against two different consoles: an RGH/JTAG machine and a
+retail one running the BadUpdate exploit. They are not interchangeable — the
+launch path differs, and `tools/fut.sh` reads `CONSOLE_MOD` to tell them
+apart, because a softmod reboot takes the patched hypervisor with it.
 
-> **Status — 2026-08-08:** FIFA 14 Ultimate Team runs. The FUT login
-> completes, a club is created and persists, the squad screen draws real cards
-> with their art, the transfer market is searchable across 14 019 cards, packs
-> can be bought and opened, and cards can be sent to the club, quick-sold or
-> listed for sale.
+> **Status — 2026-08-25:** Ultimate Team plays. A club is created and persists
+> across sessions, packs are bought and opened, cards go to the club or the
+> transfer list, the market is searchable and buys, matches are played and
+> their results written back, cups run, and a Single Player Season opens,
+> resumes after a match and promotes.
 >
-> The two-day blocker was the tutorial feed. Every session ended on the same
-> tail -- `userdata`, then the tutorial URL, then silence -- because the server
-> answered an invented empty `<MESSAGES>` document. CardsDLL pairs
-> `RetrieveShouldShowTutorial` with `RetrieveShouldShowTutorialComplete`, so
-> `DoInitialLoginSteps` waits on that retrieval; the document was accepted as
-> HTTP and never completed as a document. Answering **404** completed it, and
-> thirty requests followed immediately in the PC revival's own order.
+> **Working, measured on the console.** Login and club creation; the squad
+> screen with real cards and art; a **15 766-card** catalogue plus 1 077 World
+> Cup cards, 1 569 club items across kits, badges, stadiums and balls, and 143
+> consumables read out of the game's own database rather than invented. Packs:
+> bought, opened, sent to club, quick-sold, listed. The transfer market
+> searches and filters on position, league, club, nation, quality, price and
+> chemistry style. The transfer list lists, sells and collects, and its cards
+> can be actioned from FUT HUB directly. Duplicates are detected and a player
+> transferred mid-season is correctly two cards rather than one. Contracts
+> arrive at 7 and count down per match, so the consumables that restore them
+> have something to do. Tournaments render and their progress survives a
+> restart. Seasons open, resume and record promotion.
 >
-> Entering FUT needs two runtime patches, and the order matters: the launch
-> patch (hostnames, plaintext redirector, native FUT-resource redirect), then
-> `helperFunctions` applied **at the FIFA main menu, before Ultimate Team is
-> selected**. Applied from inside the FUT loader it does nothing -- the trace
-> stops at `accountinfo`, `/ut/auth` never follows, and CardsDLL is never
-> mapped. Re-entering FUT requires a full relaunch: the title keeps its FUT
-> session in memory and rewrites the account state within seconds of the file
-> being cleared.
+> **Not working.** Head-to-head has never completed. Two consoles are
+> introduced, the game is set up and both are told where the other is, but this
+> console has never sent `finalizeGameCreation` and so never builds an XNet
+> session — see `docs/MATCHMAKING.md` for what has been eliminated and what has
+> not. `EAS FC` reads not connected. The FUT home header shows a zero balance
+> while the store and market show the true figure. The MY CLUB counters read
+> zero on all eight tiles: they go out as `{"key": n, "value": n}` and **`key`
+> is not a member of CardsDLL at all**, which is measured and not yet acted on
+> here. A duplicate's "MY CURRENT ITEM" panel draws blank unless that card is
+> one the console happens to be holding, because the pairing is two numbers and
+> the client draws the card from its own memory.
 >
-> The club is built from this build's own icebreaker packs, whose asset ids are
-> the game's; positions, nations, leagues and rarities come from a 14 019-card
-> catalogue keyed by the same ids. Nothing about a card is invented -- an asset
-> id with no art behind it parses cleanly and draws a blank card.
+> **Two hazards worth knowing before changing anything.**
+> `FIFA14_SEASON_MODE=kyro-data` **hard-freezes the seasons screen** — no
+> spinner, music still playing, and the console stops answering XBDM. `native`
+> is the default for that reason. It is not understood, and the two modes
+> differ in four things at once. `RB Relist All` appears on the transfer list
+> while **no relist route exists**, so it reaches nothing — and it stays that
+> way deliberately: no console has ever sent a relist request, so there is
+> nothing to answer and no evidence about what to answer with.
 >
-> Not working yet: no match has been played. The FUT home header shows a zero
-> balance while the store and market show the true figure; the responses that
-> refresh it have been bisected but the one the home reads is not yet
-> identified. `EAS FC` still reads not connected -- it is a second Blaze
-> connection to its own endpoint, and pointing it here via `POW_CUSTOMURL` is
-> applied but unverified. Auction listings show no time remaining, and buying
-> from the market has not been confirmed end to end on the console.
+> **The method has not changed and is the point.** `unknown_route` in the
+> journal is what says which document to write next; command numbers and member
+> names come from the title's own binary rather than from tables published for
+> other Blaze games; and where the binary is silent nothing is invented. Two
+> corrections this week came from comparing against a build that worked rather
+> than from reading this one: seasons reset for four days because `divisionId`
+> was sent as the division's number minus one, and the seasons screen froze for
+> an evening because this repository's default mode was one nobody else ran.
 
 This repository contains only original research scripts, documentation and
 non-sensitive example configuration. It does **not** contain FIFA game files,

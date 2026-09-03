@@ -191,8 +191,36 @@ def _cards_by_asset() -> dict[int, dict]:
 BADGE_WIRE_TYPE = "custom"
 
 # What the club-search screen calls a thing -> what it is called on the wire.
-# Only badges differ, and only because `custom` is what renders.
+# Badges differ because `custom` is what renders.
 CLUB_SEARCH_TYPES = {"badge": BADGE_WIRE_TYPE}
+
+# The staff families a bare `type=staff` search should return. The screen asks
+# for each family by name and also asks for all of them at once, and nothing
+# has ever carried the itemType `staff` itself.
+STAFF_WIRE_TYPES = ("headCoach", "gkCoach", "fitnessCoach", "physio", "manager")
+
+
+def _club_search_matches(item_type: str, asked: str) -> bool:
+    """Whether a card of this type answers a search for that one.
+
+    Case-folded, because **the screen asks in lower case and the cards do not
+    carry it that way**. Journalled 25 August: `type=headcoach`,
+    `type=gkcoach`, `type=fitnesscoach` against cards reading `headCoach`,
+    `gkCoach`, `fitnessCoach`, so a club holding 150 of them reported none.
+    CardsDLL carries both spellings of all three, which is why neither side
+    looks wrong on its own.
+
+    Same shape as the badge fault this table already existed for: the wire name
+    and the search name were simply not the same word.
+    """
+    wire = (item_type or "").strip().lower()
+    want = (asked or "").strip().lower()
+    if not want:
+        return True
+    if want == "staff":
+        return wire in {t.lower() for t in STAFF_WIRE_TYPES}
+    mapped = CLUB_SEARCH_TYPES.get(want, want)
+    return wire == mapped.strip().lower()
 
 
 # What a new club owns: the five items it presents with, and nothing more.
@@ -324,31 +352,53 @@ def activate_item(
     return target
 
 
-def squad_manager(inventory: "ClubInventory | None" = None) -> list[dict]:
+def squad_manager(
+    inventory: "ClubInventory | None" = None, squad_id: int | None = None
+) -> list[dict]:
     """What the squad document says sits in the manager slot.
 
-    Empty by default, which is what the PC revival serves on its active squad
-    and what this server has always served. A manager is not required to field
-    a side -- `docs/FUT_CLUB_INVENTORY.md` establishes that -- and the club's
-    own manager cards carry resource ids invented in this file (6100000 and
-    up), because no table in `cards_ng_db` or `fifa_ng_db` names a real one.
-    The PC revival reached the same place independently and disabled manager
-    emission outright: "resource IDs are not verified against this PC build".
+    **The one the player put there.** Every squad PUT the console makes carries
+    `"manager":[{"id":N}]`, and this server read the players, the name and the
+    formation out of that body and ignored the manager. The slot filled on
+    screen, the save was written without it, and the next launch had an empty
+    slot -- reported from the console on 26 August.
 
-    `FIFA14_SQUAD_MANAGER=1` puts the club's first manager card in the slot
-    instead. It exists because a player watching a single-player tournament
-    hang on a black screen noticed he had no manager, and that is a question
-    worth answering rather than arguing about.
+    The card is looked up in the club by that id, so a manager that has been
+    quick-sold or was never owned resolves to nothing rather than to a stale
+    entry.
 
-    Off by default, and it should stay off unless it is being tested. An
-    invented asset id in the squad document is precisely the shape that can
-    make the squad screen reject the whole response rather than the one item,
-    which would cost more than the manager slot is worth.
+    The old worry here was invented resource ids: the club's managers used to
+    carry ids made up in this file, and an invented asset id in a squad
+    document is the shape that makes the squad screen reject the whole
+    response rather than one item. That is no longer the case -- the 166
+    managers come from the game's own database and were seen rendering in the
+    club on 25 August before they were ever put in packs.
+
+    `FIFA14_SQUAD_MANAGER=1` still puts the club's first manager in the slot
+    when the player has chosen none. It is off by default: an empty slot the
+    player has not filled is the truth.
     """
-    if os.environ.get("FIFA14_SQUAD_MANAGER", "").strip().lower() not in {"1", "true", "yes"}:
-        return []
     club = inventory if inventory is not None else INVENTORY
-    for item in getattr(club, "items", []):
+    items = getattr(club, "items", [])
+
+    chosen = 0
+    if hasattr(club, "_squads"):
+        wanted = squad_id if squad_id is not None else club.active_squad_id()
+        entry = club._squads().get(wanted) or {}
+        try:
+            chosen = int(entry.get("manager") or 0)
+        except (TypeError, ValueError):
+            chosen = 0
+    if chosen:
+        for item in items:
+            if item.get("id") == chosen:
+                return [item]
+
+    if os.environ.get("FIFA14_SQUAD_MANAGER", "").strip().lower() not in {
+        "1", "true", "yes"
+    }:
+        return []
+    for item in items:
         if item.get("itemType") == "manager":
             return [item]
     return []
@@ -605,6 +655,17 @@ def sync_stat_slots(card: dict) -> None:
 # Which pile a card sits in. Defined here rather than beside the consumable
 # helpers because `_player_item` carries a pile on every card and its default
 # is evaluated at definition time.
+# What a player card arrives with. Seven, because that is what FIFA 14 gives:
+# a card out of a pack or off the market plays seven matches and then needs a
+# contract, which is the whole reason contract consumables exist and are the
+# commonest card in the game.
+#
+# This was 99 on every card this server made, from every source. Nothing needed
+# a contract, so nothing needed the contracts tab, the market's development
+# category, or the apply-consumable screen -- all of which work, and all of
+# which were pointless against a squad that never ran down.
+DEFAULT_CONTRACT = 7
+
 PILE_TRANSFER = 5
 PILE_PURCHASED = 6
 PILE_CLUB = 7
@@ -624,11 +685,15 @@ def _player_item(
     nation: int = 0,
     league: int = 0,
     rarity: str = "",
+    contract: int = DEFAULT_CONTRACT,
+    version: int = RESOURCE_VERSION,
 ) -> dict:
     return {
         "id": item_id,
         "assetId": asset_id,
-        "resourceId": RESOURCE_VERSION | asset_id,
+        # The high byte is the card's version: 1 is the base card, and the
+        # Team of the Week's in-forms are band 50. Same encoding, one byte up.
+        "resourceId": version | asset_id,
         "rating": rating,
         "preferredPosition": position,
         "teamid": team_id,
@@ -640,9 +705,11 @@ def _player_item(
         "itemType": "player",
         "itemState": item_state,
         "formation": FORMATION,
-        # A full contract and full fitness: a card that cannot take the field
-        # is the same as no card at all for a first match.
-        "contract": 99,
+        # Seven matches and full fitness. Fitness stays at 99 for the reason
+        # the contract no longer does: a card that cannot take the field is the
+        # same as no card at all, and fitness is spent by playing rather than
+        # handed out at nought.
+        "contract": contract,
         "fitness": 99,
         "injuryGames": 0,
         "injuryType": "none",
@@ -925,6 +992,18 @@ def first_run() -> bool:
 
 CLUB_ITEM_TYPES = frozenset({"kit", "stadium", "ball", "custom"})
 
+# Everything that repeats rather than stacks, which is the four cosmetic
+# families plus the manager and the four staff ones.
+#
+# The staff families were added on 25 August, after this set was written, and
+# nothing brought them in: a second David Moyes was neither marked in the pack
+# nor offered for quick sell, while a second kit was. Reported from the console
+# 26 August.
+#
+# Consumables stay out on purpose. A club is meant to pile up contracts, and
+# offering to quick-sell the second one is wrong.
+REPEATING_TYPES = CLUB_ITEM_TYPES | frozenset(STAFF_WIRE_TYPES)
+
 
 def _repeats(item: dict) -> bool:
     """Whether a second copy of this card is a duplicate rather than a stack.
@@ -933,7 +1012,7 @@ def _repeats(item: dict) -> bool:
     pile up contracts, and offering to quick-sell the second one is wrong.
     """
     kind = item.get("itemType")
-    return kind == "player" or kind in CLUB_ITEM_TYPES
+    return kind == "player" or kind in REPEATING_TYPES
 
 
 def card_signature(item: dict):
@@ -979,7 +1058,13 @@ def card_signature(item: dict):
     # the catalogue holds asset 14 -- the art follows the resourceId -- so
     # keying on the asset would make all 861 kits the same card and report the
     # second kit you ever packed as a duplicate of the first.
-    if item.get("itemType") in CLUB_ITEM_TYPES:
+    #
+    # Managers and staff key the same way. Their resource is the manager's own
+    # database id -- David Moyes is 1000597 -- so two of him agree and two
+    # different managers do not, which is exactly what is wanted and is not
+    # true of the player branch below: it reads `rarity` and `rating`, and a
+    # manager carries neither in a form that tells two of them apart.
+    if item.get("itemType") in REPEATING_TYPES:
         return ("club", item.get("itemType"), item.get("resourceId"))
 
     club = item.get("teamid")
@@ -1031,7 +1116,9 @@ def club_duplicate_pairs(items: list[dict]) -> list[dict]:
     return pairs
 
 
-def pile_duplicate_pairs(pending: list[dict], owned: list[dict]) -> list[dict]:
+def pile_duplicate_pairs(
+    pending: list[dict], owned: list[dict], loaded: set[int] | None = None
+) -> list[dict]:
     """Which cards waiting in the purchased pile repeat one already owned.
 
     The pack screen gets its pairs in the pack response and shows the repeat
@@ -1043,6 +1130,23 @@ def pile_duplicate_pairs(pending: list[dict], owned: list[dict]) -> list[dict]:
     The card kept as the original is whichever was acquired first -- a copy in
     the club always beats one still in the pile, and inside the pile the
     smaller id wins, because ids are issued upwards as cards arrive.
+
+    Except that a copy the client can actually draw beats both. `loaded` names
+    the ids the console is known to be holding, and the only set that is always
+    true of is the active squad: it is fetched every session, in full, before
+    any pack is opened.
+
+    This is what "MY CURRENT ITEM" being `undefined` was. The pairing is two
+    numbers -- the client is told which id repeats which -- and it then draws
+    the owned card by looking that id up in its own memory. It has the squad,
+    it has the pack, and it has whatever club pages somebody scrolled past;
+    a card sitting at position 176 of 987 was in none of them, so the panel had
+    a number and no card. Pointing at a copy it holds is the only part of that
+    this server can decide.
+
+    It also fixes something worth having on its own terms: the copy left marked
+    as the duplicate is the one the club screen offers to quick-sell, and that
+    should never be the one in the starting eleven.
     """
     # A bought card is put in the pile *and* in the club -- the pile alone lost
     # it, so both hold the same card under the same id. Pairing across the two
@@ -1053,14 +1157,23 @@ def pile_duplicate_pairs(pending: list[dict], owned: list[dict]) -> list[dict]:
     #
     # Pelé, bought on 12 August, came back paired 1800000049 -> 1800000049.
     waiting = {item.get("id") for item in pending}
+    held = loaded or set()
     first: dict[tuple, int] = {}
-    for item in sorted(owned, key=lambda row: row.get("id") or 0):
-        if item.get("itemType") != "player" or item.get("id") in waiting:
+    # A card the client is holding sorts ahead of one it is not, and inside
+    # each group the smaller id still wins, so the choice stays stable.
+    for item in sorted(
+        owned,
+        key=lambda row: (row.get("id") not in held, row.get("id") or 0),
+    ):
+        if not _repeats(item) or item.get("id") in waiting:
             continue
         first.setdefault(card_signature(item), item["id"])
     pairs: list[dict] = []
     for item in sorted(pending, key=lambda row: row.get("id") or 0):
-        if item.get("itemType") != "player":
+        # Players, club items, managers and staff all repeat. Only players did
+        # until 26 August, so a second kit sitting in the pile was flagged on
+        # the pack screen and not in the pile's own duplicates tab.
+        if not _repeats(item):
             continue
         key = card_signature(item)
         original = first.get(key)
@@ -1315,7 +1428,7 @@ class ClubInventory:
                     # directly matched nothing and the badge tab was empty
                     # while the club held five. The wire name and the search
                     # name are simply not the same word.
-                    elif item.get("itemType") != CLUB_SEARCH_TYPES.get(kind, kind):
+                    elif not _club_search_matches(item.get("itemType"), kind):
                         return False
                 if position and position not in ("any", ""):
                     if item.get("preferredPosition") != position:
@@ -1336,6 +1449,12 @@ class ClubInventory:
             # The club search pages too, and honouring only `count` meant every
             # page returned the same first results. The parameter it uses is
             # not certain, so accept the spellings it could send.
+            # Everything that matched, before the page is cut out of it. The
+            # item screen's CLUB tab draws this number, and it draws it while
+            # the tab is greyed out -- retail shows "CLUB 352" on a tab you
+            # cannot open. So it is not the page and it is not what the client
+            # happens to be holding.
+            matched = len(items)
             start = 0
             for key in ("start", "skip", "offset", "from"):
                 value = number(key)
@@ -1365,6 +1484,7 @@ class ClubInventory:
             # unbounded response; it is not established as the fix for that
             # teardown. And it truncates: a club larger than the limit is not
             # shown whole to a screen that asked for all of it.
+            matched = len(items)
             items = _bounded_club(items)
         # Worked out over the whole club, reported for what is on this page:
         # the card a repeat points at is often not in the same search result,
@@ -1376,8 +1496,24 @@ class ClubInventory:
             for pair in club_duplicate_pairs(self.items)
             if pair["itemId"] in served
         ]
+        # How many the club holds, not how many are on this page.
+        #
+        # The response carried no count at all, so the CLUB tab read 0 over a
+        # club of 485 -- and `club/stats` reports 485 correctly, so the tab is
+        # not reading that. `total` is the member the trade pile and the market
+        # both use for the same job and it is in CardsDLL's name table;
+        # `totalResults` and `itemCount` are not in the table at all, so they
+        # were never candidates.
+        #
+        # A truncated response still reports the true size: the bound exists to
+        # keep one document small, not to tell the club it is smaller than it
+        # is.
         return json.dumps(
-            {"itemData": items, "duplicateItemIdList": pairs},
+            {
+                "itemData": items,
+                "duplicateItemIdList": pairs,
+                "total": matched,
+            },
             separators=(",", ":"),
         ).encode()
 
@@ -1435,6 +1571,8 @@ class ClubInventory:
         item_ids: list[int],
         name: str | None = None,
         formation: str | None = None,
+        manager: int | None = None,
+        chemistry: int | None = None,
     ) -> int:
         """Write a side, creating it if the id is new.
 
@@ -1459,6 +1597,35 @@ class ClubInventory:
             "name": name or entry.get("name") or f"Équipe {squad_id}",
             "formation": formation or entry.get("formation") or FORMATION,
             "players": kept or entry.get("players") or [],
+            # The manager the player put in the slot.
+            #
+            # The console has been sending it all along -- every squad PUT
+            # carries `"manager":[{"id":N}]`, and an assignment on 25 August
+            # arrived as id 1950009476 -- and this dropped it on the floor. So
+            # the slot filled on screen, the save was written without it, and
+            # the next launch had no manager.
+            #
+            # `None` means the PUT did not mention one, and the stored value
+            # stands. A zero is the player clearing the slot and is kept as a
+            # zero, not treated as "unset".
+            "manager": (
+                int(manager) if manager is not None else entry.get("manager", 0)
+            ),
+            # The chemistry the **client** worked out for this side.
+            #
+            # This server does not compute chemistry and should not pretend to:
+            # it is links by club, league and nation, the manager's own league,
+            # loyalty and position, and the console already does all of it. It
+            # also tells us the answer -- every squad PUT carries the number,
+            # and the journals hold everything from 0 to 100.
+            #
+            # It was thrown away and the squad list advertised a flat 100, so
+            # "Fondateur FUT" read 100 in the selector and 67 once you opened
+            # it. Reported from the console 27 August.
+            "chemistry": (
+                int(chemistry) if chemistry is not None
+                else entry.get("chemistry")
+            ),
         }
         if squad_id == 1 and kept:
             self.set_squad(kept)
@@ -1502,7 +1669,24 @@ class ClubInventory:
                     "formation": squad["formation"],
                     "rating": rating,
                     "starRating": rating,
-                    "chemistry": 100,
+                    # What the console last worked out for this side.
+                    #
+                    # **Zero when it has never said.** 100 was the fallback
+                    # until 27 August and it is not a placeholder, it is a
+                    # claim -- a squad reading 100 in the selector and 67 the
+                    # moment you open it, which is what was reported.
+                    #
+                    # The console only reports chemistry when a squad is
+                    # **saved**, not when it is opened: a session that opened
+                    # both squads made no squad write at all. So a side that
+                    # has not been touched since this started being kept has no
+                    # number, and nought is the honest way to say so. Impulsum
+                    # lands in the same place -- its `Chemistry` is a plain int
+                    # field, so an unsaved squad reads 0 there too.
+                    #
+                    # It fills in the first time the squad is saved, and any
+                    # edit saves it.
+                    "chemistry": int(squad.get("chemistry") or 0),
                 }
             )
         return json.dumps({"squad": entries}, separators=(",", ":")).encode()
@@ -1563,12 +1747,14 @@ class ClubInventory:
                 "id": squad_id,
                 "squadName": squad["name"],
                 "formation": squad["formation"],
-                "chemistry": 100 if fielded else 0,
+                # The squad screen recomputes this for itself; what matters
+                # is that the two documents agree on what the server knows.
+                "chemistry": int(squad.get("chemistry") or 0),
                 "starRating": rating,
                 "rating": rating,
                 "changed": False,
                 "players": players,
-                "manager": squad_manager(),
+                "manager": squad_manager(self, squad_id),
                 "actives": _presentation_items(self),
             },
             separators=(",", ":"),
@@ -1621,7 +1807,7 @@ class ClubInventory:
                 "rating": rating,
                 "changed": False,
                 "players": players,
-                "manager": squad_manager(),
+                "manager": squad_manager(self),
                 "actives": _presentation_items(self),
             },
             separators=(",", ":"),
@@ -1741,6 +1927,30 @@ def _market_copies(card: dict) -> int:
     return 3 + (_market_key(card) % (max(MARKET_SPREADS) - 2))
 
 
+def _card_tier(card: dict) -> str:
+    """Bronze, silver or gold, the way the market's Quality filter means it.
+
+    The rarity string settles an ordinary card -- "Non-Rare Bronze", "Rare
+    Silver" -- and that is what this used to match on, as a substring. It is
+    silent about every special: "Team of the Year", "Team of the Season",
+    "iMOTM" and "Legend" contain none of the three words, so a search for Gold
+    excluded all 296 of them, and the best cards in the game could not be found
+    by the filter most likely to be looking for them.
+
+    An in-form is a gold card. So where the name does not say, the rating does,
+    on the same boundaries packs use.
+    """
+    rarity = (card.get("rarity") or "").lower()
+    for tier in ("bronze", "silver", "gold"):
+        if tier in rarity:
+            return tier
+    rating = int(card.get("rating") or 0)
+    for tier, (low, high) in TIER_RATINGS.items():
+        if low <= rating <= high:
+            return tier
+    return "gold"
+
+
 def _market_listing_price(card: dict, index: int, count: int) -> int:
     """One seller's asking price, spread around the card's value."""
     value = _price_for(card.get("rating", 0), card.get("rareflag", 0), card)
@@ -1807,6 +2017,29 @@ def _price_for(rating: int, rareflag: int, card: dict | None = None) -> int:
 # category means.
 MARKET_CONSUMABLE_TYPES = {"development", "training"}
 
+# The CLUB ITEMS and STAFF tabs. `clubInfo` is what the console asks the market
+# for kits, badges, stadiums and balls; `staff` covers the manager and the four
+# coach families. Both fell through to the player search and found nothing.
+#
+# `clubInfo` carries a `cat` naming the family -- but only for badges and kits.
+# **Stadiums and balls come as types of their own**, which is why searching for
+# either still turned up the player list: they were never routed here. The
+# console's own queries, from the journal:
+#
+#     type=clubInfo&start=0&num=12&cat=badge
+#     type=clubInfo&start=0&num=12&lev=bronze&cat=kit
+#     type=stadium&start=0&num=12
+#     type=ball&start=0&num=12
+#     type=staff&start=0&num=12&cat=manager
+MARKET_CLUB_ITEM_FAMILIES = {"kit", "badge", "stadium", "ball"}
+MARKET_CLUB_ITEM_TYPES = {"clubinfo", "staff"} | MARKET_CLUB_ITEM_FAMILIES
+
+# How many of each family lead the listing -- one per (tier, rare) pair, so the
+# first page carries a bronze, a silver and a gold and the rare of each rather
+# than a wall of one colour. The rest of the family follows behind them; the tab
+# pages, and a market that holds six kits is a sample rather than a market.
+MARKET_CLUB_ITEM_COPIES = 6
+
 
 def _market_consumable_price(card: dict) -> int:
     """What a consumable asks on the market.
@@ -1828,6 +2061,30 @@ def market_consumables(query: dict[str, str]) -> list[dict]:
     """
     wanted = (query.get("cat") or "").strip().lower()
     family = CONSUMABLE_CATEGORIES.get(wanted)
+
+    # Quality, the same tiers a pack uses. The screen offers Bronze, Silver and
+    # Gold beside the category and sends `lev`; it was read for players and
+    # ignored here, so picking Bronze returned every card of the family.
+    #
+    # A consumable's tier is its rating, exactly as a player's is -- the
+    # catalogue splits cleanly on the existing boundaries, with player training
+    # at 55 and 64 bronze, 65 and 74 silver, 85 and 95 gold.
+    level = (query.get("lev") or query.get("level") or "").strip().lower()
+    span = TIER_RATINGS.get(level) if level not in ("", "any") else None
+
+    # One particular modifier, not the whole family. The screen sends the pair
+    # it is showing -- `pos=LB-LWB` for "LB >> LWB" -- and a search for one
+    # was answering with all twenty.
+    #
+    # `from` and `to` are on the card. The query names them in that order, so
+    # LB-LWB is the card that takes a left back and makes him a left wing back,
+    # and not its opposite number, which is a different card with its own id.
+    change = (query.get("pos") or query.get("position") or "").strip().upper()
+    pair = None
+    if change and change not in ("ANY",) and "-" in change:
+        head, _, tail = change.partition("-")
+        pair = (head.strip(), tail.strip())
+
     rows = []
     for card in _consumable_catalogue():
         kind = card["itemType"]
@@ -1838,6 +2095,16 @@ def market_consumables(query: dict[str, str]) -> list[dict]:
                 continue
         elif wanted and wanted not in CONSUMABLE_TYPES:
             continue
+        if span is not None:
+            rating = int(card.get("rating") or 0)
+            if not (span[0] <= rating <= span[1]):
+                continue
+        if pair is not None:
+            # Only a card that names a change can match one. Anything without
+            # `from`/`to` is filtered out rather than let through, because the
+            # screen asked for one modifier and means it.
+            if (card.get("from"), card.get("to")) != pair:
+                continue
         rows.append(card)
     return rows
 
@@ -1892,13 +2159,26 @@ class CardCatalogue:
         nation = number("nat") if query.get("nat") else number("nation")
         league = number("leag") if query.get("leag") else number("league")
         team = number("team")
-        min_rating, max_rating = number("minb"), number("maxb")
+        # Price, not rating. `minb`/`maxb` were read as a minimum and maximum
+        # **rating**, and this screen has no rating filter at all -- it offers
+        # Quality, Position, Chemistry Style, Nationality, League, Club and
+        # Pricing. So a Min. Price of 1000 asked for cards rated at least a
+        # thousand and emptied the market.
+        #
+        # `micr`/`macr` are the current-price pair and `minb`/`maxb` the buy-now
+        # pair. This server does not model a bid separately from a buy now at
+        # catalogue level -- both come from `_price_for`, which is stable per
+        # card because its jitter comes from the resource id -- so both pairs
+        # bound the same value. A card the screen shows at a price is a card
+        # the price filter agrees about, which is the part that has to hold.
+        min_price = number("micr") if query.get("micr") else number("minb")
+        max_price = number("macr") if query.get("macr") else number("maxb")
 
         def wanted(card: dict) -> bool:
             if definition and card.get("assetId") != definition:
                 return False
             if level and level not in ("any", ""):
-                if level not in (card.get("rarity") or "").lower():
+                if _card_tier(card) != level:
                     return False
             if position and position not in ("any", ""):
                 if card.get("position") != position:
@@ -1910,11 +2190,14 @@ class CardCatalogue:
             ):
                 if value not in (None, -1) and card.get(field) != value:
                     return False
-            rating = card.get("rating", 0)
-            if min_rating is not None and rating < min_rating:
-                return False
-            if max_rating is not None and rating > max_rating:
-                return False
+            if min_price is not None or max_price is not None:
+                price = _price_for(
+                    card.get("rating", 0), card.get("rareflag", 0), card
+                )
+                if min_price is not None and price < min_price:
+                    return False
+                if max_price is not None and price > max_price:
+                    return False
             return True
 
         # No exclusion by asset. Removing a bought player took every version
@@ -1932,12 +2215,18 @@ class CardCatalogue:
         kind = (query.get("type") or "").strip().lower()
         if kind in MARKET_CONSUMABLE_TYPES:
             return self.consumable_auctions(query, coins)
+        if kind in MARKET_CLUB_ITEM_TYPES:
+            return self.club_item_auctions(query, coins)
         page, total = self.search(query)
         listings = []
         try:
             offset = int(query.get("start") or 0)
         except ValueError:
             offset = 0
+        try:
+            wanted_style = int(query.get("playStyle") or 0)
+        except (TypeError, ValueError):
+            wanted_style = 0
         # A search for one particular player is the price-comparison screen,
         # and it expects to see what several sellers are asking. A broad
         # search is a different question and gets one listing a card.
@@ -1957,7 +2246,19 @@ class CardCatalogue:
                 asset_id=card["assetId"],
                 rating=card.get("rating", 0),
                 rare=card.get("rareflag", 0),
-                play_style=0,
+                # The chemistry style the search asked for, when it asked for
+                # one. The catalogue holds no style -- a style is applied by a
+                # consumable, not born with the card -- so every listing this
+                # server built carried Basic, and a search for Hunter matched
+                # nothing at all.
+                #
+                # Serving the style that was asked for is what a real market
+                # looks like: those cards are there because somebody applied a
+                # style and listed the result. It is the same class of thing as
+                # `_market_listing_price`, which invents what a seller wants,
+                # and `_market_copies`, which invents how many are selling.
+                # Unfiltered, the market stays Basic as before.
+                play_style=wanted_style,
                 team_id=card.get("clubId", 0),
                 attributes=card.get("attributes", [0] * 6),
                 position=card.get("position") or FALLBACK_POSITION,
@@ -2029,6 +2330,184 @@ class CardCatalogue:
         }
         if coins is not None:
             document.update({"credits": coins, "totalCredits": coins, "coins": coins})
+        return json.dumps(document, separators=(",", ":")).encode()
+
+    def club_item_auctions(
+        self, query: dict[str, str], coins: int | None = None
+    ) -> bytes:
+        """The CLUB ITEMS and STAFF tabs of the transfer market.
+
+        Both fell through to the player search and found nothing, so the two
+        tabs were empty however they were filtered. The console asks for them
+        the same way it asks for consumables:
+
+            type=clubInfo&start=0&num=12&cat=badge
+            type=staff&start=0&num=12&cat=manager
+
+        `cat` names the family. A tab with no `cat` gets a few of each, which
+        is what the screen shows before anything is chosen.
+
+        **A handful of each, not the catalogue.** There are 2,035 club items
+        and listing them all would make the tab a directory rather than a
+        market -- the player asked for five apiece, which is enough to search,
+        filter and buy against.
+        """
+        kind = (query.get("type") or "").strip().lower()
+        wanted = (query.get("cat") or query.get("category") or "").strip().lower()
+        # A stadium or a ball names itself in `type` and sends no `cat`.
+        if not wanted and kind in MARKET_CLUB_ITEM_FAMILIES:
+            wanted = kind
+
+        def families() -> list[tuple[str, list[dict]]]:
+            if kind == "staff":
+                out = [("manager", list(manager_catalogue()))]
+                by_kind: dict[str, list[dict]] = {}
+                for row in staff_catalogue():
+                    by_kind.setdefault(row["itemType"], []).append(row)
+                out += sorted(by_kind.items())
+                return out
+            by_kind = {}
+            for row in _clubitem_catalogue():
+                by_kind.setdefault(row["itemType"], []).append(row)
+            return sorted(by_kind.items())
+
+        # `lev`, which is what the console sends -- the quality filter did
+        # nothing because this read `level` alone.
+        level = (query.get("lev") or query.get("level") or "").strip().lower()
+
+        def spread(members: list[dict]) -> list[dict]:
+            """A few of a family, across its qualities rather than off the top.
+
+            Taking the first five handed back the five lowest-rated bronzes of
+            every family: the catalogue is in resource order, and resource
+            order is quality order. The tab then showed a wall of bronze and
+            its quality filter had nothing to sort.
+
+            One of each (tier, rare) pair first -- bronze, silver, gold, and
+            the rare of each -- then whatever is left over to make up the
+            count.
+            """
+            if level and level not in ("any", "-1", ""):
+                members = [
+                    row for row in members
+                    if str(row.get("tier") or "").lower() == level
+                ]
+            seen: dict[tuple, dict] = {}
+            for row in members:
+                key = (row.get("tier"), row.get("rare"))
+                seen.setdefault(key, row)
+            # Tier first, then the rare of each, so a short page still shows a
+            # bronze, a silver and a gold rather than two bronzes and a silver.
+            order = {"bronze": 0, "silver": 1, "gold": 2}
+            ranked = sorted(
+                seen.items(),
+                key=lambda kv: (int(kv[0][1] or 0), order.get(kv[0][0], 3)),
+            )
+            # **Everything, with one of each grade in front.**
+            #
+            # This used to stop at six. Six is right for the first page -- a
+            # bronze, a silver and a gold, and the rare of each, so the tab
+            # opens on a spread rather than a wall of one colour -- and wrong
+            # for the tab, which pages: a market that holds six kits is a
+            # sample, not a market.
+            #
+            # So the grades lead and the rest of the family follows behind
+            # them, in the table's own order. That order is a standing order --
+            # 6000000 is FC Barcelona, 6000600 is Drogheda United -- so page
+            # one carries the crests a player is actually looking for.
+            lead = [row for _, row in ranked]
+            chosen = {id(row) for row in lead}
+            return lead + [row for row in members if id(row) not in chosen]
+
+        wanted_families: list[tuple[str, list[dict]]] = []
+        for family, members in families():
+            # `badge` is what the screen asks for; the wire type is `custom`.
+            if wanted and wanted != family.lower():
+                continue
+            picked = spread(members)
+            if picked:
+                wanted_families.append((family, picked))
+
+        # Round-robin, not one family after another. Listed in family order,
+        # a page of twelve held five badges, five balls and two kits, and never
+        # reached the stadiums at all -- which is what "stadiums do not show
+        # up" was.
+        # Round-robin, not one family after another. Listed in family order, a
+        # page of twelve held six badges and six balls and never reached the
+        # stadiums at all.
+        rows: list[tuple[str, dict]] = []
+        longest = max((len(picked) for _, picked in wanted_families), default=0)
+        for index in range(longest):
+            for family, picked in wanted_families:
+                if index < len(picked):
+                    rows.append((family, picked[index]))
+
+        def number(key: str, fallback: int) -> int:
+            try:
+                return int(query.get(key) or fallback)
+            except (TypeError, ValueError):
+                return fallback
+
+        start = max(0, number("start", 0))
+        count = max(1, min(50, number("num", 20)))
+        total = len(rows)
+        page = rows[start:start + count]
+
+        listings = []
+        for family, row in page:
+            CardCatalogue._issued += 1
+            item_id = MARKET_ITEM_ID_BASE + CardCatalogue._issued
+            if family == "manager":
+                item = _manager_item(row, item_id)
+                rating = int(row.get("rating") or 0)
+            elif kind == "staff":
+                item = _staff_item(row, item_id)
+                rating = int(row.get("rating") or 0)
+            else:
+                item = _club_item(
+                    family, int(row["assetId"]), int(row["resourceId"]), item_id,
+                    rating=row.get("rating"), rare=row.get("rare"),
+                    discard=row.get("discardValue"),
+                )
+                rating = int(row.get("rating") or 0)
+            # A club item's quick-sell value is tiny -- a kit is worth 3 --
+            # so anchoring on it alone priced every kit, badge, stadium and
+            # ball at the 200 floor. The rating carries it instead, so an
+            # 88-rated stadium costs more than a 48-rated badge, with the
+            # discard value still setting the floor the way it does for a
+            # consumable. A house choice, like every other price in this file.
+            price = max(
+                200,
+                int(item.get("discardValue") or discard_value(rating)) * 5,
+                rating * 10,
+            )
+            listings.append(
+                {
+                    "tradeId": MARKET_TRADE_ID_BASE + CardCatalogue._issued,
+                    "itemData": item,
+                    "tradeState": "active",
+                    "startingBid": max(150, int(price * 0.8)),
+                    "buyNowPrice": price,
+                    "currentBid": 0,
+                    "offers": 0,
+                    "watched": False,
+                    "bidState": "none",
+                    "expires": AUCTION_DURATION,
+                    "sellerName": "",
+                    "sellerEstablished": 2013,
+                    "sellerId": 0,
+                    "tradeOwner": False,
+                }
+            )
+        document: dict = {
+            "auctionInfo": listings,
+            "duplicateItemIdList": [],
+            "total": total,
+        }
+        if coins is not None:
+            document.update(
+                {"credits": coins, "totalCredits": coins, "coins": coins}
+            )
         return json.dumps(document, separators=(",", ":")).encode()
 
     def consumable_auctions(
@@ -2178,6 +2657,48 @@ class CardCatalogue:
 # at the top level is skipped, so naming all three costs nothing and a wrapper
 # would have broken the parse, as {"userInfo":{...}} did.
 
+def _user_currencies(coins: int) -> dict:
+    """The currencies array on `/user`. This is what fills the club header.
+
+    Settled on the console 25 August 2026: with this array on `/user`, the
+    balance is on the header at login, before any navigation. It had read zero
+    there since the project began.
+
+    Every balance member `/user` already carried is **flat** -- `credits`,
+    `totalCredits`, `coins`, `funds`, `finalFunds` -- and none of them was it.
+    That was measured on 16 August: the same reply wrote the win/draw/loss
+    record correctly and printed zero coins beside it, so the document was
+    parsed, its members were read, and the coin field simply did not bind to
+    any of the five.
+
+    It binds to the array. `FutUserCreditsServerResponse` takes lower-case
+    currency names -- "COINS", which the PC reference's fixture uses, matches
+    nothing -- which is why each entry carries `name`, `funds` and `finalFunds`
+    rather than a bare number. `/user/credits` is built this way and is the one
+    document that always filled the header; it is fetched on screen
+    transitions and never during login, which is why the figure used to appear
+    the moment the store was opened and not before.
+
+    **Why it took so long to find.** Seven routes were swept across both
+    shapes -- `hub`, `eventfeed`, `clubUser`, `clientdata/tutorialpopups`,
+    `clientdata/userHubData`, `userdata`, `store/transaction` -- and every one
+    of them is fed by `with_balance`. `/user` builds its own document, so it
+    got the flat members by hand and the sweep never reached it. The route that
+    was fetched twice in the login fan-out, was demonstrably parsed, and
+    carried the club name, the badge and the record was the one route nobody
+    tested.
+
+    The array goes **beside** the flat members, not instead of them. Wrapping
+    this document is what made the header print 0xCDCDCDCD.
+    """
+    return {
+        "currencies": [
+            {"name": "coins", "funds": int(coins), "finalFunds": int(coins)},
+            {"name": "points", "funds": 0, "finalFunds": 0},
+        ]
+    }
+
+
 STARTING_COINS = 1_000_000
 
 
@@ -2317,6 +2838,7 @@ class Wallet:
                 "finalFunds": self.coins,
                 "points": 0,
                 "fifaPoints": 0,
+                **_user_currencies(self.coins),
             },
             separators=(",", ":"),
         ).encode()
@@ -2344,72 +2866,131 @@ class Wallet:
 # contract, kit or manager has ever come out of one, and why the club's
 # consumables tab has only ever shown what the club was seeded with. A players
 # pack is the exception the name promises: all twelve.
+# The store, as the player wrote it out on 26 August against the retail text.
+#
+# `name` is drawn in **capitals**, which is how FIFA 14's store had it, and
+# `blurb` is the pack's own description -- both resolve through
+# `packs/loc/storepackdescriptions.<locale>.xml`, keyed `FUT_STORE_PACK_<id>_NAME`
+# and `_DESC`. The blurb used to be generated from the counts below, which is
+# why it read "12 items, 3 of them players, 1 rare" instead of retail's own
+# sentence.
+#
+# `art` is the tile's cover. Bronze is 1, silver 2, gold 3, and the special
+# group has one of its own: **4**, seen rendering on this console on
+# 26 August. The 4/5/6 spread came from `MarvelcoCode/Impulsum14` and answers
+# the player's question about the special tiles looking different in retail;
+# 5 and 6 have never been drawn here, so the whole group wears 4 until they
+# are. An asset id that has not been looked at is how a tile draws NOT FOUND.
+#
+# The prices are a house choice, as they have always been in this file: the
+# binary names the fields and says nothing about what a pack should cost.
 PACK_SPECS: dict[int, dict] = {
-    103: {"name": "Bronze Pack", "tier": "bronze", "coins": 400, "points": 0,
+    103: {"name": "BRONZE PACK", "tier": "bronze", "coins": 400, "points": 0,
           "count": 12, "rares": 1, "players": 3, "premium": False,
-          "group": "Bronze Packs"},
-    104: {"name": "Premium Bronze Pack", "tier": "bronze", "coins": 750,
+          "group": "BRONZE PACKS", "art": 1,
+          "blurb": "Great value for increasing club depth. A mix of 12 items, "
+                   "including players, club items and consumables, at least 10 "
+                   "Bronze with 1 rare."},
+    104: {"name": "PREMIUM BRONZE PACK", "tier": "bronze", "coins": 750,
           "points": 0, "count": 12, "rares": 3, "players": 3, "premium": True,
-          "group": "Bronze Packs"},
-    203: {"name": "Silver Pack", "tier": "silver", "coins": 2500, "points": 50,
+          "group": "BRONZE PACKS", "art": 1,
+          "blurb": "Triple the rares of a standard bronze pack. A mix of 12 "
+                   "items, including players, club items and consumables, at "
+                   "least 10 Bronze with 3 rare."},
+    203: {"name": "SILVER PACK", "tier": "silver", "coins": 2500, "points": 50,
           "count": 12, "rares": 1, "players": 3, "premium": False,
-          "group": "Silver Packs"},
-    204: {"name": "Premium Silver Pack", "tier": "silver", "coins": 3750,
+          "group": "SILVER PACKS", "art": 2,
+          "blurb": "Great value for building mid-tiered squads. A mix of 12 "
+                   "items, including players, club items and consumables, with "
+                   "at least 10 Silver items and 1 rare."},
+    204: {"name": "PREMIUM SILVER PACK", "tier": "silver", "coins": 3750,
           "points": 75, "count": 12, "rares": 3, "players": 3, "premium": True,
-          "group": "Silver Packs"},
-    303: {"name": "Gold Pack", "tier": "gold", "coins": 5000, "points": 100,
+          "group": "SILVER PACKS", "art": 2,
+          "blurb": "Triple the rares of a standard silver pack. A mix of 12 "
+                   "items, including players and consumables, with at least 10 "
+                   "Silver items and 3 rare items."},
+    303: {"name": "GOLD PACK", "tier": "gold", "coins": 5000, "points": 100,
           "count": 12, "rares": 1, "players": 3, "premium": False,
-          "group": "Gold Packs"},
-    304: {"name": "Premium Gold Pack", "tier": "gold", "coins": 7500,
+          "group": "GOLD PACKS", "art": 3,
+          "blurb": "A mix of 12 items, including players, contracts, stadiums, "
+                   "managers, staff, fitness, healing, balls, kits, and badges. "
+                   "Gold packs consist mostly of players rated 75+ in-game, and "
+                   "include one rare item, such as enhanced player attributes, "
+                   "longer contracts, and coveted players."},
+    304: {"name": "PREMIUM GOLD PACK", "tier": "gold", "coins": 7500,
           "points": 150, "count": 12, "rares": 3, "players": 3, "premium": True,
-          "group": "Gold Packs"},
-    305: {"name": "Jumbo Gold Pack", "tier": "gold", "coins": 10000,
-          "points": 0, "count": 24, "rares": 7, "players": 8, "premium": True,
-          "group": "Gold Packs"},
-    306: {"name": "Gold Players Pack", "tier": "gold", "coins": 15000,
-          "points": 0, "count": 12, "rares": 1, "players": 12,
-          "premium": False, "group": "Gold Packs"},
-    307: {"name": "Premium Gold Players Pack", "tier": "gold", "coins": 25000,
-          "points": 0, "count": 12, "rares": 3, "players": 12, "premium": True,
-          "group": "Gold Packs"},
+          "group": "GOLD PACKS", "art": 3,
+          "blurb": "The best pack for finding those elite players to fill out "
+                   "your best squad. Includes 12 Items, mostly Gold and 3 rare."},
+    305: {"name": "JUMBO PREMIUM GOLD PACK", "tier": "gold", "coins": 15000,
+          "points": 300, "count": 24, "rares": 7, "players": 8, "premium": True,
+          "group": "GOLD PACKS", "art": 3,
+          "blurb": "A mix of 24 items - including players and consumables - "
+                   "with at least 20 Gold items and 7 rare items."},
+    307: {"name": "PREMIUM GOLD PLAYERS PACK", "tier": "gold", "coins": 25000,
+          "points": 350, "count": 12, "rares": 3, "players": 12, "premium": True,
+          "group": "GOLD PACKS", "art": 3,
+          "blurb": "12 Gold players, including 3 rare player items, with no "
+                   "non-player items (purely players to build out your squad)."},
 
-    # Packs this server adds. Retail FIFA 14 had no consumables-only pack and
-    # nothing above 25 000, so these are not reconstructions of anything --
-    # they are what an offline club with no store behind it needs to keep
-    # being worth playing.
+    # Packs this server adds. Retail FIFA 14 had no consumables-only pack, so
+    # this is not a reconstruction of anything -- it is what an offline club
+    # with no store behind it needs to keep being worth playing.
     #
     # `players` 0 makes a pack all consumables and club items; `guaranteed`
-    # promises that many specials rather than rolling for them; `families`
-    # replaces the house spread, so a Team of the Week pack cannot hand you a
-    # Team of the Year instead.
-    108: {"name": "Consumables Pack", "tier": "silver", "coins": 2000,
-          "points": 0, "count": 12, "rares": 2, "players": 0, "premium": False,
-          "group": "Consumables"},
-    109: {"name": "Premium Consumables Pack", "tier": "gold", "coins": 6000,
-          "points": 0, "count": 24, "rares": 8, "players": 0, "premium": True,
-          "group": "Consumables"},
-    308: {"name": "Rare Gold Pack", "tier": "gold", "coins": 100000,
-          "points": 0, "count": 12, "rares": 12, "players": 12, "premium": True,
-          "group": "Gold Packs"},
-    309: {"name": "Team of the Week Pack", "tier": "gold", "coins": 50000,
-          "points": 0, "count": 12, "rares": 12, "players": 12, "premium": True,
-          "guaranteed": 1, "families": {"team of the week": 1.0},
-          "group": "Special Packs"},
-    310: {"name": "Team of the Season Pack", "tier": "gold", "coins": 250000,
-          "points": 0, "count": 12, "rares": 12, "players": 12, "premium": True,
-          "guaranteed": 2,
-          "families": {"team of the season": 70.0, "team of the year": 12.0,
-                       "record breaker": 6.0, "team of the week": 12.0},
-          "group": "Special Packs"},
+    # promises that many specials rather than rolling for them.
+    #
+    # The plain Consumables Pack is gone, 26 August, at the player's request:
+    # two consumable packs is one more than a club needs and the premium one is
+    # the one worth buying.
+    109: {"name": "PREMIUM CONSUMABLES PACK", "tier": "gold", "coins": 20000,
+          "points": 400, "count": 24, "rares": 8, "players": 0, "premium": True,
+          "group": "SPECIAL PACKS", "art": 4,
+          "blurb": "24 consumable and club items, 8 of them rare. Contracts, "
+                   "fitness, training, healing, kits, badges, stadiums and "
+                   "balls."},
+
+    # The special packs, rewritten 26 August. What was here -- a Team of the
+    # Week pack and a Team of the Season pack -- is gone at the player's
+    # request. Their covers are their own: art 4, 5 and 6 rather than the gold
+    # tile the whole group used to wear.
+    # `players` was 12 here until 27 August, which made this pack draw twelve
+    # players -- byte for byte the Rare Players Pack at half the price, and
+    # nothing its own description promises. A Rare Gold Pack is the all-rare
+    # version of a Gold Pack, so it takes a Gold Pack's mix: 3 players and 9
+    # consumables and club items. `rares` 12 with `count` 12 makes every slot
+    # rare whatever kind it holds, extras included, which is the whole point
+    # of the pack and what separates it from 307 at the same price -- 307
+    # gives you all players and 3 rares, this gives you 12 rares and a mix.
+    308: {"name": "RARE GOLD PACK", "tier": "gold", "coins": 25000,
+          "points": 500, "count": 12, "rares": 12, "players": 3, "premium": True,
+          "group": "SPECIAL PACKS", "art": 4,
+          "blurb": "A full mix of 12 gold items, including players and "
+                   "consumables, where every single item is rare."},
+    405: {"name": "RARE PLAYERS PACK", "tier": "gold", "coins": 50000,
+          "points": 1000, "count": 12, "rares": 12, "players": 12, "premium": True,
+          "group": "SPECIAL PACKS", "art": 4,
+          "blurb": "A pack containing 12 items, and all 12 items are rare gold "
+                   "players."},
+    404: {"name": "MEGA PACK", "tier": "gold", "coins": 35000,
+          "points": 700, "count": 30, "rares": 18, "players": 12, "premium": True,
+          "group": "SPECIAL PACKS", "art": 4,
+          "blurb": "Includes 18 rare items out of the 30 total items."},
+    406: {"name": "JUMBO RARE PLAYERS PACK", "tier": "gold", "coins": 100000,
+          "points": 2000, "count": 24, "rares": 24, "players": 24, "premium": True,
+          "group": "SPECIAL PACKS", "art": 4,
+          "blurb": "The most unique top rated players, all in a single pack! "
+                   "Includes 24 items, all gold, all players, and all rare."},
 }
 
 # The order the store lists its groups in, cheapest first.
 GROUP_ORDER = {
-    "Bronze Packs": 0,
-    "Silver Packs": 1,
-    "Gold Packs": 2,
-    "Consumables": 3,
-    "Special Packs": 4,
+    "BRONZE PACKS": 0,
+    "SILVER PACKS": 1,
+    "GOLD PACKS": 2,
+    # The consumables group is gone, 26 August. One pack does not need a tab of
+    # its own, and the premium consumables pack is a special pack by price.
+    "SPECIAL PACKS": 3,
 }
 
 GOLD_PACK_ID = 304
@@ -2489,13 +3070,16 @@ RARE_BAND_MULTIPLIER = {(84, 86): 1.2, (87, 89): 1.45, (90, 99): 1.8}
 SPECIAL_CHANCE = {
     103: 0.010, 104: 0.020,
     203: 0.025, 204: 0.045,
-    303: 0.11, 304: 0.20, 305: 0.30, 306: 0.25, 307: 0.40,
-    # The added packs. 108 and 109 hold no players at all, so their chance
-    # is nought by construction; 308 is all rare golds and pays for it.
-    308: 0.45, 309: 1.0, 310: 1.0,
+    303: 0.11, 304: 0.20, 305: 0.30, 307: 0.40,
+    # The special group, in the order the store lists it. 109 holds no players
+    # at all, so its chance is nought by construction. The odds rise with the
+    # price -- they did not when the prices were set on 26 August, and a Mega
+    # Pack at 35 000 was drawing better than a Rare Players Pack at 50 000.
+    308: 0.45, 404: 0.55, 405: 0.70, 406: 0.80,
 }
-SECOND_SPECIAL_CHANCE = {303: 0.01, 304: 0.02, 305: 0.03, 306: 0.03,
-                         307: 0.05, 308: 0.10, 309: 0.25, 310: 0.35}
+SECOND_SPECIAL_CHANCE = {303: 0.01, 304: 0.02, 305: 0.03,
+                         307: 0.05, 308: 0.10, 404: 0.15, 405: 0.30,
+                         406: 0.35}
 MAX_SPECIALS_PER_PACK = 2
 # A pack that promises more than the house limit gets what it promises;
 # see `guaranteed` in PACK_SPECS.
@@ -2518,7 +3102,20 @@ def _pack_identity(card: dict) -> tuple:
     through. Inside one pack, the asset and the rare flag are exactly
     "the same player, the same card".
     """
-    return card_signature(card)
+    # **The asset, and nothing else.** One player, once, per pack.
+    #
+    # This delegated to `card_signature`, which separates two versions of one
+    # player -- it has to, or a Team of the Year 98 reads as a repeat of a Team
+    # of the Year 92 in the club. Inside a single pack that is the wrong
+    # question: a Mega Pack drew an 85 MOTM and an 84 MOTM of the same man, two
+    # different cards by the club's reckoning and the same face twice on the
+    # pack screen.
+    #
+    # The rare flag came off too, 26 August. Keying on asset and flag still let
+    # a rare gold and a non-rare gold of one player share a pack -- fifteen
+    # times in 5,600 opens -- and the player asked for the plain rule: never
+    # the same player twice, ever.
+    return (card.get("assetId"),)
 
 # Which special, when there is one. By weight, not by how many of each the
 # catalogue holds.
@@ -2592,21 +3189,33 @@ def store_pack_descriptions() -> bytes:
         "<localization>",
     ]
     for pack_id, spec in sorted(PACK_SPECS.items()):
-        players = int(spec.get("players", 0))
-        count = int(spec.get("count", 12))
-        rares = int(spec.get("rares", 0))
-        if players >= count:
-            body = f"{count} players, {rares} rare."
-        elif players:
-            body = (
-                f"{count} items, {players} of them players, {rares} rare."
-            )
-        else:
-            body = f"{count} consumable and club items, {rares} rare."
-        text = f"{spec['name']}. {body}"
+        # The pack's own words. These were generated from the counts until
+        # 26 August -- "12 items, 3 of them players, 1 rare" -- which is a
+        # description of a pack rather than the pack's description. The retail
+        # text is on the spec now and goes out verbatim.
+        #
+        # A spec with no blurb still gets a sentence rather than nothing.
+        text = spec.get("blurb")
+        if not text:
+            players = int(spec.get("players", 0))
+            count = int(spec.get("count", 12))
+            rares = int(spec.get("rares", 0))
+            if players >= count:
+                text = f"{count} players, {rares} rare."
+            elif players:
+                text = f"{count} items, {players} of them players, {rares} rare."
+            else:
+                text = f"{count} consumable and club items, {rares} rare."
         lines.append(
             f'  <trans-unit resname="FUT_STORE_PACK_{pack_id}_DESC">'
             f"<source>{_xml_text(text)}</source></trans-unit>"
+        )
+        # And the pack's own name, for the line beside the FUT 14 logo. The
+        # store entry carries this key in `name` and `title`; see
+        # `store_catalogue` for why it is a key rather than the text.
+        lines.append(
+            f'  <trans-unit resname="FUT_STORE_PACK_{pack_id}_NAME">'
+            f"<source>{_xml_text(spec['name'])}</source></trans-unit>"
         )
     # The cup names go in this document too.
     #
@@ -2623,6 +3232,43 @@ def store_pack_descriptions() -> bytes:
             f'  <trans-unit resname="TOURNY_LOC_{cup}">'
             f"<source>{_xml_text(title)}</source></trans-unit>"
         )
+    # The entry-requirement strings, while the probe is reading the key space.
+    #
+    # Measured on the console 26 August: a cup served `eligibilityKey` 4 drew
+    #
+    #     *LOC_TOURN_ELG_KEY_16
+    #     undefined
+    #
+    # in its Entry Requirements panel. The leading `*` is an unresolved
+    # localisation key -- the same mark the cup names carried before this
+    # document answered them -- so the disc has no text for these and the text
+    # is this server's to supply.
+    #
+    # CardsDLL carries four templates: `LOC_TOURN_ELG_KEY_%d`,
+    # `LOC_TOURN_ELG_SCOPE_%d`, `LOC_TOURN_ELG_DOMAIN_%d` and
+    # `LOC_TOURN_ELG_DOMAIN_LIST_%d`. So a requirement reads as a key, a scope
+    # and a domain assembled together, which is exactly the shape of "Max.
+    # number of leagues: 4 in the squad's starting 11".
+    #
+    # One reading is not a mapping. `eligibilityKey` 4 produced index 16 and a
+    # single point fits any number of formulas, so these go out numbered: each
+    # string names its own index, and one pass along the fourteen tiles reads
+    # the whole relation off the screen instead of guessing at it.
+    if eligibility_probe()[0]:
+        for index in range(ELG_PROBE_STRINGS):
+            lines.append(
+                f'  <trans-unit resname="LOC_TOURN_ELG_KEY_{index}">'
+                f"<source>KEY {index}</source></trans-unit>"
+            )
+        for index in range(ELG_PROBE_SCOPES):
+            lines.append(
+                f'  <trans-unit resname="LOC_TOURN_ELG_SCOPE_{index}">'
+                f"<source>SCOPE {index}</source></trans-unit>"
+            )
+            lines.append(
+                f'  <trans-unit resname="LOC_TOURN_ELG_DOMAIN_{index}">'
+                f"<source>DOMAIN {index}</source></trans-unit>"
+            )
     lines.append("</localization>")
     return ("\n".join(lines) + "\n").encode("utf-8")
 
@@ -2663,7 +3309,12 @@ def store_catalogue(timestamp: int = 2147483647) -> bytes:
         # The asset id names the tier's artwork, not the pack: the PC
         # reference ships assetId 3 for the gold pack. Deriving it from the
         # pack id resolved to nothing and the bronze tiles drew NOT FOUND.
-        tier_asset = {"bronze": 1, "silver": 2, "gold": 3}[spec["tier"]]
+        # The pack's own cover. Bronze 1, silver 2, gold 3 -- and the special
+        # packs carry 4, 5 and 6, which is why that group's tiles look
+        # different from the gold ones they used to share art with.
+        tier_asset = int(
+            spec.get("art") or {"bronze": 1, "silver": 2, "gold": 3}[spec["tier"]]
+        )
         # `value` is drawn as the group's heading, verbatim -- the store showed
         # "bronze", "silver" and "gold" in lower case because that is what it
         # was handed. It is not a localisation key: the packs' own
@@ -2681,6 +3332,35 @@ def store_catalogue(timestamp: int = 2147483647) -> bytes:
                 "actionType": "CREATEPACK",
                 "packType": "CARDPACK",
                 "description": f"FUT_STORE_PACK_{pack_id}_DESC",
+                # The pack's own name, for the line beside the FUT 14 logo.
+                #
+                # Retail draws "PREMIUM GOLD PACK" there and the description
+                # underneath it. This server had no name member at all, so that
+                # line fell back to the group heading -- every gold pack read
+                # "Gold Packs" -- and the name was only visible because
+                # `store_pack_descriptions` prepends it to the description
+                # text. Reported from the console 26 August against a retail
+                # screenshot.
+                #
+                # `name` and `title` are both in CardsDLL's table and neither
+                # has ever been sent, so which one the detail pane reads is
+                # untested. Both go out: an unrecognised sibling at the top
+                # level is skipped, and offering two costs nothing.
+                #
+                # **A key, not the text.** Written out first, on 26 August, on
+                # the reasoning that `displayGroup.value` is drawn verbatim so
+                # this screen takes plain text somewhere. The line came back
+                # **blank**, which is the useful answer: blank means the member
+                # is read and looked up, and "Premium Gold Pack" is not a key
+                # any table holds. Had it been ignored the group heading would
+                # still have been there.
+                #
+                # So it resolves the way `description` beside it does, through
+                # `packs/loc/storepackdescriptions.<locale>.xml` -- a document
+                # this console fetches 1,066 times across these journals and
+                # which `store_pack_descriptions` already answers.
+                "name": f"FUT_STORE_PACK_{pack_id}_NAME",
+                "title": f"FUT_STORE_PACK_{pack_id}_NAME",
                 "displayGroup": {
                     # Unique per pack, which is what the document that
                     # rendered had. The client groups by `value`, so the
@@ -3161,6 +3841,60 @@ class PackShop:
             seen.add(signature)
         return duplicates
 
+    def items_by_id(self, ids: list[int]) -> bytes:
+        """`GET /item?idList=a,b` -- the cards behind those ids.
+
+        **This is what "MY CURRENT ITEM: undefined" was.** The duplicate panel
+        compares two cards, and it asks for both by id right before it draws
+        them: every one of the 48 requests in these journals carries exactly
+        two ids, the new card and the owned one it repeats.
+
+            GET /ut/game/fifa14/item?idList=1950012526,1700000002
+
+        This server answered a static `{"itemData":[]}` to all of them, so the
+        panel had a number for the owned card and no card. The new one drew
+        because the pack response had already handed it over.
+
+        It is not only the duplicate panel: any screen holding an id it has no
+        card for can ask here, which is the general answer to a club too large
+        for `/clubUser`'s cache. That route sends 146 of this club's 1,597
+        cards, and the other 1,451 had no way to be drawn at all.
+
+        Order follows the request, and an id this club does not hold is left
+        out rather than answered with a blank -- a card that is not there is
+        not a card with no members.
+        """
+        wanted = [int(item_id) for item_id in ids if item_id]
+        pools: list[list[dict]] = [self.pending]
+        if self.inventory is not None:
+            pools.append(self.inventory.items)
+        by_id: dict[int, dict] = {}
+        for pool in pools:
+            for item in pool:
+                item_id = item.get("id")
+                if item_id and item_id not in by_id:
+                    by_id[int(item_id)] = item
+        found = [by_id[item_id] for item_id in wanted if item_id in by_id]
+        return json.dumps({"itemData": found}, separators=(",", ":")).encode()
+
+    def _client_cache(self) -> set[int]:
+        """Every owned card the console can draw without asking again.
+
+        The active squad, which `/squad/active` fetches every session and in
+        full, **and** whatever `/clubUser` sent -- that route is the client's
+        face-card cache and it reads it once. A card in neither is a card the
+        duplicate panel has a number for and no picture of.
+        """
+        club = self.inventory
+        if club is None:
+            return set()
+        cached = {
+            item["id"] for item in getattr(club, "squad", []) or []
+            if isinstance(item, dict) and item.get("id")
+        }
+        cached |= set(getattr(club, "cached_ids", set()) or set())
+        return cached
+
     def purchased_items(self) -> bytes:
         return json.dumps(
             {
@@ -3181,6 +3915,11 @@ class PackShop:
                 "duplicateItemIdList": pile_duplicate_pairs(
                     self.pending,
                     self.inventory.items if self.inventory else [],
+                    # The squad is the one part of the club the console is
+                    # always holding: `/squad/active` is fetched every session
+                    # and in full, where the club is paged eleven at a time and
+                    # only as far as somebody scrolled.
+                    self._client_cache(),
                 ),
                 "itemData": self.pending,
                 "credits": self.wallet.coins,
@@ -3227,6 +3966,11 @@ CONSUMABLE_WIRE_TYPE = {
     # Modifier -- Manager, 3-4-1-2" and cannot resolve the art for. Art 34
     # beside them renders fine, so this is the id and not the family.
     "formationManager": "development",
+    # Subtypes 300-326, one per league. `training` is what the game's own
+    # database calls them and what the member name they count under says --
+    # `consumablesTrainingManagerLeagueModifier`. See
+    # `tools/manager_league_mods.py` for where the block was named.
+    "managerLeagueModifier": "training",
 }
 
 # The families themselves, as `tools/build_consumables.py` names them. Used to
@@ -3304,6 +4048,11 @@ PLAY_STYLE_GK = (121, 136)
 # the range. See `docs/CONSUMABLES.md`.
 CHEMISTRY_FIRST = 250
 CHEMISTRY_LAST = 268
+
+# The manager league modifiers, one per league -- see
+# `tools/manager_league_mods.py`. The card's `amount` is the league it names.
+MANAGER_LEAGUE_FIRST = 300
+MANAGER_LEAGUE_LAST = 326
 HEALING_FIRST, HEALING_ANY = 211, 218
 FITNESS_PLAYER, FITNESS_SQUAD = 219, 220
 
@@ -3479,6 +4228,24 @@ class ConsumableRack:
                 ATTRIBUTE_CEILING, int(target.get("contract", 0)) + gain
             )
             return [target], f"contract +{gain}"
+
+        # The manager's league. Subtypes 300-326, one per league, and the
+        # card's `amount` is the league it names -- 13 the Premier League, 16
+        # Ligue 1, 53 La Liga.
+        #
+        # A manager card carries `leagueId` and `leagueid`, both of them, which
+        # is how it gives chemistry to players from that league. Changing it is
+        # the whole point of the card, and it is the one manager consumable
+        # whose effect this server can state without guessing.
+        if MANAGER_LEAGUE_FIRST <= subtype <= MANAGER_LEAGUE_LAST:
+            if kind != "manager":
+                raise ConsumableRefused("a league modifier needs a manager")
+            league = int(row.get("amount") or 0)
+            if not league:
+                raise ConsumableRefused("this modifier names no league")
+            target["leagueId"] = league
+            target["leagueid"] = league
+            return [target], f"league {league}"
 
         if kind != "player":
             raise ConsumableRefused("this card can only be applied to a player")
@@ -3702,7 +4469,30 @@ class ConsumableRack:
         return [target], f"healing -{amount} match(es)"
 
     def _squad_fitness(self, amount: int) -> list[dict]:
-        squad = [item for item in self.inventory.squad if isinstance(item, dict)]
+        """A team fitness card restores the **whole active squad**.
+
+        It used to restore `inventory.squad`, which is the list built at load
+        time and only ever rewritten for squad 1. A club with squad 2 active --
+        "Classic XI", 22 players, on 26 August -- had its card spent on squad
+        1's eleven instead, so the side about to play got nothing.
+
+        The squad store is what knows the answer: the active id, and that
+        squad's own player ids. The legacy list is the fallback for a club that
+        has never saved a squad at all.
+        """
+        club = self.inventory
+        squad: list[dict] = []
+        squads = club._squads() if hasattr(club, "_squads") else {}
+        entry = squads.get(club.active_squad_id()) if squads else None
+        if entry:
+            by_id = {item["id"]: item for item in club.items if item.get("id")}
+            squad = [
+                by_id[item_id]
+                for item_id in (entry.get("players") or [])
+                if item_id and item_id in by_id
+            ]
+        if not squad:
+            squad = [item for item in club.squad if isinstance(item, dict)]
         if not squad:
             raise ConsumableRefused("there is no active squad to restore")
         for player in squad:
@@ -4349,29 +5139,34 @@ class CardActions:
         """A card sent to the transfer list but not put up for sale yet.
 
         Sending a card to the transfer list takes it out of the club -- it has
-        to, or it shows in both places at once -- and until now the trade pile
-        answered with the listings alone, so the card was in neither. It went
-        the way the lost pack cards and the withdrawn contracts went: quietly,
-        with the screen showing nothing where it should have been. The same
-        symptom is reported against the PC revival, where unlisted pile-5 cards
-        were disappearing from the Transfer List.
+        to, or it shows in both places at once -- and until 18 August the trade
+        pile answered with the listings alone, so the card was in neither.
 
-        `tradeId` 0 is the native "no auction yet" sentinel. The state is
-        `inactive` because Kyro's build tags an unlisted pile card that way. The
-        card carries `pile` 5 and `itemState` free so the screen knows it is on
-        the list and available.
+        **`tradeId` 0 and no trade state**, which is what
+        `MarvelcoCode/Impulsum14` serves and what this console accepted on
+        26 August: the cards read as unlisted rather than expired, and A lists
+        them. Two listings in that session, at 12500/13000 and 104000/114000.
 
-        This docstring used to add that "with an empty state the transfer-list
-        screen would not act on the card at all -- pressing A did nothing over a
-        card the player had sent there to list", and that claim is withdrawn. It
-        was written five hours after unlisted rows first reached that screen at
-        all, it was never measured against the console, and the player reports
-        the press **working** in exactly the window it describes as broken --
-        18 August 09:45 to 14:49, between `_pile_number` and this change.
+        This corrects a conclusion in `docs/TRADE_PILE.md` that was held for
+        six days and was wrong. It read:
 
-        So the change this docstring belongs to is a live suspect for breaking
-        the press it was named for. `asitwas` in `_apply_unlisted_shape` puts
-        the window back; see docs/TRADE_PILE.md.
+            The panel text and the action are the same member.
+            tradeId 0  -- "Press (A) to list this item", and a handler with no
+                          card to act on
+            a real id  -- the handler has a card ... There is no third option
+
+        There was. The reading behind it was taken on 20 August against an
+        entry that carried `sellerId`, `sellerEstablished`, `endtime`,
+        `startTime`, `EXPIRE_TIME` and `expireTime` -- six members the PC build
+        does not send -- so "tradeId 0 does not work" was measured on a
+        document that differed from the working one in more than its trade id.
+        The document then wrote "Do not reopen this by trying another
+        `tradeState`", which is exactly the instruction that would have kept it
+        wrong. The player asked to try it anyway.
+
+        The old shape is still reachable as `expired` in
+        `runtime/unlisted-shapes.json`, because it is the one that gives the
+        relist menu and RB Relist All has never been traced.
         """
         card = dict(item)
         card["pile"] = PILE_TRANSFER
@@ -4382,23 +5177,15 @@ class CardActions:
         # positive `tradeable`, so the List Item action was never offered.
         card["untradeable"] = False
         card["tradeable"] = True
-        # Field-for-field what Kyro's build sends, because deviating from it is
-        # what kept this card inert. Two deviations mattered enough to name:
-        #
-        #   no `id`   Kyro's auction carries `tradeId` and no `id`. This sent
-        #             `"id": 0` on every unlisted entry, so ten cards arrived
-        #             sharing one identifier -- and a screen that keys entries
-        #             by `id` cannot act on any of them.
-        #   endtime   2147483647, not 0. A zero end time reads as an auction
-        #             already over, which is not a card awaiting listing.
-        #
-        # The seller fields are the club's own, not blanks: this card belongs to
-        # the player, and `sellerId` 0 with an empty name is not a seller the
-        # screen recognises as you.
+        # Field for field what the PC build sends, and nothing besides. The six
+        # members this server used to add on top are the reason the earlier
+        # reading of `tradeId` 0 came out wrong, so they stay out.
         return {
-            "tradeId": _pseudo_trade_id(card.get("id") or 0),
+            # No auction yet. A pseudo id makes the row an auction, and an
+            # auction that was never listed can only read as a lapsed one.
+            "tradeId": 0,
             "itemData": card,
-            "tradeState": "expired",
+            "tradeState": None,
             "startingBid": 0,
             "buyNowPrice": 0,
             "currentBid": 0,
@@ -4407,14 +5194,9 @@ class CardActions:
             "bidState": "none",
             "tradeOwner": True,
             "expires": -1,
-            "EXPIRE_TIME": 0,
-            "expireTime": 0,
-            "startTime": 0,
-            "endtime": 2147483647,
-            "sellerName": SELLER_NAME,
-            "sellerEstablished": 2013,
-            "sellerId": PERSONA.id,
-            "confidenceValue": 100,
+            "sellerName": "",
+            "seller": 0,
+            "confidenceValue": 0,
         }
 
     def settle_market(self) -> list[dict]:
@@ -4917,6 +5699,191 @@ def _club_item(
     return item
 
 
+MANAGER_FILE = Path(__file__).resolve().parent / "fifa14_managers.json"
+# Managers sit in their own id block, above the club items, for the reason the
+# club items have blocks at all: an id has to mean the same card in a save
+# written last week as in one written today.
+MANAGER_ID_BASE = 1_760_000_000
+
+
+def manager_catalogue() -> list[dict]:
+    """Every manager the game has, or nothing if the file is absent."""
+    try:
+        return json.loads(MANAGER_FILE.read_text())["managers"]
+    except (OSError, ValueError, KeyError):
+        return []
+
+
+def _manager_item(entry: dict, item_id: int, item_state: str = "free") -> dict:
+    """One manager card.
+
+    `assetId` **is** the resource id. That is not a shortcut: a manager's art is
+    addressed by the same number as the card, the way a stadium's is, and unlike
+    a kit or a badge which carry a family asset and vary the resource.
+    MarvelcoCode/Impulsum14 builds it the same way.
+    
+    `cardsubtypeid` 4 is the manager subtype, from that same build.
+
+    What is deliberately **not** here: `dream`, `marketDataMinPrice` and
+    `marketDataMaxPrice`. That build sends all three and none of them is a
+    member of this console's CardsDLL -- checked by exact match -- and an
+    unknown member on a card is the shape that has frozen a parser in this
+    project twice. Price ranges are a FIFA 15 idea anyway.
+
+    Nothing about the rating is invented: it comes from the game's own database
+    through `fifa14_managers.json`, and the quick-sell value follows the same
+    table every other card here uses.
+    """
+    resource = int(entry["resourceId"])
+    rating = int(entry.get("rating") or 0)
+    league = int(entry.get("league") or 0)
+    return {
+        "id": item_id,
+        "assetId": resource,
+        "resourceId": resource,
+        "rating": rating,
+        "itemType": "manager",
+        "itemState": item_state,
+        "cardsubtypeid": 4,
+        "discardValue": club_discard_value(rating, 1),
+        "lastSalePrice": 0,
+        "timestamp": issued_now(),
+        "untradeable": False,
+        "rareflag": 1,
+        "owners": 1,
+        "contract": DEFAULT_CONTRACT,
+        "formation": FORMATION,
+        "morale": 0,
+        "fitness": 0,
+        "injuryType": "none",
+        "injuryGames": 0,
+        "suspension": 0,
+        "training": 0,
+        "preferredPosition": "",
+        "playStyle": 0,
+        "teamid": 0,
+        "leagueId": league,
+        "leagueid": league,
+        "nation": int(entry.get("nation") or 0),
+        "attributeList": [],
+        "statsList": [],
+        "lifetimeStats": [],
+        "name": str(entry.get("name") or ""),
+    }
+
+
+STAFF_FILE = Path(__file__).resolve().parent / "fifa14_staff.json"
+# Staff resources run 2000001-9000045 across four families, so the block has to
+# be wide enough to hold nine million without reaching the next one. Managers
+# sit at 1_760_000_000 and this ends below 1_780_000_000.
+STAFF_ID_BASE = 1_770_000_000
+
+
+def staff_catalogue() -> list[dict]:
+    """Every coach and physio the game has, or nothing if the file is absent."""
+    try:
+        return json.loads(STAFF_FILE.read_text())["staff"]
+    except (OSError, ValueError, KeyError):
+        return []
+
+
+def _staff_item(entry: dict, item_id: int, item_state: str = "free") -> dict:
+    """One head coach, goalkeeping coach, fitness coach or physio.
+
+    Four families, each with its own subtype and its own resource run:
+
+        headCoach     5    2000001-2000037
+        gkCoach       6    9000001-9000045
+        physio        7    4000001-4000042
+        fitnessCoach  8    3000004-3000039
+
+    All four `itemType` values are in CardsDLL, and so are the counters they
+    report under -- `staffHeadCoach`, `staffGKCoach`, `staffFitnessCoach`,
+    `staffPhysio`, which `club_stats_response` already sends and which have
+    read zero because nothing ever filled them.
+
+    `assetId` is the resource, as it is for a manager and a stadium.
+
+    `attr` is dropped. The source carries it, values 0-6, and **`attr` is not a
+    member of this binary** -- unlike `amount`, `posbonus` and `fieldpos`, which
+    all are. Same rule that kept `dream` and the two market-price members off
+    the manager card.
+    """
+    resource = int(entry["resourceId"])
+    rating = int(entry.get("rating") or 0)
+    rare = int(entry.get("rare") or 0)
+    return {
+        "id": item_id,
+        "assetId": resource,
+        "resourceId": resource,
+        "rating": rating,
+        "itemType": str(entry.get("itemType") or ""),
+        "itemState": item_state,
+        "cardsubtypeid": int(entry.get("cardsubtypeid") or 0),
+        "discardValue": club_discard_value(rating, rare),
+        "lastSalePrice": 0,
+        "timestamp": issued_now(),
+        "untradeable": False,
+        "rareflag": rare,
+        "owners": 1,
+        "contract": DEFAULT_CONTRACT,
+        "morale": 0,
+        "fitness": 0,
+        "injuryType": "none",
+        "injuryGames": 0,
+        "suspension": 0,
+        "training": 0,
+        "preferredPosition": "",
+        "playStyle": 0,
+        "teamid": 0,
+        "leagueId": 0,
+        "nation": 0,
+        # What the card is worth to a squad: the bonus it applies, which slot
+        # it applies to, and where on the pitch. All three are in the table.
+        "amount": int(entry.get("amount") or 0),
+        "posbonus": int(entry.get("posbonus") or 0),
+        "fieldpos": int(entry.get("fieldpos") or 0),
+        "attributeList": [],
+        "statsList": [],
+        "lifetimeStats": [],
+        "name": str(entry.get("name") or ""),
+    }
+
+
+def seed_staff() -> list[dict]:
+    """Staff put straight into the club, when asked for.
+
+    `FIFA14_SEED_STAFF=1`, and the same caveat as `seed_managers`: this is a
+    way to see whether the cards draw, not how they should arrive.
+    """
+    if os.environ.get("FIFA14_SEED_STAFF", "").strip().lower() not in {
+        "1", "true", "yes"
+    }:
+        return []
+    return [
+        _staff_item(entry, STAFF_ID_BASE + int(entry["resourceId"]))
+        for entry in staff_catalogue()
+    ]
+
+
+def seed_managers() -> list[dict]:
+    """Managers put straight into the club, when asked for.
+
+    `FIFA14_SEED_MANAGERS=1` puts every manager the game has into the club at
+    once. That is not how they should arrive -- they belong in packs, like the
+    kits and badges -- but it is how to find out whether they draw at all, and
+    on which the art fails, without opening a hundred packs first.
+    """
+    if os.environ.get("FIFA14_SEED_MANAGERS", "").strip().lower() not in {
+        "1", "true", "yes"
+    }:
+        return []
+    return [
+        _manager_item(entry, MANAGER_ID_BASE + int(entry["resourceId"]))
+        for entry in manager_catalogue()
+    ]
+
+
 def _club_extras() -> list[dict]:
     """Consumables, kits, badges, stadiums and balls."""
     items: list[dict] = []
@@ -4966,6 +5933,11 @@ def _club_extras() -> list[dict]:
             _club_item(kind, asset, resource, club_item_id(kind, asset),
                        rating=84, rare=1)
         )
+
+    # Off unless asked for. See `seed_managers`: this is how to find out
+    # whether a manager card draws at all, not how managers should arrive.
+    items.extend(seed_managers())
+    items.extend(seed_staff())
 
     return items
 
@@ -5017,6 +5989,14 @@ def _club_item_probe() -> dict[str, list[int]]:
 CONSUMABLE_DRAW_WEIGHT = {
     "contract": 40, "fitness": 22, "healing": 12, "playStyle": 10,
     "training": 8, "position": 6,
+    # Manager league modifiers, in from 25 August once all twenty-seven were
+    # seen rendering in the club. Weighted with the thinnest families: there
+    # are twenty-seven of them and a club needs one, not a shelf of them.
+    #
+    # They are rated 95, so `_extra_tier` makes them gold and a Bronze Pack
+    # cannot hand one out -- the same thing that keeps chemistry styles out of
+    # the low packs.
+    "managerLeagueModifier": 6,
 }
 
 # Subtype 232 is not drawn, and it is not a position modifier either.
@@ -5044,16 +6024,37 @@ CONSUMABLE_DRAW_WEIGHT = {
 # `squadTraining` takes its place, and for a reason: art id 43 draws NOT FOUND,
 # so packing one hands the player a card that cannot be looked at. It stays out
 # until the id is known -- the same treatment manager and staff got.
+#
+# `managerLeagueModifier` spent one relaunch here and is out again, 25 August.
+# Art 32 came out of Kyro's database extract rather than being invented, but
+# uniform in an extract is not the same as drawn on a console, and every family
+# that skipped that check handed the player a NOT FOUND card. So it was seeded
+# into the club first and looked at: all twenty-seven render.
 UNDRAWN_CONSUMABLE_TYPES = {"squadTraining", "formationManager"}
 
 # And out of the club seed, so the tab it was polluting is clean.
 UNSEEDED_CONSUMABLE_TYPES = {"squadTraining", "formationManager"}
 
 # Kits, badges, stadiums and balls carry a rating now (CLUB_ITEM_QUALITY) and
-# so respect a tier. Manager and staff are absent: they are not in
-# CLUB_ITEM_KINDS, so there is nothing to weight.
+# so respect a tier.
+#
+# Managers and staff join them, 25 August, after being seeded into a club and
+# rendering: 166 managers and 150 across the four staff families. They were
+# absent because nothing served them at all, not because anything was decided
+# about them.
+#
+# Their tier comes from their own rating rather than from a quality slot --
+# the game's database gives every one a rating, 54 to 88 for a manager and 55
+# to 80 for staff, so a Bronze Pack cannot hand out an 88-rated manager.
+#
+# The weights are deliberately below the four cosmetic families. A manager or a
+# coach is a card you want a few of, where kits and badges are a collection --
+# there are 1327 kits and 166 managers, and drawing them evenly would bury the
+# kits nobody has yet under staff nobody needs a fifth of.
 CLUB_ITEM_DRAW_WEIGHT = {
     "kit": 30, "badge": 30, "stadium": 12, "ball": 18,
+    "manager": 10,
+    "headCoach": 5, "gkCoach": 5, "fitnessCoach": 5, "physio": 5,
 }
 
 # How the non-player slots divide.
@@ -5105,20 +6106,50 @@ CLUB_DISCARD = {
 
 
 CLUBITEM_FILE = Path(__file__).resolve().parent / "fifa14_clubitems.json"
+CLUBITEM_BLANK_FILE = (
+    Path(__file__).resolve().parent / "fifa14_clubitems_blank.json"
+)
+
+
+def blank_club_items() -> set[int]:
+    """Resource ids known to draw the green NOT FOUND placeholder.
+
+    Read here rather than only at build time, so an id added after a bad card
+    comes out of a pack takes effect on the next server start without anyone
+    regenerating the catalogue. A missing or unreadable file means no
+    exclusions, which is the same catalogue as before.
+    """
+    try:
+        listed = json.loads(CLUBITEM_BLANK_FILE.read_text())["blank"]
+    except (OSError, ValueError, KeyError):
+        return set()
+    return {int(x) for x in listed if isinstance(x, (int, str)) and str(x).isdigit()}
 
 
 def _clubitem_catalogue() -> list[dict]:
-    """Every club item the console was seen to render.
+    """Every club item the console has actually been seen to render.
 
-    1570 of them across four families, built by `tools/build_clubitems.py` from
-    the probe sessions of 18-19 August 2026. Before this the server invented
-    fourteen, which is why the same Barcelona third kit kept coming out of
-    packs -- four kits was nearly the whole pool.
+    1570 of them across four families, built by `tools/build_clubitems.py`.
+
+    The count is not as measured as it reads. The probe sessions of 18-19
+    August established where each family **stops** -- it visited 24 kit ids and
+    every one was above 6300860, hunting the boundary -- and the interior of
+    each range was then assumed contiguous. Kit 6300772 came out of a pack on
+    24 August drawing NOT FOUND, which is the first evidence that the interiors
+    have holes. Balls were never probed at all.
+
+    So the ids that fail are removed one at a time as they are found, from
+    `fifa14_clubitems_blank.json`. Until somebody sweeps the interiors properly
+    this list is how the catalogue gets honest.
     """
     try:
-        return json.loads(CLUBITEM_FILE.read_text())["clubitems"]
+        items = json.loads(CLUBITEM_FILE.read_text())["clubitems"]
     except (OSError, ValueError, KeyError):
         return []
+    blank = blank_club_items()
+    if not blank:
+        return items
+    return [item for item in items if item.get("resourceId") not in blank]
 
 
 def club_discard_value(rating: int, rare: int) -> int:
@@ -5198,6 +6229,22 @@ def pack_extras() -> dict[tuple[str, str], list[dict]]:
         template["_rare"] = bool(card["rare"])
         families.setdefault(("club", card["itemType"]), []).append(template)
 
+    # Managers and the four staff families, from the game's own database.
+    # Tiered by their own rating, so a Bronze Pack cannot hand out an 88.
+    for entry in manager_catalogue():
+        template = _manager_item(entry, 0, item_state="new")
+        template.pop("id")
+        template["_tier"] = _extra_tier(template["rating"])
+        template["_rare"] = bool(template.get("rareflag"))
+        families.setdefault(("club", "manager"), []).append(template)
+
+    for entry in staff_catalogue():
+        template = _staff_item(entry, 0, item_state="new")
+        template.pop("id")
+        template["_tier"] = _extra_tier(template["rating"])
+        template["_rare"] = bool(template.get("rareflag"))
+        families.setdefault(("club", template["itemType"]), []).append(template)
+
     _PACK_EXTRAS = families
     return families
 
@@ -5251,7 +6298,43 @@ def _draw_extra(
             return got
         return [t for t in got if ("club", t.get("assetId")) not in taken]
 
-    choices = [
+    # A rare slot picks a family that can actually pay it.
+    #
+    # `exact` at the bottom of this function relaxes the rare flag when the
+    # chosen family holds no card of that rarity, and two gold families hold
+    # none at all: there is no rare ball in the catalogue and no rare
+    # chemistry style. So a rare slot that picked either handed back a
+    # non-rare. That is how the Rare Gold Pack -- twelve slots, every one of
+    # them rare -- still came out 7% non-rare on 27 August, against a
+    # description that promises every single item is rare.
+    #
+    # Choosing the family first and relaxing second is the bug. Families that
+    # cannot pay are dropped from the choice instead, and the relax below goes
+    # back to being the last resort it was written as.
+    #
+    # Only a rare slot filters. A non-rare slot that draws from an all-rare
+    # family -- managers, positions -- keeps handing back the rare card it
+    # always did: that is a gift rather than a defect, and a Gold Pack with
+    # one rare slot would otherwise almost never show a manager again.
+    rare_first: list[tuple] = []
+    if rare:
+        def pays(key: tuple, templates: list[dict]) -> bool:
+            return any(t["_rare"] for t in available(key, templates))
+
+        rare_first = [
+            (key, weights.get(key[1], 1))
+            for key, templates in pool.items()
+            if key[0] == kind and pays(key, templates)
+        ]
+        if not rare_first:
+            # Nothing of the chosen kind holds a rare at this tier: the other
+            # kind carries the slot rather than the slot going non-rare.
+            rare_first = [
+                (key, 1) for key, templates in pool.items()
+                if pays(key, templates)
+            ]
+
+    choices = rare_first or [
         (key, weights.get(key[1], 1))
         for key, templates in pool.items()
         if key[0] == kind and available(key, templates)
@@ -5354,12 +6437,108 @@ SEASON_DIVISIONS = [
 # where the parser walks an array is the whole explanation, and none of the
 # invented members appear in the name table.
 
-TOURNAMENT_ROUNDS = {
-    # (round id, difficulty, reward multiplier, coins)
-    1: [(1, 1, 1, 500), (2, 1, 1, 750), (3, 2, 1, 1000), (4, 2, 1, 1500)],
-    2: [(1, 2, 1, 1500), (2, 2, 1, 2000), (3, 3, 1, 3000), (4, 3, 2, 4500)],
-    3: [(1, 3, 1, 3000), (2, 3, 1, 4000), (3, 4, 2, 6000), (4, 4, 2, 9000)],
+# The fourteen single-player cups FIFA 14 ships, from
+# `MarvelcoCode/Impulsum14`'s `Tournaments.cs`.
+#
+# (id, name, trophy design, difficulty, final award, retail unlock requirement)
+#
+# This replaces three cups invented here -- Founders Cup, Continental Cup,
+# Legacy Champions Cup, at trophies 1100-1102 -- which drew a bare `*` for a
+# name because nothing on the disc knows those ids.
+#
+# Two things make this data rather than a guess, and they meet in the middle:
+#
+#   * `docs/TOURNAMENTS.md` already recorded that retail shows **fourteen**
+#     single-player cups with names baked into the disc. Impulsum lists exactly
+#     fourteen.
+#   * The trophy designs run 1100, 1104, 1108 ... 1152, step four. `cards0.big`
+#     on this disc carries `trophy_<id>_<tier>` for **1100..1169** -- measured
+#     here, months before this file was read -- and 1152 is inside it. A step
+#     of four is one design per cup across the four tiers the archive ships:
+#     bronze, silver, gold and dark.
+#
+# The unlock column is retail's and is **not applied**: `lock` stays UNLOCKED
+# and `unlockreq` stays 0 for every cup, because nothing here counts trophies
+# won yet and locking ten of fourteen behind a counter that does not exist
+# would take away cups that are playable today. It is recorded so the
+# progression can be switched on the day the counter is.
+TOURNAMENTS = [
+    (1,  "Starter Cup",                 1100, 1,   300,  0),
+    (2,  "Midlands Invitational",       1104, 2,   500,  0),
+    (3,  "Gold Challenge",              1108, 3,   700,  0),
+    (4,  "Quad-League Classic",         1112, 2,   600,  1),
+    (5,  "Managers Cup",                1116, 3,   700,  1),
+    (6,  "Bronze International Shield", 1120, 4,  1000,  2),
+    (7,  "Trio Showcase",               1124, 2,   300,  2),
+    (8,  "Unified Cup",                 1128, 3,  1000,  2),
+    (9,  "Pyramid Invitational",        1132, 4,  1000,  3),
+    (10, "Silver Links Cup",            1136, 3,   700,  4),
+    (11, "Federation Cup",              1140, 4,   200,  4),
+    (12, "Champions Trophy",            1144, 5,  2500,  4),
+    (13, "Premier Clash",               1148, 3,  1200,  5),
+    (14, "Ultimate Cup",                1152, 3,  3000, 10),
+]
+
+# Every fixed cup is a 16-team, four-round bracket.
+TOURNAMENT_TEAMS = 16
+TOURNAMENT_NUM_ROUNDS = 4
+TOURNAMENT_MATCH_LENGTH = 6
+
+
+def tournament_row(identifier: int) -> tuple:
+    return next(
+        (row for row in TOURNAMENTS if row[0] == identifier), TOURNAMENTS[0]
+    )
+
+
+def tournament_rounds(identifier: int) -> list[tuple[int, int, int, int]]:
+    """(round id, difficulty, reward multiplier, coins) for one cup.
+
+    The final round pays the cup's award, which is the figure the tile shows as
+    its Tournament Bonus and the one Impulsum carries.
+
+    The earlier rounds pay a rising share of it -- an eighth, a quarter, three
+    eighths -- so the run pays on the way to the final rather than only at it.
+    That is this server's own behaviour and it is kept deliberately: Impulsum
+    pays nothing before the final, and taking its cup data is not a reason to
+    take an economy the player already has working. The amounts follow each
+    cup's award, so they moved with the new table without being chosen twice.
+    """
+    _, _, _, difficulty, award, _ = tournament_row(identifier)
+    return [
+        (
+            index,
+            difficulty,
+            1,
+            award
+            if index == TOURNAMENT_NUM_ROUNDS
+            else max(1, award * index // (2 * TOURNAMENT_NUM_ROUNDS)),
+        )
+        for index in range(1, TOURNAMENT_NUM_ROUNDS + 1)
+    ]
+
+
+# The AI opponents each cup draws from -- fifteen per cup, the club itself
+# taking the sixteenth slot. Real EA club ids, one pool per tournament, from
+# the same source. Cup 14's pool is the Premier League one this server already
+# used for everything.
+TOURNAMENT_TEAM_POOLS = {
+    1:  [422, 1572, 357, 294, 922, 1914, 1744, 873, 697, 689, 1939, 110, 696, 12, 15005],
+    2:  [1926, 162, 2023, 433, 94, 298, 165, 1910, 256, 1871, 570, 97, 3, 8, 1880],
+    3:  [1887, 1902, 62, 1807, 1915, 417, 614, 191, 91, 665, 200, 459, 95, 14, 1884],
+    4:  [57, 378, 605, 2007, 1888, 472, 190, 674, 1913, 10020, 226, 1882, 29, 1795, 71],
+    5:  [896, 1906, 1903, 31, 673, 1881, 1808, 58, 1844, 379, 242, 1838, 1901, 4, 1876],
+    6:  [203, 1861, 1799, 1793, 78, 171, 453, 1893, 1837, 1909, 10029, 1878, 232, 1908, 15029],
+    7:  [229, 1961, 217, 744, 1598, 1952, 231, 246, 1892, 468, 244, 189, 1032, 192, 166],
+    8:  [72, 479, 1917, 206, 1970, 1879, 169, 1039, 819, 1853, 1843, 25, 1891, 483, 54],
+    9:  [2, 38, 1013, 1719, 109, 450, 485, 1792, 70, 106, 59, 1824, 1809, 28, 1877],
+    10: [19, 247, 1028, 15, 1806, 66, 569, 452, 23, 312, 32, 36, 383, 1842, 245],
+    11: [17, 39, 1819, 393, 65, 462, 517, 315, 480, 567, 1053, 219, 1860, 50, 9],
+    12: [1960, 568, 280, 74, 1629, 598, 237, 1043, 69, 175, 449, 448, 573, 1, 481],
+    13: [13, 7, 144, 1896, 34, 1048, 55, 1035, 1041, 461, 22, 18, 457, 44, 48],
+    14: [52, 234, 325, 236, 47, 46, 10, 5, 11, 21, 73, 240, 45, 243, 241],
 }
+
 
 # The trophy ids are the game's own. `cards0.big` carries 70 of them under
 # data/ui/external/ion_fut/artassets/fcctournamenttrophies/, named
@@ -5416,43 +6595,56 @@ def trophy_item_response(resource_id: int, tier: str = TROPHY_TIER) -> bytes:
     """The definition behind a cup's `trophyResourceId`.
 
     The journal settles what this endpoint is for. With `trophyResourceId` 0
-    the console asked for `/fut/items/xbl2/0.json` once per cup; with 1100,
-    1101 and 1102 it asked for those three. So the field drives the request and
-    this document is the trophy's definition.
+    the console asked for `/fut/items/xbl2/0.json` once per cup; with a real id
+    it asks for that id. So the field drives the request and this document is
+    the trophy's definition.
 
-    Answered with the blanket `{"itemData":[]}` the whole prefix gets, the
-    definition is empty -- and on entering a cup the console then asked for
+    **The shape changed on 25 August.** It used to be `{"itemData":[{...}]}`
+    with `assetName`, `name` and `image` all holding the same basename -- three
+    candidates offered at once because the module's name table carries all
+    three and nothing said which one the client reads. No cup ever showed a
+    trophy under it.
 
-        /fut/items/images/trophies/xbl2/.big
+    Impulsum's build has a working trophy screen and answers flat, with two
+    members this server was not sending at all:
 
-    with nothing between the prefix and the extension. It builds that path from
-    a member of this document, and an empty list left it empty.
+        {"tournamentId":N,"tournamentType":0,
+         "assetName":"trophy_1100_gold","silName":"trophy_1100_dark",
+         "locString":[{"lang":"ENG_US","label":"Starter Cup"}]}
 
-    Which member is not settled. `assetName`, `name` and `image` are the three
-    candidates the module's name table carries; all three go out holding the
-    same basename, and the next path the console asks for names the winner.
-    An unrecognised sibling is skipped, so offering three costs nothing.
+    `silName` and `locString` are both in CardsDLL's table, as are `lang` and
+    `label`. `silName` is the silhouette drawn for a cup not yet won, which is
+    why a screen with only one name had nothing to show in that state.
+
+    And `locString` is the second route a cup's name travels. `TOURNY_LOC_%d`
+    is the first and this server already answers it; this one arrives attached
+    to the trophy the tile is drawing.
+
+    `tier` still names the won trophy's art. The basename is built from the
+    **design** id, which is the resource the cup carries -- 1100, 1104 ... 1152
+    -- and `cards0.big` ships `trophy_<design>_<tier>` for 1100..1169 in
+    bronze, silver, gold and dark.
     """
     resource_id = int(resource_id)
-    basename = f"trophy_{resource_id}_{tier}"
+    row = next((r for r in TOURNAMENTS if r[2] == resource_id), None)
     return json.dumps(
         {
-            "itemData": [
-                {
-                    "id": resource_id,
-                    "assetId": resource_id,
-                    "resourceId": resource_id,
-                    "itemType": "trophy",
-                    "assetName": basename,
-                    "name": basename,
-                    "image": basename,
-                }
-            ]
+            # The cup this trophy belongs to. A probe id belongs to none, and
+            # says so with 0 rather than borrowing the first cup's identity.
+            "tournamentId": row[0] if row else 0,
+            "tournamentType": 0,
+            "assetName": f"trophy_{resource_id}_{tier}",
+            # The unwon silhouette.
+            "silName": f"trophy_{resource_id}_dark",
+            "locString": (
+                [{"lang": "ENG_US", "label": row[1]}] if row else []
+            ),
         },
         separators=(",", ":"),
     ).encode()
 
-# What each cup is called.
+
+# What each cup is called, from TOURNAMENTS above.
 #
 # The tiles drew a bare `*` because the client builds its own localisation key
 # -- `TOURNY_LOC_%d`, in the module at 0x01DDC4 -- and nothing answered it.
@@ -5460,14 +6652,11 @@ def trophy_item_response(resource_id: int, tier: str = TROPHY_TIER) -> bytes:
 # CardsDLL's JSON table, and the PC revival keeps its cup names in source and
 # never sends them either.
 #
-# So these are served as locstrings, keyed by tournament id. They are a choice,
-# like the prizes and the round coins beside them: the binary names the fields,
-# it does not say what a cup should be called.
-TOURNAMENT_NAMES = {
-    1: "Founders Cup",
-    2: "Continental Cup",
-    3: "Legacy Champions Cup",
-}
+# Two routes carry the name now and neither invents one. This locstring table
+# answers `TOURNY_LOC_%d`, and the trophy document carries a `locString` array
+# -- see `trophy_item_response`, which is the route Impulsum's build uses and
+# the one that has a working screen behind it.
+TOURNAMENT_NAMES = {row[0]: row[1] for row in TOURNAMENTS}
 
 
 # A tournament id sweep, the way the club items were mapped.
@@ -5510,22 +6699,11 @@ def tournament_probe() -> tuple[int, int, int]:
     return (count, first, step)
 
 
-TOURNAMENTS = [
-    # (id, teams, match length in minutes, final award, trophy resource)
-    #
-    # The prizes are a choice, not a finding -- the binary names the fields, it
-    # does not say what a cup should pay (`docs/TOURNAMENTS.md`). These are the
-    # player's own: 15k, 50k, 100k, with the round coins carried up to match so
-    # the run pays on the way to the final rather than only at it.
-    # Trophies 1100-1102, and these are NOT invented -- `cards0.big` carries
-    # `trophy_<id>_<tier>` for 1100..1169, which is where TROPHY_FIRST and
-    # TROPHY_LAST come from. Kyro's build uses 7100001 and up; those are his
-    # own, for a PC client, and swapping to them here would have replaced a
-    # measured range with a guess. The test caught exactly that.
-    (1, 16, 6, 15000, 1100),
-    (2, 16, 6, 50000, 1101),
-    (3, 16, 8, 100000, 1102),
-]
+# Kyro's build uses trophy ids 7100001 and up; those are his own, for a PC
+# client, and swapping to them here would have replaced a measured range with a
+# guess. A test caught exactly that once. Impulsum's designs are 1100..1152,
+# which is *inside* the measured range rather than beside it -- that is the
+# difference, and it is why these were taken and those were not.
 
 # The AI opponents a cup is drawn from. Real EA club ids -- 1 Arsenal,
 # 2 Aston Villa, 5 Chelsea, 7 Everton, 9 Liverpool, 10 Manchester City,
@@ -5687,7 +6865,37 @@ def season_wire_mode() -> str:
     # one. The record was never selected, so nothing it carried could be read,
     # and every attempt to fix the reset by adding members to it was measured
     # against a document the client was not looking at.
-    raw = os.environ.get("FIFA14_SEASON_MODE", "kyro-data").strip().lower()
+    # `native` is the default, because it is the one that opens.
+    #
+    # Two measurements, both on this console, and they disagree:
+    #
+    #   22 Aug  `kyro-data` opened Single Player Seasons and **resumed** a
+    #           season after a match -- the fixture list drawn, the score on
+    #           it, NEXT on the second fixture. That is what `729c68f` fixed
+    #           and why this default was `kyro-data`.
+    #   25 Aug  `kyro-data` froze the screen on entry. No spinner, music still
+    #           playing, and the console eventually stopped answering XBDM.
+    #           `native` opened it immediately on the same console, the same
+    #           disc, the same club and the same Xbox LIVE session.
+    #
+    # What found it was not this repository. nygmasx's server was tried from
+    # the same console and seasons opened there -- and his `deploy/run.sh`
+    # pins `FIFA14_SEASON_MODE=native`, so he had never been running the
+    # default this file sets. Same code, same console, same club: only the
+    # mode differed. Three branches here had been eliminated on the grounds
+    # that they served identical documents, which was true and useless,
+    # because they shared this default.
+    #
+    # So the trade is: `native` opens and probably does not resume --
+    # `seasonId` 10 selects the row whose `divisionId` is 1 while the user
+    # document says 9, which is the disagreement `729c68f` was about --
+    # and `kyro-data` resumes but froze. A screen that opens beats a screen
+    # that resumes, until the freeze is understood.
+    #
+    # Not understood yet. The four differences between the two are the
+    # reversed list order, `seasonId`, `divisionId` and the `data` blob, and
+    # nothing says which one costs the freeze.
+    raw = os.environ.get("FIFA14_SEASON_MODE", "native").strip().lower()
     if raw in {"current", "one"}:
         return "current"
     if raw == "default":
@@ -6061,7 +7269,23 @@ def season_user_response(division: int = 10, played: int = 0) -> bytes:
             # `_season_division_id` carries the experiment that would settle
             # it. What is settled is the range -- 10 hangs the screen, 0 and 9
             # both hold -- and division minus one stays inside it.
-            "divisionId": _season_division_id(int(division) - 1),
+            # The division's own number, not that number minus one.
+            #
+            # `seasonId` selects a row and this has to name that row's
+            # division, or the client reads the pair as a season that is not
+            # there and offers to start a fresh one. Measured 25 August: on
+            # `native`, `seasonId` 10 selects row 10 whose `divisionId` is 10,
+            # while this sent 9 -- so a season played to round 2, with its
+            # record and its blob both present and correct, still came back as
+            # "are you sure you want to start this Single Player Season?".
+            #
+            # Minus one was the "index into the client's own table of ten"
+            # reading. That was settled against the console on 21 August and
+            # the answer was no: the shield reads DIV 1 for 0, for 9 and for
+            # 10, so it never followed this member at all, and what the member
+            # does is identify the record. `kyro-data` has sent the division's
+            # own number since, and it resumed a season on 22 August.
+            "divisionId": _season_division_id(int(division)),
             "round": max(0, int(played)) + 1,
             # The season's own blob, and the version that decodes it.
             #
@@ -6154,26 +7378,210 @@ def _season_record_members(entry: dict) -> dict:
 FOREVER = 2147483647
 
 
+# The entry requirements retail puts on eleven of the fourteen cups, as the
+# player recorded them. Kept as plain terms, not as wire values, because the
+# wire values are not known yet -- see `eligibility_probe`.
+#
+# (attribute, operation, value, scope)
+#
+#   attribute  leagues | chemistry | quality | nationalities | clubs
+#              | stars | oneLeague | oneNation
+#   operation  min | max | exact
+#   scope      "xi" for the starting eleven, "xi+subs" for it and the bench
+#
+# Stars are held as halves -- the Pyramid Invitational's cap is 2.50 -- so the
+# value stays an integer here and nothing has to decide how the wire spells a
+# fraction before it is known.
+TOURNAMENT_REQUIREMENTS: dict[int, list[tuple[str, str, int, str]]] = {
+    4:  [("leagues", "max", 4, "xi")],
+    5:  [("chemistry", "min", 80, "xi")],
+    6:  [("quality", "max", 1, "xi+subs"),        # 1 = bronze
+         ("nationalities", "min", 3, "xi")],
+    7:  [("clubs", "max", 3, "xi")],
+    8:  [("stars", "max", 8, "xi"),               # 8 halves = 4.0 stars
+         ("oneLeague", "min", 11, "xi")],
+    9:  [("leagues", "exact", 11, "xi"),
+         ("stars", "max", 5, "xi")],              # 5 halves = 2.5 stars
+    10: [("chemistry", "min", 90, "xi"),
+         ("quality", "max", 2, "xi+subs")],       # 2 = silver
+    11: [("oneNation", "exact", 18, "xi+subs")],
+    12: [("chemistry", "min", 95, "xi"),
+         ("leagues", "min", 3, "xi+subs")],
+    13: [("stars", "exact", 10, "xi")],           # 10 halves = 5.0 stars
+    14: [("chemistry", "exact", 100, "xi")],
+}
+
+
+# How many numbered strings the probe publishes. `eligibilityKey` 4 drew index
+# 16, so the index runs ahead of the key by some factor; 256 covers a key space
+# of 64 at that rate and costs a few kilobytes in a document already served.
+ELG_PROBE_STRINGS = 256
+ELG_PROBE_SCOPES = 16
+
+
+def eligibility_probe() -> tuple[int, int]:
+    """`FIFA14_ELIGIBILITY_PROBE=first[:step]`: read the requirement key space.
+
+    CardsDLL carries the whole vocabulary -- `elgReq`, `elgOperation`,
+    `eligibilityKey`, `eligibilityValue`, `eligibilitySlot`,
+    `eligibilityOperation` -- and one template beside them:
+
+        ELIGIBILITY_STRING%d
+
+    That is the same shape as `TOURNY_LOC_%d`, which is how a cup's name is
+    drawn: the client builds a localisation key from a number and looks it up.
+    So a requirement's text comes from a number this server sends, and nothing
+    here knows which number means "Min. Team Chemistry" and which means "Max.
+    number of clubs".
+
+    `TOURNAMENT_REQUIREMENTS` records what the eleven cups actually require.
+    It cannot be served until those numbers are known, and guessing them would
+    put the wrong requirement on the wrong cup -- the same mistake the invented
+    tournament ids made, which drew a bare `*` on every tile.
+
+    So this reads them the way the club items and the trophy range were read:
+    one key per cup, fourteen keys a launch, and the screen names each one.
+
+        FIFA14_ELIGIBILITY_PROBE=1        cups 1-14 carry keys 1-14
+        FIFA14_ELIGIBILITY_PROBE=1:10     keys 1, 11, 21 ... a coarse pass first
+
+    A cup whose tile names a real requirement has a key the disc knows. A tile
+    that draws nothing, or `*`, does not.
+    """
+    raw = os.environ.get("FIFA14_ELIGIBILITY_PROBE", "").strip()
+    if not raw:
+        return (0, 0)
+    parts = raw.split(":")
+    try:
+        first = int(parts[0])
+        step = max(1, int(parts[1])) if len(parts) > 1 else 1
+    except ValueError:
+        return (0, 0)
+    return (first, step)
+
+
+# What the probe puts at the tournament's own level, offset from what it puts
+# inside `elgReq`, so the screen says which one it read.
+ELG_TOP_LEVEL_OFFSET = 100
+
+
+def _cup_requirement_key(identifier: int) -> int:
+    first, step = eligibility_probe()
+    return first + step * (max(1, int(identifier)) - 1) if first else 0
+
+
+def _cup_requirements(identifier: int) -> list[dict]:
+    """`elgReq` for one cup: empty, or the probe's single key.
+
+    Empty is what has always gone out and it costs nothing -- a cup with no
+    stated requirement is enterable, which is what every cup here is.
+
+    **Measured 26 August**: with keys 1 to 14 on the fourteen cups, *every* tile
+    drew `*LOC_TOURN_ELG_KEY_16` and `undefined`. The same index on all
+    fourteen, so the index is not derived from this key -- 16 is a constant the
+    client reached on its own, and the first reading (key 4 drawing 16) was a
+    coincidence of the tile that happened to be selected.
+
+    Two readings of that are worth separating, and the next probe separates
+    them. Either the client is not parsing these entries at all, or it does not
+    read the requirement from here: `eligibilityKey`, `eligibilityValue` and
+    `eligibilitySlot` are single members in CardsDLL's table, and they may
+    belong to the **tournament** rather than to a row of this array --
+    `LOC_TOURN_ELG_DOMAIN_LIST_%d` beside them suggests `elgReq` is the list of
+    domains a single requirement applies to, not a list of requirements.
+
+    So the probe now writes the key in both places, offset by
+    `ELG_TOP_LEVEL_OFFSET`, and the drawn index names the winner: an index that
+    tracks the low number came from here, one that tracks the high number came
+    from the tournament, and 16 on every tile again means neither is read.
+    """
+    key = _cup_requirement_key(identifier)
+    if not key:
+        return []
+    return [
+        {
+            "eligibilityKey": key,
+            # A value every squad passes, so the probe reads the *name* of the
+            # requirement without also locking the cup behind it.
+            "eligibilityValue": 0,
+            "eligibilitySlot": 0,
+            "eligibilityOperation": 0,
+        }
+    ]
+
+
+def _cup_requirement_members(identifier: int) -> dict:
+    """The same key at the tournament's own level, offset so it is telling."""
+    key = _cup_requirement_key(identifier)
+    if not key:
+        return {}
+    return {
+        "eligibilityKey": key + ELG_TOP_LEVEL_OFFSET,
+        "eligibilityValue": 0,
+        "eligibilitySlot": 0,
+    }
+
+
+def cup_unlocks_enforced() -> bool:
+    """`FIFA14_CUP_UNLOCKS=1`: gate the later cups on trophies won. Off by default.
+
+    Retail locks eleven of the fourteen -- one trophy for the Quad-League
+    Classic and the Managers Cup, two for the next three, and ten for the
+    Ultimate Cup. Those numbers reached this file twice from sources that had
+    not seen each other: Impulsum's table, and the player's own list of retail
+    requirements. All fourteen agree.
+
+    It is still off by default, because the counter behind it only started
+    counting on 25 August. Every cup won before that was paid, and recorded
+    nowhere -- there is no count to reconstruct from. Turning this on today
+    would lock eleven cups that are playable now on the strength of a counter
+    that reads zero, which is the opposite of what the data is for.
+
+    Turn it on once the count means something, or seed the count first.
+    """
+    return os.environ.get("FIFA14_CUP_UNLOCKS", "").strip().lower() in {
+        "1", "true", "yes"
+    }
+
+
+def _cup_lock(identifier: int) -> str:
+    """Why a cup cannot be entered, or UNLOCKED.
+
+    `JOINED`, `LOCKED`, `LOCKED_TROPHIES` and `TOO_MANY_TOURNAMENTS` are the
+    other values in CardsDLL's table.
+    """
+    _, _, _, _, _, unlock = tournament_row(identifier)
+    if cup_unlocks_enforced() and TOURNAMENT_PROGRESS.trophies < unlock:
+        return "LOCKED_TROPHIES"
+    if identifier in TOURNAMENT_PROGRESS.entries and os.environ.get(
+        "FIFA14_CUP_JOINED", ""
+    ).strip().lower() in {"1", "true", "yes"}:
+        # See the note on FIFA14_CUP_JOINED in docs/TOURNAMENTS.md: this labels
+        # a cup that was opened without offering the resume that freezes.
+        return "JOINED"
+    return "UNLOCKED"
+
+
 def tournament_entry(identifier: int, trophy: int | None = None) -> dict:
     """One cup, in the shape the native parser reads.
 
     `trophy` overrides the trophy resource, which the id sweep uses to read the
     trophy id space and the tournament id space in a single pass.
     """
-    teams, match_length, award, default_trophy = next(
-        (row[1:] for row in TOURNAMENTS if row[0] == identifier),
-        TOURNAMENTS[0][1:],
-    )
+    _, _, default_trophy, _, award, unlock = tournament_row(identifier)
+    teams = TOURNAMENT_TEAMS
+    match_length = TOURNAMENT_MATCH_LENGTH
     if trophy is None:
         trophy = default_trophy
-    rounds = TOURNAMENT_ROUNDS.get(identifier) or TOURNAMENT_ROUNDS[1]
+    rounds = tournament_rounds(identifier)
     return {
         "id": identifier,
         "type": "offline",
         "treeType": "knockout",
         "aigroup": 0,
         "eligibilityOperation": "AND",
-        "elgReq": [],
+        "elgReq": _cup_requirements(identifier),
+        **_cup_requirement_members(identifier),
         "numTeams": teams,
         "numRounds": len(rounds),
         "matchlength": match_length,
@@ -6187,8 +7595,35 @@ def tournament_entry(identifier: int, trophy: int | None = None) -> dict:
             for round_id, difficulty, multiplier, coins in rounds
         ],
         "awardSet": {"awards": [{"awardType": 1, "value": award, "halid": 0}]},
-        "lock": "UNLOCKED",
-        "unlockreq": 0,
+        # `JOINED` is in CardsDLL beside `UNLOCKED`, `LOCKED`,
+        # `LOCKED_TROPHIES` and `TOO_MANY_TOURNAMENTS`, and it is the state a
+        # cup the club is already in would carry.
+        #
+        # `FIFA14_CUP_JOINED=1`, off by default. A cup opened and backed out of
+        # before a ball is kicked saves at round one with `progressData`
+        # `AAAAAA==` -- four zero bytes -- and `TournamentProgress.unplayed`
+        # keeps it out of `/tournament/user/list` because handing that run back
+        # **freezes the title**. It froze twice on it, the second time on a
+        # reply byte for byte identical to what the client itself had PUT, so
+        # the document was never the problem: the client cannot resume a run
+        # with no first match in it.
+        #
+        # This marks the tile without offering the resume, which is the part
+        # that freezes. The risk it carries is the other way: `lock` is the
+        # field that says *why a cup cannot be entered* -- TOO_MANY_TOURNAMENTS
+        # and LOCKED_TROPHIES are both refusals -- so JOINED may make the tile
+        # unenterable, or route its button to the resume this guard exists to
+        # avoid. One launch judges it, and a cup that says nothing is better
+        # than a cup that cannot be played.
+        "lock": _cup_lock(identifier),
+        # The number the tile prints under "Unlock", and it is not the same
+        # question as whether the cup is playable.
+        #
+        # Tying it to the gate made every tile read "Unlock: 0 Trophies",
+        # which is what the console showed on 26 August. `lock` is what
+        # decides entry; this is a label, and retail's number is the true one
+        # whether or not this server is enforcing it.
+        "unlockreq": unlock,
         # No entry limit: triesMax 0 is what an always-playable offline cup
         # carries, and a nonzero triesRemaining against triesMax 0 is what
         # makes the screen show "0 essais restants" and refuse entry.
@@ -6207,7 +7642,9 @@ def tournament_entry(identifier: int, trophy: int | None = None) -> dict:
         # sent it. The tile shows a Tournament Bonus figure -- 500 Coins on the
         # retail Starter Cup -- and `awardSet` alone was carrying that.
         "prize": award,
-        "trophyUserCount": 0,
+        # Cups won, ever. Zero until one is, and it is what retail gates the
+        # later cups on.
+        "trophyUserCount": TOURNAMENT_PROGRESS.trophies,
     }
 
 
@@ -6242,18 +7679,28 @@ def tournaments_response() -> bytes:
     ).encode()
 
 
-def tournament_teams_response(count: int = 15, group: int = 0) -> bytes:
+def tournament_teams_response(
+    count: int = 15, group: int = 0, tournament: int | None = None
+) -> bytes:
     """The draw. `teamId` is the only member this document carries.
 
     The query is `/teams?groupId=%d&count=%d` in the module's own template, so
     the group is part of the request even though every cup here declares
     `aigroup` 0. Rotating the pool by it keeps two groups from drawing the same
     side in the same order, without inventing a second pool.
+
+    `tournament` picks that cup's own fifteen from `TOURNAMENT_TEAM_POOLS`.
+    The route does not carry it -- the template is groupId and count and
+    nothing else -- so the caller supplies the cup the club is actually in, and
+    falls back to the flat pool when no cup is open. Impulsum has the same
+    problem and solves it the same way, with an `ActiveTournamentId` it sets
+    when a cup is joined.
     """
-    count = max(0, min(int(count), len(TOURNAMENT_TEAM_POOL)))
-    size = len(TOURNAMENT_TEAM_POOL)
+    pool = TOURNAMENT_TEAM_POOLS.get(int(tournament or 0)) or TOURNAMENT_TEAM_POOL
+    count = max(0, min(int(count), len(pool)))
+    size = len(pool)
     offset = (int(group) % size) if size else 0
-    rotated = TOURNAMENT_TEAM_POOL[offset:] + TOURNAMENT_TEAM_POOL[:offset]
+    rotated = pool[offset:] + pool[:offset]
     return json.dumps({"teamId": rotated[:count]}, separators=(",", ":")).encode()
 
 
@@ -6326,6 +7773,14 @@ class TournamentProgress:
 
     def __init__(self) -> None:
         self.entries: dict[int, dict] = {}
+        # Cups won, ever. `trophyUserCount` is the member the tile reads it
+        # from, and it is what retail gates the later cups on -- one trophy for
+        # the Quad-League Classic, ten for the Ultimate Cup.
+        #
+        # It counts from the day it was added. Runs won before that were never
+        # recorded anywhere, so the count starts wherever the save says and not
+        # from a reconstruction: `advance` is the only thing that raises it.
+        self.trophies: int = 0
 
     def apply(self, identifier: int, document: dict) -> dict:
         identifier = int(identifier)
@@ -6416,7 +7871,7 @@ class TournamentProgress:
         stops existing the moment you are good enough to win it.
         """
         identifier = int(identifier)
-        rounds = TOURNAMENT_ROUNDS.get(identifier) or []
+        rounds = tournament_rounds(identifier)
         entry = self.entries.get(identifier) or {}
         played = max(1, int(entry.get("round") or 1))
         final = len(rounds) or 1
@@ -6430,11 +7885,13 @@ class TournamentProgress:
         if result == "WIN":
             if played >= final:
                 prize = next(
-                    (award for cup, _teams, _length, award, _trophy in TOURNAMENTS
+                    (award
+                     for cup, _name, _design, _diff, award, _unlock in TOURNAMENTS
                      if cup == identifier),
                     0,
                 )
                 nxt = 1                       # won it; the cup is playable again
+                self.trophies += 1
             else:
                 nxt = played + 1
         elif result == "DRAW":
@@ -6513,10 +7970,21 @@ class TournamentProgress:
         )
 
     def state(self) -> dict:
-        return {str(key): value for key, value in self.entries.items()}
+        # The runs are keyed by cup id, so the count rides under a name no cup
+        # id can collide with rather than in a second save member.
+        state: dict = {str(key): value for key, value in self.entries.items()}
+        if self.trophies:
+            state["trophies"] = self.trophies
+        return state
 
     def restore(self, saved: dict | None) -> None:
         for key, value in (saved or {}).items():
+            if key == "trophies":
+                try:
+                    self.trophies = max(0, int(value))
+                except (TypeError, ValueError):
+                    self.trophies = 0
+                continue
             if isinstance(value, dict):
                 self.apply(int(key), value)
 
@@ -6907,7 +8375,16 @@ def apply_match_items(inventory: "ClubInventory", items: list) -> dict:
     """
     by_id = {item["id"]: item for item in inventory.items if item.get("id")}
     touched = {"fitness": 0, "goals": 0, "assists": 0, "played": 0,
-               "contracts": 0, "unknown": []}
+               "contracts": 0, "unknown": [], "manager": 0}
+
+    # The eleven who started, from the squad this club is actually fielding.
+    starters: set = set()
+    squads = inventory._squads() if hasattr(inventory, "_squads") else {}
+    entry_squad = squads.get(inventory.active_squad_id()) if squads else None
+    if entry_squad:
+        starters = {i for i in (entry_squad.get("players") or [])[:11] if i}
+    elif getattr(inventory, "squad", None):
+        starters = {i["id"] for i in inventory.squad[:11] if isinstance(i, dict)}
     for entry in items or []:
         if not isinstance(entry, dict):
             continue
@@ -6920,9 +8397,48 @@ def apply_match_items(inventory: "ClubInventory", items: list) -> dict:
         # `gamesPlayed` is a member CardsDLL's name table carries (0x030BE0)
         # that nothing here had ever written. The bio read 0 matches for a
         # club that had just won a cup.
-        card["gamesPlayed"] = int(card.get("gamesPlayed") or 0) + 1
-        touched["played"] += 1
-        # And one match off the contract.
+        # Who actually played.
+        #
+        # The `items` array is the whole eighteen, not the team sheet, and
+        # treating it as the sheet took a contract off every substitute who
+        # never left the bench.
+        #
+        # Fitness alone does not answer it, and a **goalkeeper** is why. On
+        # 26 August a cup tie came back with the keeper at 99 -- he started and
+        # a comfortable win cost him nothing -- so a rule reading "fitness
+        # unchanged means he sat on the bench" left David Seaman with no
+        # appearance recorded. That rule was inferred from one sheet where the
+        # keeper happened to lose fitness, which is the one case that breaks
+        # it.
+        #
+        # The squad answers it instead: the first eleven of the active squad
+        # started, whatever their fitness says. Fitness still catches the
+        # substitute who came on, and a goal or an assist still counts, because
+        # neither of those can happen from the bench.
+        reported = entry.get("fitness")
+        held = int(card.get("fitness") or 0)
+        try:
+            dropped = reported is not None and int(reported) < held
+        except (TypeError, ValueError):
+            dropped = False
+
+        def scored(member: str) -> bool:
+            try:
+                return int(entry.get(member) or 0) > 0
+            except (TypeError, ValueError):
+                return False
+
+        appeared = (
+            card.get("id") in starters
+            or dropped
+            or scored("goals")
+            or scored("assists")
+        )
+
+        if appeared:
+            card["gamesPlayed"] = int(card.get("gamesPlayed") or 0) + 1
+            touched["played"] += 1
+        # And one match off the contract, for the ones who played.
         #
         # The client reports fitness, goals and assists per player at the
         # whistle and says **nothing** about contracts -- checked across every
@@ -6937,7 +8453,7 @@ def apply_match_items(inventory: "ClubInventory", items: list) -> dict:
         # and a negative number would only make the eventual rule harder to
         # write.
         contract = int(card.get("contract") or 0)
-        if contract > 0:
+        if appeared and contract > 0:
             card["contract"] = contract - 1
             touched["contracts"] += 1
         if "fitness" in entry:
@@ -6962,6 +8478,20 @@ def apply_match_items(inventory: "ClubInventory", items: list) -> dict:
         # table at all -- so a match that updated only those wrote numbers
         # nothing would ever display.
         sync_stat_slots(card)
+
+    # And the manager, who is not in the team sheet at all.
+    #
+    # The client reports the eighteen and says nothing about the man in the
+    # dugout, so if this does not count his match down nothing does -- reported
+    # from the console 26 August, a manager still on the contract he arrived
+    # with after a cup tie. Retail spends one per match, which is why manager
+    # contract cards exist and are a family of their own (subtype 202).
+    for manager in squad_manager(inventory):
+        held = int(manager.get("contract") or 0)
+        if held > 0:
+            manager["contract"] = held - 1
+            touched["manager"] += 1
+        manager["gamesPlayed"] = int(manager.get("gamesPlayed") or 0) + 1
     return touched
 
 
@@ -6979,128 +8509,202 @@ def active_tournaments_response() -> bytes:
 TOTW_FILE = Path(__file__).resolve().parent / "fifa14_totw.json"
 
 
-def _totw_asset_ids() -> list[int]:
-    """The real Team of the Week, if it was fetched.
+# The Team of the Week, forty-nine weeks of it.
+#
+# TOTW 1 went out on 18 September 2013 and one followed every Wednesday, so
+# week N is that date plus 7(N-1) days. `tools/build_totw.py` writes the
+# catalogue; the teams and formations come from Impulsum14's extract and every
+# one of the 882 asset ids resolves against this server's own card catalogue.
+#
+# What this replaced was two squads of six ids scraped off wefut, with the rest
+# of the eleven padded from the catalogue's best rares. That padding decided
+# how strong the opponent was -- `opponentRating` reads the first eleven -- so
+# a side whose real members top out at 85 was played against a bench of 98s.
 
-    wefut publishes one at /squad/1, titled "TOTW 1". The squads after it are
-    not the following weeks -- that path is a public gallery of user-built
-    sides -- so only pages that name themselves TOTW are kept, and the rest of
-    the screen falls back to the best rare cards in the catalogue.
-    """
+# The in-form band. A base card is version 1; these are version 50, and they
+# carry `rareflag` 3 so the client draws the in-form art.
+TOTW_RESOURCE_VERSION = 50 * 0x0100_0000
+TOTW_RARE = 3
+
+# The Team of the Week's own persona -- and the entries announce it.
+#
+# Keys 3 and 4 of the challenge record are its two halves. Impulsum sends
+# 2147483647 and -2, and read as one little-endian 64-bit value, low word
+# first, they are
+#
+#     0xFFFFFFFE | 0x7FFFFFFF << 32  ==  0x7FFFFFFFFFFFFFFE
+#                                    ==  9223372036854775806
+#
+# which is exactly the persona its `Totw.PersonaId()` defaults to. Not a
+# coincidence and not two unrelated sentinels: the record carries the id of the
+# club that owns the challenge, and the client then asks
+# `/user/list?personaIdList=<that>` for it. That club is the one the challenge
+# select screen enumerates -- "WEEK 41/49 ... WEEK 49/49" is its squad list.
+#
+# So the persona is the source here and the two keys are derived from it,
+# rather than three constants copied separately and able to drift apart.
+TOTW_PERSONA_ID = 9_223_372_036_854_775_806
+
+
+def _persona_halves(persona: int) -> tuple[int, int]:
+    """(high, low) as signed 32-bit words, which is how the record carries it."""
+    raw = int(persona) & 0xFFFF_FFFF_FFFF_FFFF
+    high = (raw >> 32) & 0xFFFF_FFFF
+    low = raw & 0xFFFF_FFFF
+    to_signed = lambda word: word - 0x1_0000_0000 if word >= 0x8000_0000 else word
+    return to_signed(high), to_signed(low)
+
+
+
+def totw_squads() -> list[dict]:
+    """Every week the catalogue holds, in order."""
     if not TOTW_FILE.exists():
         return []
-    squads = json.loads(TOTW_FILE.read_text()).get("squads", [])
-    return list(squads[0]["assetIds"]) if squads else []
+    try:
+        return json.loads(TOTW_FILE.read_text()).get("squads", [])
+    except (OSError, ValueError):
+        return []
 
 
-def totw_response(catalogue: "CardCatalogue", size: int = 23) -> bytes:
-    """Team of the Week."""
+def totw_active_week() -> int:
+    """Which week the screen is showing.
+
+    `FIFA14_TOTW_WEEK` names one. The default is **week 1**, deliberately, for
+    testing: the console's clock is not this season's, and a real release
+    schedule would have to decide what "now" means on a title whose season
+    ended in 2014.
+
+    An unknown week falls back to the first one the catalogue holds.
+    """
+    squads = totw_squads()
+    if not squads:
+        return 1
+    known = {int(entry.get("week") or 0) for entry in squads}
+    raw = os.environ.get("FIFA14_TOTW_WEEK", "").strip()
+    try:
+        asked = int(raw) if raw else 1
+    except ValueError:
+        asked = 1
+    return asked if asked in known else min(known)
+
+
+def totw_week(week: int | None = None) -> dict:
+    """One week's squad, or an empty dict when there is no catalogue."""
+    squads = totw_squads()
+    if not squads:
+        return {}
+    wanted = int(week if week is not None else totw_active_week())
+    return next(
+        (entry for entry in squads if int(entry.get("week") or 0) == wanted),
+        squads[0],
+    )
+
+
+def _totw_slots(entry: dict) -> list[dict]:
+    return sorted(
+        entry.get("slots") or [], key=lambda slot: int(slot.get("order") or 0)
+    )
+
+
+def totw_response(
+    catalogue: "CardCatalogue", size: int = 23, week: int | None = None
+) -> bytes:
+    """Team of the Week: the week's own eighteen, in its own formation."""
     by_asset = {card["assetId"]: card for card in catalogue.cards}
-    best = [
-        by_asset[asset] for asset in _totw_asset_ids() if asset in by_asset
-    ]
-    if len(best) < size:
-        # Fill the bench so the squad screen gets a full side rather than a
-        # partial one -- but from the band the real Team of the Week is
-        # actually in, not from the catalogue's best rares.
-        #
-        # Taking the best put a 98, a 98, a 98, a 97 and a 97 on the bench of a
-        # side whose real members top out at 85. That is not a Team of the
-        # Week, and it is not a fair opponent either: the challenge computes
-        # `opponentRating` from the first eleven, so the padding decided how
-        # strong the team you play against is.
-        #
-        # 78 to 86 when there is nothing real to measure against, which is
-        # where an in-form side of this era sits.
-        ratings = [card.get("rating", 0) for card in best] or [78, 86]
-        floor, ceiling = max(60, min(ratings) - 2), max(ratings)
-        seen = {card["assetId"] for card in best}
-        average = sum(ratings) / len(ratings)
-        candidates = [
-            card
-            for card in catalogue.cards
-            if card.get("rareflag")
-            and floor <= card.get("rating", 0) <= ceiling
-            and card["assetId"] not in seen
-        ]
-        # Closest to the side's own average first, so the bench looks like the
-        # team rather than like a shortlist.
-        candidates.sort(key=lambda card: abs(card.get("rating", 0) - average))
-        best += candidates[: size - len(best)]
-    best = best[:size]
+    entry = totw_week(week)
+    slots = _totw_slots(entry)
+
     items = []
-    for index, card in enumerate(best):
+    for index, slot in enumerate(slots):
+        # A slot whose base card is not in the catalogue is still a real card:
+        # the in-form's position, rating and face stats are on the slot itself.
+        # Dropping it left five weeks a player short -- week 10 fielded sixteen
+        # with no goalkeeper at all, because Andriy Pyatov's base card is not
+        # in this catalogue.
+        #
+        # The club, nation and league are on the slot too, resolved at build
+        # time against the raw cards file. `CardCatalogue` drops 196 cards that
+        # are missing one of those -- right for the market, where such a card
+        # renders with placeholder text, and wrong for a fixed side. Andriy
+        # Pyatov is one of them, which is why week 10 had no goalkeeper.
+        card = by_asset.get(int(slot.get("assetId") or 0)) or {}
         items.append(
             _player_item(
-                item_id=1_850_000_000 + index,
-                asset_id=card["assetId"],
-                rating=card.get("rating", 0),
-                rare=card.get("rareflag", 1),
+                item_id=1_850_000_000 + int(entry.get("week") or 0) * 100 + index,
+                asset_id=int(card.get("assetId") or slot.get("assetId") or 0),
+                # The in-form's rating, which is not the base card's -- an
+                # in-form is a different card from the player it is based on.
+                rating=int(slot.get("rating") or card.get("rating", 0)),
+                rare=TOTW_RARE,
                 play_style=0,
-                team_id=card.get("clubId", 0),
-                attributes=card.get("attributes", [0] * 6),
-                position=card.get("position") or FALLBACK_POSITION,
+                team_id=int(slot.get("clubId") or card.get("clubId") or 0),
+                # The in-form's own face stats, which are not the base card's.
+                attributes=(
+                    slot.get("attributes")
+                    or card.get("attributes", [0] * 6)
+                ),
+                # The card's own position. `totw_teams.tsv` carries the
+                # formation slot beside it -- RCB, LCB, RCM -- and serving that
+                # is why the centre-backs drew blank: RCB is not a position the
+                # client knows. It is kept on the slot as `slot` for reading.
+                position=slot.get("position") or card.get("position")
+                or FALLBACK_POSITION,
                 item_state="free",
-                nation=card.get("nationId", 0),
-                league=card.get("leagueId", 0),
+                nation=int(slot.get("nationId") or card.get("nationId") or 0),
+                league=int(slot.get("leagueId") or card.get("leagueId") or 0),
                 rarity=card.get("rarity", ""),
+                # Gold, silver and bronze in-forms are different art bands --
+                # 8, 9, 10 and 11 -- and the card names its own.
+                version=int(slot.get("band") or 0) * 0x0100_0000
+                or TOTW_RESOURCE_VERSION,
             )
         )
+
     # The screen wants a challenge, not a squad: CardsDLL names
     # RequestChallengeData, GetChallengeData, GetTotalChallenges and
     # SetSelectedChallengeInfo, and its JSON table carries `squadChallenge`
     # at 0x8902FFD8 beside `squadId`. So a challenge is a squad you play
     # against, and the document lists them.
     #
-    # The member names below are the ones the binary actually carries;
-    # the arrangement around them is still inferred, which is why this is
-    # kept small -- an invented shape froze the title twice tonight.
-    saved_squads = (
-        json.loads(TOTW_FILE.read_text()).get("squads", [])
-        if TOTW_FILE.exists()
-        else []
-    )
-
-    def challenge(index: int, squad: dict) -> dict:
+    # The member names below are the ones the binary actually carries; the
+    # arrangement around them is still inferred, which is why this is kept
+    # small -- an invented shape froze the title twice.
+    def challenge(squad: dict) -> dict:
         """One side to play against, rated from the cards it actually holds.
 
-        `opponentRating` was computed as `max(... for card in [])` -- over an
-        empty list, so every challenge advertised a rating of 0 and an
+        `opponentRating` used to be computed as `max(... for card in [])` --
+        over an empty list, so every challenge advertised a rating of 0 and an
         opponent of team 0. A side you are invited to beat has to say how
         strong it is.
         """
-        cards = [
-            by_asset[asset]
-            for asset in (squad.get("assetIds") or [])
-            if asset in by_asset
-        ] or best
-        eleven = sorted(
-            cards, key=lambda card: -card.get("rating", 0)
-        )[:11]
-        rating = (
-            round(sum(card.get("rating", 0) for card in eleven) / len(eleven))
-            if eleven
-            else 0
-        )
+        eleven = [s for s in _totw_slots(squad) if s.get("starter")][:11]
+        rating = int(squad.get("rating") or 0)
+        if not rating and eleven:
+            rating = round(
+                sum(int(s.get("rating") or 0) for s in eleven) / len(eleven)
+            )
+        clubs = [
+            by_asset[asset].get("clubId")
+            for asset in (int(s.get("assetId") or 0) for s in eleven)
+            if asset in by_asset and by_asset[asset].get("clubId")
+        ]
         # The club most of them play for, which is what an opponent team id
         # means here. Zero is "no team" and drew nothing.
-        clubs = [card.get("clubId") for card in eleven if card.get("clubId")]
         team = max(set(clubs), key=clubs.count) if clubs else 0
         return {
-            "squadId": index + 1,
-            "squadName": squad.get("name", f"TOTW {index + 1}"),
-            "formation": FORMATION,
+            "squadId": int(squad.get("week") or 0),
+            "squadName": squad.get("name", "TOTW"),
+            "formation": squad.get("formation") or FORMATION,
             "opponentTeam": int(team),
             "opponentRating": rating,
         }
 
-    challenges = [challenge(i, s) for i, s in enumerate(saved_squads)]
     return json.dumps(
         {
             "itemData": items,
-            "formation": FORMATION,
-            "squadName": "Équipe de la semaine",
-            "squadChallenge": challenges,
+            "formation": entry.get("formation") or FORMATION,
+            "squadName": entry.get("name") or "Équipe de la semaine",
+            "squadChallenge": [challenge(week) for week in totw_squads()],
         },
         separators=(",", ":"),
     ).encode()
@@ -7108,7 +8712,7 @@ def totw_response(catalogue: "CardCatalogue", size: int = 23) -> bytes:
 
 def hub_response(
     inventory: "ClubInventory", market: int, selling: int, sold: int,
-    unlisted: int = 0,
+    unlisted: int = 0, totw: dict | None = None,
 ) -> bytes:
     """The transfer and My Club tiles read their counts from here.
 
@@ -7142,9 +8746,31 @@ def hub_response(
             "clubPlayers": players,
             "selling": selling,
             "sold": sold,
-            "transferListCount": user_total,
-            "tradePileCount": user_total,
-            "tradePileItems": user_total,
+            # **Nested, because that is what the tile reads.**
+            #
+            # `transferListCount`, `tradePileCount` and `tradePileItems` are
+            # none of them in CardsDLL's table -- three members invented here --
+            # so the TRANSFER LIST tile read 0 ITEMS, Selling 0, Sold 0 over a
+            # club holding 26 cards on the pile and 5 sold listings. Reported
+            # from the console 27 August.
+            #
+            # `tradePile`, `watchlist`, `count`, `notification`, `winning` and
+            # `outbid` are all in the table, and Impulsum's working hub sends
+            # exactly this shape.
+            "tradePile": {
+                "selling": selling,
+                "sold": sold,
+                "count": user_total,
+                # What the tile badges. Sold cards are waiting to be collected,
+                # and an outbid card wants attention the same way.
+                "notification": sold,
+            },
+            # No bids are modelled yet, so the targets tile is honestly empty
+            # rather than absent -- a tile with no numbers draws nothing.
+            "watchlist": {"winning": 0, "count": 0, "outbid": 0},
+            # The Team of the Week tile on the PLAY screen. Without it the tile
+            # is an empty pitch -- no cards and no "Active Challenge" line.
+            **({"squad": totw} if totw else {}),
         },
         separators=(",", ":"),
     ).encode()
@@ -7183,8 +8809,17 @@ CONSUMABLE_MEMBERS = {
 # refuses to apply anything.
 CONSUMABLE_FALLBACKS = {
     "consumablesTrainingManager": "training",
-    "consumablesTrainingManagerLeagueModifier": "training",
-    "consumablesFormationManager": "position",
+    # `consumablesFormationManager` is gone, 26 August. It reported the
+    # position family's count -- twenty -- over a family this server serves
+    # **none** of: the formation modifiers are subtypes 121-136 on art 35, art
+    # 35 draws NOT FOUND, and they are in both UNDRAWN_CONSUMABLE_TYPES and
+    # UNSEEDED_CONSUMABLE_TYPES because of it.
+    #
+    # So the tab announced twenty and had nothing behind it, which is exactly
+    # what the manager-league tab was doing when it said sixty-nine. A family
+    # held out on purpose should report nothing, not borrow another's count.
+    # The player put it well: he did not remember formation modifiers being in
+    # FIFA 14 at all.
     # `consumablesPosition` was carried by the six subtype-232 cards alone, and
     # those are out of the club now -- they drew NOT FOUND in the position
     # modifier tab, which is what the player reported. Reporting the position
@@ -7269,7 +8904,9 @@ def consumable_stats_response(inventory: "ClubInventory") -> bytes:
     return json.dumps(document, separators=(",", ":")).encode()
 
 
-def club_stats_response(inventory: "ClubInventory") -> bytes:
+def club_stats_response(
+    inventory: "ClubInventory", context_id: int = 5, context_value: int = 0
+) -> bytes:
     """The Mon Club counters: players, rares, staff, stadiums, kits, badges.
 
     They all read zero because the stats endpoints answered with an empty
@@ -7288,17 +8925,100 @@ def club_stats_response(inventory: "ClubInventory") -> bytes:
         for item in inventory.items
         if item.get("itemType") == "player" and item.get("rareflag")
     )
-    entries = [
-        {"key": 0, "value": players},
-        {"key": 1, "value": rares},
-        {"key": 2, "value": count("staff") + count("manager")},
-        {"key": 3, "value": count("stadium")},
-        {"key": 4, "value": count("kit")},
-        {"key": 5, "value": count("badge") + count(BADGE_WIRE_TYPE)},
-        {"key": 6, "value": count("ball")},
-        {"key": 7, "value": 0},
+    # Every family that reports as staff. `count("staff")` was the whole of
+    # this and nothing has ever carried that itemType -- the game's four
+    # families are named, and the counters beside them in CardsDLL are named
+    # per family too, so they can be filled rather than summed into one.
+    head_coaches = count("headCoach") + count("headcoach")
+    gk_coaches = count("gkCoach") + count("gkcoach")
+    fitness_coaches = count("fitnessCoach") + count("fitnesscoach")
+    physios = count("physio")
+    managers = count("manager")
+    staff = (
+        count("staff")
+        + managers
+        + head_coaches
+        + gk_coaches
+        + fitness_coaches
+        + physios
+    )
+    stadia = count("stadium")
+    kits = count("kit")
+    badges = count("badge") + count(BADGE_WIRE_TYPE)
+    balls = count("ball")
+
+    def by_tier(tier: str) -> int:
+        low, high = TIER_RATINGS[tier]
+        return sum(
+            1
+            for item in inventory.items
+            if item.get("itemType") == "player"
+            and low <= int(item.get("rating") or 0) <= high
+        )
+
+    # `key` is not a member of this binary.
+    #
+    # The counters went out as `{"entries":[{"key":0,"value":485}, ...]}` and
+    # the MY CLUB screen drew zero in all eight slots. `strings` on
+    # `work/cardsdll.bin` settles why: **`key` does not appear in CardsDLL at
+    # all** -- no exact match, in any capitalisation; the only near things are
+    # `artificialkey`, `eligibilityKey` and `keyid`. The parser was being handed
+    # a list whose every row was named after something it has never heard of.
+    #
+    # What it does carry, all of it exact: `contextId`, `contextValue`, `type`,
+    # `typeValue`, `stat`, `entries`, and a name for every counter below.
+    #
+    # The shape comes from MarvelcoCode/Impulsum14, a separate FIFA 14 server,
+    # which emits the same array twice as `stat` and as `entries`. That is a
+    # **PC** implementation and its client is a different binary -- the same
+    # caveat this project already carries about Kyro's build and about the
+    # leaked XNet source. It is not proof about the 360. What makes it more
+    # than a guess is the check above: every member it uses is in this
+    # console's own table and the one we were using is not.
+    #
+    # Bronze under 65, silver 65 to 74, gold 75 and over -- the same boundaries
+    # `TIER_RATINGS` already carries, arrived at independently there.
+    counters = [
+        ("playerCount", players),
+        ("players", players),
+        ("clubPlayers", players),
+        ("rarePlayers", rares),
+        ("playersBronze", by_tier("bronze")),
+        ("playersSilver", by_tier("silver")),
+        ("playersGold", by_tier("gold")),
+        ("staff", staff),
+        ("staffManager", managers),
+        ("staffHeadCoach", head_coaches),
+        ("staffGKCoach", gk_coaches),
+        ("staffFitnessCoach", fitness_coaches),
+        ("staffPhysio", physios),
+        ("numberItems", len(inventory.items)),
+        ("stadia", stadia),
+        ("balls", balls),
+        ("kits", kits),
+        ("badges", badges),
+        ("trophies", 0),
+        ("legendCount", sum(
+            1
+            for item in inventory.items
+            if (item.get("rarity") or "").strip().lower() == "legend"
+        )),
     ]
-    return json.dumps({"entries": entries}, separators=(",", ":")).encode()
+    rows = [
+        {
+            "contextId": context_id,
+            "contextValue": context_value,
+            "type": name,
+            "typeValue": value,
+        }
+        for name, value in counters
+    ]
+    document = {name: value for name, value in counters}
+    # Both names for the same array, as the reference does: which one this
+    # screen reads is not established, and they cannot disagree.
+    document["stat"] = rows
+    document["entries"] = rows
+    return json.dumps(document, separators=(",", ":")).encode()
 
 
 
@@ -7325,10 +9045,19 @@ CONSUMABLE_CATEGORIES = {
     "chemistrystyle": "playStyle",
     "position": "position",
     "positioning": "position",
-    # Asked for, and this club holds none: manager cards are left out of the
-    # catalogue by tools/build_consumables.py. An empty tab is the truth.
-    "managerleaguemodifier": "",
-    "managerleague": "",
+    # The club holds these now -- subtypes 300-326, one per league, added
+    # 25 August. The console asks for them by the family name rather than by
+    # the wire type: `/club/consumables/managerLeagueModifier`.
+    #
+    # It asked for them before they existed, too, and got an empty tab under a
+    # count of sixty-nine, because the count came from a fallback and the list
+    # came from here. Both halves are the stock now.
+    "managerleaguemodifier": "managerLeagueModifier",
+    "managerleague": "managerLeagueModifier",
+    # Still none of these. Manager contracts are left out of the catalogue by
+    # tools/build_consumables.py, and the formation modifiers are in it but
+    # held out of the club -- art 35 draws NOT FOUND. An empty tab is the
+    # truth for both.
     "managercontract": "",
     "formationmanager": "",
 }
@@ -7357,9 +9086,10 @@ def consumables_response(
         if not wanted:
             pass                                    # the bare path: everything
         elif family is not None:
-            # A category this club has no cards for -- manager league, say --
-            # maps to the empty string and matches nothing. Falling through to
-            # "everything" instead is how a tab headed one thing lists another.
+            # A category this club has no cards for -- a manager contract, say
+            # -- maps to the empty string and matches nothing. Falling through
+            # to "everything" instead is how a tab headed one thing lists
+            # another.
             if not family or consumable_family(item) != family:
                 continue
         elif wanted in CONSUMABLE_TYPES:
@@ -7434,7 +9164,28 @@ def club_user_response(inventory: "ClubInventory", name: str) -> bytes:
     def document(cards: list[dict]) -> bytes:
         return json.dumps(
             {
-                "user": [{"persona": name, "personaId": PERSONA.id, "public": False}],
+                "user": [
+                    {"persona": name, "personaId": PERSONA.id, "public": False},
+                    # The Team of the Week's club, announced beside the
+                    # player's. This is how the client learns it exists.
+                    #
+                    # Nothing else tells it. The challenge record carries that
+                    # persona in keys 3 and 4, but the console was never seen
+                    # asking `/user/list` for it -- because it had no reason
+                    # to: a persona that appears in no user list is not a club
+                    # the client knows about, and "there's no Team of the Week
+                    # available" is a true statement about a club it has never
+                    # been told exists.
+                    #
+                    # `persona` and `public` are the ION binding table's
+                    # GAMERTAG and PUBLIC, at 0x890125B4 and 0x890125EC, beside
+                    # USER_ID and the rest of the fields that screen reads.
+                    {
+                        "persona": "TOTW",
+                        "personaId": TOTW_PERSONA_ID,
+                        "public": True,
+                    },
+                ],
                 "itemData": cards,
                 "total": len(cards),
                 "count": len(cards),
@@ -7473,7 +9224,140 @@ def club_user_response(inventory: "ClubInventory", name: str) -> bytes:
             continue
         cards.append(card)
         payload = candidate
+    # What the console is now holding.
+    #
+    # This route is the client's face-card cache: it reads these once and never
+    # asks for more. So these ids are exactly the cards it can draw without
+    # another request, and that is what the duplicate panel needs to know --
+    # `pile_duplicate_pairs` pairs a new card against an owned one by id, and
+    # the client draws the owned card out of this cache. An id that is not in
+    # it has no card behind it, which is what "MY CURRENT ITEM: undefined" is.
+    inventory.cached_ids = {
+        card["id"] for card in cards if card.get("id")
+    }
     return payload
+
+
+def totw_hub_squad(catalogue: "CardCatalogue", week: int | None = None) -> dict:
+    """The Team of the Week as the PLAY tile draws it.
+
+    The tile was an empty pitch: no cards, no "Active Challenge" line. `/hub`
+    is fetched 499 times across these journals and carried no squad at all, and
+    Impulsum's build puts one there -- that is what fills the tile.
+
+    Built on this server's own squad document rather than copied. Four of the
+    members Impulsum sends are **not in CardsDLL's table** -- `loyaltyBonus`,
+    `dreamSquad`, `squadType` and `newSquad` -- and a member this binary does
+    not carry is what froze the match-award screen on 17 August and the
+    trade-offer screen on 18 August. Every member below is one
+    `active_squad_response` already sends, plus `captain` and `kicktakers`,
+    which are both in the table.
+
+    `/hub` is one of the three routes measured to tolerate an unrecognised
+    sibling -- see `with_balance` -- so this is the safe place to put it.
+    """
+    entry = totw_week(week)
+    slots = _totw_slots(entry)
+    by_asset = {card["assetId"]: card for card in catalogue.cards}
+    squad = json.loads(totw_response(catalogue, week=week))
+    items = squad["itemData"]
+
+    players = []
+    for index, item in enumerate(items):
+        players.append(
+            {
+                "index": index,
+                "itemData": item,
+                "kitNumber": index + 1 if index < 11 else 0,
+            }
+        )
+
+    starters = [s for s in slots if s.get("starter")][:11]
+    rating = int(entry.get("rating") or 0)
+    if not rating and starters:
+        rating = round(
+            sum(int(s.get("rating") or 0) for s in starters) / len(starters)
+        )
+
+    # The card the tile leads with. Impulsum takes the first starter; the
+    # highest-rated one is what the screen is actually advertising -- their own
+    # shot leads with an 89 Robben, who is the best card in that week.
+    captain = 0
+    if items:
+        captain = max(items, key=lambda card: card.get("rating", 0))["id"]
+
+    return {
+        # The Team of the Week's club, which is what keys 3 and 4 of the
+        # challenge record name. The squad is that club's, not the player's.
+        "personaId": TOTW_PERSONA_ID,
+        "id": int(entry.get("week") or 0),
+        "squadName": entry.get("name") or "TOTW",
+        "formation": entry.get("formation") or FORMATION,
+        "chemistry": 100,
+        "starRating": rating,
+        "rating": rating,
+        "changed": False,
+        "players": players,
+        "manager": [],
+        "captain": captain,
+        # Five set-piece slots, all the same card, which is what a side nobody
+        # has arranged carries.
+        "kicktakers": [{"id": captain, "index": index} for index in range(5)],
+    }
+
+
+def totw_club_info(catalogue: "CardCatalogue | None" = None) -> bytes:
+    """The Team of the Week's club, for `/user/list?personaIdList=<totw>`.
+
+    A club, with a squad list -- one entry per week -- rather than a squad.
+    That is what the console goes looking for once the squad it was shown
+    belongs to a persona that is not the player's.
+
+    `squadType` and `categoryId` are left out: Impulsum sends both and neither
+    is in CardsDLL's table. `activeSquadId` is not in it either and is sent
+    anyway, because the list has to say which week is showing and nothing else
+    in the document can; it is the one unverified member here and it is a
+    sibling at the top of `squadList`, where this protocol skips what it does
+    not know.
+
+    The crest and kits are this server's own verified art -- badge 6000241 and
+    kits 6300000/6400001, all three seen rendering on this console -- rather
+    than Impulsum's 6000654/6300815/6400685, which are a PC build's ids and
+    have never been drawn here.
+    """
+    weeks = totw_squads()
+    active = totw_active_week()
+    return json.dumps(
+        {
+            "user": [
+                {
+                    "personaId": TOTW_PERSONA_ID,
+                    "clubName": "Team of the Week",
+                    "clubAbbr": "TOTW",
+                    "teamId": 0,
+                    "bidTokens": {},
+                    "established": 2013,
+                    "squadList": {
+                        "squad": [
+                            {
+                                "id": int(entry.get("week") or index + 1),
+                                "squadName": entry.get("name", "TOTW"),
+                                "formation": entry.get("formation") or FORMATION,
+                                "rating": int(entry.get("rating") or 0),
+                                "chemistry": 100,
+                            }
+                            for index, entry in enumerate(weeks)
+                        ],
+                        "activeSquadId": active,
+                    },
+                    "badge": {"resourceId": 6_000_241, "teamId": 241},
+                    "homekit": {"resourceId": 6_300_000, "teamId": 241, "year": 0},
+                    "awaykit": {"resourceId": 6_400_001, "teamId": 241, "year": 0},
+                }
+            ]
+        },
+        separators=(",", ":"),
+    ).encode()
 
 
 def totw_index(catalogue: "CardCatalogue | None" = None) -> bytes:
@@ -7485,42 +9369,29 @@ def totw_index(catalogue: "CardCatalogue | None" = None) -> bytes:
 
     Every entry used to advertise `rating` 0. A squad with no rating is not a
     squad the screen can offer, and "aucune disponible" is what it says about a
-    list it will not take. The rating is the real one now, worked out from the
-    eleven the squad names.
+    list it will not take. The rating is the week's own now, and so is the
+    formation -- these are not all f442, week 1 is f343.
     """
-    squads = []
-    if TOTW_FILE.exists():
-        squads = json.loads(TOTW_FILE.read_text()).get("squads", [])
-    by_asset = (
-        {card["assetId"]: card for card in catalogue.cards} if catalogue else {}
-    )
-
-    def rating(squad: dict) -> int:
-        eleven = [
-            by_asset[asset]
-            for asset in list(squad.get("assetIds") or [])[:11]
-            if asset in by_asset
-        ]
-        if not eleven:
-            return 0
-        return round(sum(card.get("rating", 0) for card in eleven) / len(eleven))
-
+    squads = totw_squads()
     return json.dumps(
         {
             "squad": [
                 {
-                    "id": index + 1,
-                    "squadName": squad.get("name", f"TOTW {index + 1}"),
-                    "formation": FORMATION,
-                    "rating": rating(squad),
+                    "id": int(entry.get("week") or index + 1),
+                    "squadName": entry.get("name", f"TOTW {index + 1}"),
+                    "formation": entry.get("formation") or FORMATION,
+                    "rating": int(entry.get("rating") or 0),
                     "chemistry": 100,
                 }
-                for index, squad in enumerate(squads)
+                for index, entry in enumerate(squads)
             ],
+            "activeSquadId": totw_active_week(),
             "userInfo": [],
         },
         separators=(",", ":"),
     ).encode()
+
+
 
 
 # -- keeping the club between sessions -------------------------------------
@@ -7856,6 +9727,144 @@ class ClubSave:
         self.path.write_text(json.dumps(document, separators=(",", ":")))
 
 
+# The Team of the Week challenge's own configuration.
+#
+# `/clientdata/totw` is a **clientdata** route and its siblings all answer an
+# entries document -- `clientdata/pileSize` is `{"entries":[{"key":2,...}]}`
+# here and works. It is also the only Team of the Week route any console in
+# these journals has ever asked for, fetched once at login, and pressing A on
+# the tile fires no request at all. So everything the screen decides from is in
+# this one reply.
+#
+# **Keys 7, 8 and 9 are the challenge's name**, packed little-endian, four
+# characters to an integer. Impulsum's values decode to
+#
+#     1398034260 541150240 1095190860  ->  "TOTS LA LIGA"
+#
+# and its key 6 is 12, which is that name's length. This server was sending
+# those three integers verbatim, so the entries announced a Team of the Season
+# La Liga squad while the tile drew TOTW 1. The name is built from the week
+# now.
+#
+# The rest stay as Impulsum has them and remain **opaque**: 3 is int max and 4
+# is -2, which read like "no limit" and a sentinel. Nothing here has decoded
+# them, and inventing values for a configuration this server does not
+# understand is how the match-award screen got hung.
+_TOTW_PERSONA_HIGH, _TOTW_PERSONA_LOW = _persona_halves(TOTW_PERSONA_ID)
+TOTW_CHALLENGE_HEAD = [
+    (1, 3),
+    (2, 1),
+    # The owning club's persona, high word then low.
+    (3, _TOTW_PERSONA_HIGH),
+    (4, _TOTW_PERSONA_LOW),
+    (5, 1),
+]
+TOTW_CHALLENGE_TAIL = [(10, 1), (11, 3), (12, 0), (13, 1), (14, 0)]
+
+# The name occupies keys 7, 8 and 9 -- three integers, twelve characters. It is
+# padded to that width rather than shortened to fit, so the keys after it stay
+# where the working build puts them; `key 6` carries the real length, so a
+# shorter name reads as itself and the padding is never shown.
+TOTW_NAME_KEYS = (7, 8, 9)
+TOTW_NAME_WIDTH = 4 * len(TOTW_NAME_KEYS)
+
+
+def _packed_name(name: str) -> list[int]:
+    """A challenge name as little-endian integers, four characters each."""
+    raw = name.encode("ascii", "replace")[:TOTW_NAME_WIDTH]
+    raw = raw.ljust(TOTW_NAME_WIDTH, b" ")
+    return [
+        int.from_bytes(raw[index:index + 4], "little", signed=True)
+        for index in range(0, TOTW_NAME_WIDTH, 4)
+    ]
+
+
+def totw_challenge_entries(catalogue: "CardCatalogue | None" = None) -> bytes:
+    """`/ut/game/fifa14/clientdata/totw` -- the challenge configuration.
+
+    **Entries alone**, which is measured rather than chosen. Three documents
+    have been served on this route and the refusal names which got furthest:
+
+        squad index only      "no Team of the Week available at the moment"
+        entries only          "no Team of the Week to play"
+        entries + squad       "available at the moment" again
+
+    The middle one is past a check the other two fail, so the squad members do
+    not merely fail to help here -- they push the screen backwards. What "to
+    play" wants is in the remaining opaque keys, not in a bigger document.
+
+    `catalogue` is unused and kept so the route wiring does not have to change
+    again while those keys are being read.
+    """
+    entry = totw_week()
+    name = str(entry.get("name") or "TOTW")
+
+    pairs = list(TOTW_CHALLENGE_HEAD)
+    # The **padded** width, not the name's own length.
+    #
+    # Key 6 is a length and keys 7-9 are the string it describes, so the two
+    # have to agree or everything after them moves. Impulsum's name is "TOTS LA
+    # LIGA", exactly twelve characters, with key 6 at 12 -- three integers
+    # consumed and the tail starting at key 10.
+    #
+    # This server sent key 6 as the *real* length, 6 for "TOTW 1", while still
+    # padding the name across all three integers. A client that reads six
+    # characters consumes two integers and then takes key 9 -- four spaces,
+    # 538976288 -- as the first value of the tail. The refusal went backwards
+    # when that changed, from "no Team of the Week to play" to "no Team of the
+    # Week available at the moment", which is what a shifted record looks like.
+    #
+    # Twelve keeps the record byte-for-byte the shape of the working build's
+    # and differs only in the characters. The padding is trailing spaces, so a
+    # name shorter than twelve still reads as itself.
+    pairs.append((6, TOTW_NAME_WIDTH))
+    pairs.extend(zip(TOTW_NAME_KEYS, _packed_name(name)))
+    pairs.extend(TOTW_CHALLENGE_TAIL)
+
+    document: dict = {
+        "entries": [{"key": key, "value": value} for key, value in pairs]
+    }
+    # Entries **alone**, and this is measured rather than chosen.
+    #
+    # Three documents have been served on this route and the refusal names
+    # which got furthest:
+    #
+    #     squad index only      "no Team of the Week available at the moment"
+    #     entries only          "no Team of the Week to play"
+    #     entries + squad       "available at the moment" again
+    #
+    # The middle one is past a check the other two fail, so the squad members
+    # are not merely unnecessary here -- they push the screen backwards. What
+    # is left to find is what "to play" wants, and it is in the remaining
+    # opaque keys rather than in a bigger document.
+    return json.dumps(document, separators=(",", ":")).encode()
+
+
+def totw_challenge_response(catalogue: "CardCatalogue") -> bytes:
+    """`/ut/game/fifa14/totw` -- the challenge itself, and the side it is against.
+
+    No console has ever asked for this route: every journal here carries
+    `/clientdata/totw` and nothing else. It is served anyway, because the
+    reason may simply be that the client never got past the clientdata reply --
+    a screen that has decided there is no Team of the Week has no reason to ask
+    for one.
+
+    `squadChallenge` is an **object** wrapping the squad, not a list of
+    descriptors. The list this server used to send was invented, and its own
+    comment said so.
+    """
+    squad = totw_hub_squad(catalogue)
+    return json.dumps(
+        {
+            "matchDifficulty": 2,
+            "grantsGameModePrizes": True,
+            "squad": squad,
+            "squadChallenge": {"squad": squad},
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
 def totw_index_with_squad(catalogue: "CardCatalogue") -> bytes:
     """The Team of the Week list, carrying the squad itself as well.
 
@@ -8095,7 +10104,19 @@ class Tenant:
             # A club that has been created has a name. Saying nothing here
             # tells the client no club exists, which is what the first-run
             # flag is for -- so outside first-run mode the name is set.
-            self.identity.name = CLUB_NAME_DEFAULT
+            #
+            # Only when the save did not carry one. This line used to run
+            # unconditionally, immediately after `save.load` had restored the
+            # saved name, so every club was called `Fondateur FUT` again on the
+            # next launch however it had been renamed.
+            #
+            # The abbreviation is what gave it away: `PUT /user/club` carries
+            # both, `adopt` took both, the save held both -- and a club renamed
+            # to "Classic XI"/"CXI" on 25 August came back as "Fondateur
+            # FUT"/"CXI". The half that reverted was the half this line
+            # writes.
+            if not self.identity.name:
+                self.identity.name = CLUB_NAME_DEFAULT
             # Said out loud when a club opens. A cup run that was in the save
             # one evening and gone the next launch left nothing to look at
             # afterwards. With more than one club it also says which one.

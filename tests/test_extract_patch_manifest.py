@@ -54,13 +54,75 @@ def test_the_ip_actually_changes_the_manifest() -> None:
     assert a["stage2_easfc"]["strings"] != b["stage2_easfc"]["strings"]
 
 
-def test_a_max_length_ipv4_fits_both_easfc_slots() -> None:
+def test_the_easfc_session_slot_is_nearly_full() -> None:
     # In-place rewrite: a replacement longer than the original cannot be
-    # written. A maximal IPv4 is the worst case and must still fit, or a plugin
-    # that resolves to one would be stuck.
+    # written, and the patcher refuses rather than overrunning into the string
+    # that follows.
+    #
+    # The session slot is 24 bytes and `http://` takes seven of them, which
+    # leaves seventeen for `<ip>:<port>`. That is not much:
+    #
+    #     http://10.0.0.119:18080        23   fits, by one byte
+    #     http://192.168.1.40:18080      25   does not fit
+    #     http://255.255.255.255:18080   28   does not fit
+    #
+    # So most home LANs cannot point EAS FC at port 18080 at all. The way out
+    # is a shorter identity port -- omitting it entirely leaves
+    # `http://255.255.255.255` at 22 bytes, which always fits, at the cost of
+    # having to serve EAS FC on port 80. Nothing here does that yet; the limit
+    # is asserted so it is found in a test rather than on a console.
+    for ip, expected in (
+        ("10.0.0.119", True),
+        ("192.168.1.40", False),
+        ("255.255.255.255", False),
+    ):
+        session = next(
+            s for s in M.build(ip, 10041, 18080)["stage2_easfc"]["strings"]
+            if s["name"] == "easfc_session"
+        )
+        assert session["fits"] is expected, f"{ip}: {session['write']}"
+        assert session["budget"] == 24
+
+    # The catalogue slot is 28 bytes and has always carried the scheme, so it
+    # has room the session slot does not.
+    catalogue = next(
+        s for s in M.build("255.255.255.255", 10041, 18080)["stage2_easfc"]["strings"]
+        if s["name"] == "easfc_catalogue"
+    )
+    assert catalogue["fits"]
+
+
+def test_the_session_slot_cannot_hold_a_maximal_ipv4_with_a_port() -> None:
+    # This used to assert the opposite, and the scheme is why it changed.
+    #
+    # EAS FC needs `http://` on the session endpoint -- without it the module
+    # hands `10.0.0.119:18080/pow/auth` to ProtoHttp, which will not open a
+    # socket for a scheme-less URL, and no request is ever made. Adding it is
+    # what produced the first `POST /pow/auth` this project has seen.
+    #
+    # It costs seven of the twenty-four bytes `pal.gt.easfc.ea.com:8094`
+    # leaves. A maximal IPv4 with a five-digit port needs twenty-eight:
+    #
+    #     http://255.255.255.255:18080
+    #
+    # So there is a real address-length limit on EAS FC now, and it is
+    # asserted rather than discovered on a console. `fits` reports False and
+    # the patcher writes nothing; it does not truncate, and it does not run
+    # past the end of the slot.
     m = M.build("255.255.255.255", 10041, 18080)
-    for s in m["stage2_easfc"]["strings"]:
-        assert s["fits"], f"{s['name']} overruns: {len(s['write'])} > {s['budget']}"
+    slots = {s["name"]: s for s in m["stage2_easfc"]["strings"]}
+    assert slots["easfc_catalogue"]["fits"]
+    assert not slots["easfc_session"]["fits"]
+    assert slots["easfc_session"]["budget"] == 24
+
+    # Where the line falls: this server's own address fits with one byte over.
+    fits = M.build("10.0.0.119", 10041, 18080)
+    session = next(
+        s for s in fits["stage2_easfc"]["strings"] if s["name"] == "easfc_session"
+    )
+    assert session["fits"]
+    assert session["write"] == "http://10.0.0.119:18080"
+    assert len(session["write"]) == 23
 
 
 def test_the_tu3_branches_carry_their_context_guards() -> None:
