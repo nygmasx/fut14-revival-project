@@ -21,6 +21,25 @@ def test_every_listed_file_exists_in_the_repo() -> None:
         assert (P.REPO / relative).exists(), f"listed but missing: {relative}"
 
 
+
+def _data_files_read_from_server_dir() -> set[str]:
+    """Every `server/*.json` the running server names, as package members.
+
+    A JSON name in the server's own source that also exists in `server/` is a
+    runtime dependency by definition. Names under `runtime/` and `work/` are
+    written by the operator, do not exist in a checkout, and are correctly
+    absent here.
+    """
+    import re
+
+    found = set()
+    for module in ("server/fifa14_blaze_server.py", "server/fut_inventory.py"):
+        source = (P.REPO / module).read_text()
+        for name in re.findall(r'"([A-Za-z0-9_.-]+\.json)"', source):
+            if (P.REPO / "server" / name).exists():
+                found.add(f"server/{name}")
+    return found
+
 def test_the_server_runtime_modules_are_all_present() -> None:
     # The three the running server imports. If the server grows a fourth, it
     # has to be added here or the package fails to boot -- which is the whole
@@ -32,14 +51,17 @@ def test_the_server_runtime_modules_are_all_present() -> None:
         "tools/blaze_tdf.py",
     ):
         assert module in listed
-    # And the four data files it reads.
-    for data in (
-        "server/fifa14_cards.json",
-        "server/fifa14_consumables.json",
-        "server/fifa14_totw.json",
-        "server/icebreakerpacklist.json",
-    ):
-        assert data in listed
+    # And every data file it reads from beside itself.
+    #
+    # Named literals rather than a fixed list, because a fixed list cannot
+    # catch the omission it is meant to catch: `server/fifa14_staff.json`
+    # arrived with the staff catalogue and was never added to SERVER_DATA, and
+    # `staff_catalogue()` answers `[]` when the file is absent -- so the
+    # package booted on the VPS and served a club with no coaches and no
+    # physios, silently. Anything the server reads from `server/` that exists
+    # in the checkout has to ship.
+    for data in _data_files_read_from_server_dir():
+        assert data in listed, f"read by the server but not packaged: {data}"
 
 
 def test_the_package_carries_no_game_files_or_club_data(tmp_path) -> None:

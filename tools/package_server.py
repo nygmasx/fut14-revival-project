@@ -41,6 +41,7 @@ SERVER_DATA = [
     "server/fifa14_clubitems.json",
     "server/fifa14_clubitems_blank.json",
     "server/fifa14_managers.json",
+    "server/fifa14_staff.json",
     "server/fifa14_consumables.json",
     "server/fifa14_totw.json",
     "server/icebreakerpacklist.json",
