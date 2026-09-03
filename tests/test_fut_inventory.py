@@ -4289,12 +4289,24 @@ def test_a_probe_run_never_writes_the_save() -> None:
     wallet = Wallet(coins=999)
     actions = CardActions(PackShop(CardCatalogue(), wallet), wallet, inventory)
 
+    # The roster the probe sweeps is written by the operator and gitignored, so
+    # a checkout does not have one -- and without one `_club_item_probe` reads
+    # nothing and returns a falsy roster, so the guard does not fire and this
+    # test asserted a machine rather than the code. It gets its own roster.
+    import fut_inventory
+
+    roster = Path(tempfile.mkdtemp()) / "club-item-probe.json"
+    roster.write_text(json.dumps({"kit": [1], "badge": [], "stadium": [], "ball": []}))
+    kept = fut_inventory.PROBE_FILE
+    fut_inventory.PROBE_FILE = roster
+
     os.environ["FIFA14_CLUB_ITEM_PROBE"] = "1"
     try:
         ClubSave(path).save(inventory, wallet, actions, None)
         assert path.read_text() == before, "a probe run wrote the save"
     finally:
         os.environ.pop("FIFA14_CLUB_ITEM_PROBE", None)
+        fut_inventory.PROBE_FILE = kept
 
     # And with the probe off it saves as normal.
     ClubSave(path).save(inventory, wallet, actions, None)
