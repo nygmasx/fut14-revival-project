@@ -2792,7 +2792,16 @@ class Wallet:
                 # Serving a founding year for a club with no name is the same
                 # contradiction the club name itself was, one field along.
                 "established": 2013 if club_name else 0,
-                "divisionOffline": 10,
+                # La division où le club joue, et non le 10 en dur qu'elle a
+                # été jusqu'ici. Un club qui gagne sa saison montait dans
+                # `SeasonProgress` et rouvrait le mode en Division 10 quand
+                # même, parce que cette ligne ne lisait rien.
+                #
+                # `divisionOnline` reste à 10 : ce serveur ne sert pas les
+                # saisons en ligne, donc il n'a rien à en dire, et lui faire
+                # suivre la division hors ligne serait affirmer une chose que
+                # personne n'a mesurée.
+                "divisionOffline": int(getattr(SEASON_PROGRESS, "division", 10)),
                 "divisionOnline": 10,
                 # The club's record, and this is where the dashboard reads it.
                 #
@@ -6553,6 +6562,37 @@ TOURNAMENT_TEAM_POOLS = {
 
 TROPHY_FIRST = 1100
 TROPHY_LAST = 1169
+
+# L'id d'une saison, et pourquoi ce n'est plus une position.
+#
+# `seasonId` a porte trois lectures successives ici -- la position dans la
+# liste servie, la position dans la table des dix, le numero de division -- et
+# `docs/SEASONS.md` enregistre une journee entiere passee a les departager sans
+# jamais y arriver, parce que sur une liste de dix elles donnent toutes le meme
+# nombre.
+#
+# Le serveur PC d'AC (31 aout 2026, conversation Discord) n'a pas ce probleme :
+# il donne a chaque saison un identifiant qui n'est la position de rien. La
+# Division 1 porte `id` 1103, `season/user` repond `seasonId` 1103, et
+# `trophyResourceId` vaut 1103 lui aussi. Il n'y a plus d'arithmetique d'index
+# a se tromper, et le desaccord entre `native` et `kyro-data` -- lequel des
+# deux nombres designe quelle ligne -- disparait au lieu d'etre tranche.
+#
+# 1103 pour la Division 1 place la serie a 1102 + numero, donc 1103..1112, et
+# les dix tombent dans les soixante-dix trophees que `cards0.big` embarque a
+# 1100..1169. C'est pour ca que le meme nombre peut servir d'id et de trophee.
+SEASON_ID_BASE = 1102
+
+
+def season_id(division: int) -> int:
+    """L'identifiant propre d'une saison, qui est aussi son trophee."""
+    return SEASON_ID_BASE + int(division)
+
+
+# Un an, en secondes. AC sert `untilEndSeconds` 31 536 000 la ou ce fichier
+# servait dix fois ca -- une valeur choisie pour dire « jamais » et qui n'est
+# pas une duree que le client ait jamais vue d'EA.
+SEASON_YEAR_SECONDS = 31_536_000
 TROPHY_TIER = "gold"
 
 
@@ -6764,19 +6804,35 @@ def _season_record(index: int, division: int, matches: int, promote: int, coins:
     title = 12
     holding = 300 if int(division) == 10 else max(300, int(coins) // 5)
     promotion = 1500 if int(division) == 10 else max(500, int(coins) - 400)
+    # Les trois niveaux d'AC, du plus haut seuil au plus bas.
+    #
+    # Il y en avait quatre ici, `RELEGATION` en tete et les seuils croissants.
+    # La relegation n'est pas un niveau de recompense -- elle ne paie rien, et
+    # son seuil valait zero, le meme que le maintien, donc les deux premieres
+    # entrees etaient indiscernables l'une de l'autre. AC n'en sert que trois,
+    # et c'est aussi dans cet ordre que `season_outcome` les lit : le premier
+    # niveau dont le seuil est atteint gagne.
+    prizes = [
+        _season_prize("CHAMPIONSHIP", title, int(coins)),
+        _season_prize("PROMOTION", int(promote), promotion),
+        _season_prize("MAINTENANCE", 0, holding),
+    ]
+    # Une saison qui commence maintenant et court un an.
+    #
+    # `startDateTime` valait 0 et `endDateTime` valait 0x7FFFFFFF -- « depuis
+    # toujours, pour toujours ». Aucune saison qu'EA ait servie n'a cette
+    # forme, et `visStartDays`/`visEndDays` disaient 3650 des deux cotes, ce
+    # qui n'a pas de sens non plus : le second est une fenetre de visibilite,
+    # pas une duree. AC sert 0 et 365.
+    start = int(time.time())
     return {
-        "id": int(index),
+        "id": season_id(division),
         "type": "OFFLINE",
         "divisionId": int(division),
         "numMatches": int(matches),
         "matchLengthMin": 6,
         "matches": _season_matches(division, matches),
-        "prizeSet": [
-            _season_prize("RELEGATION", 0, 0),
-            _season_prize("MAINTENANCE", 0, holding),
-            _season_prize("PROMOTION", int(promote), promotion),
-            _season_prize("CHAMPIONSHIP", title, int(coins)),
-        ],
+        "prizeSet": prizes,
         "elgOperation": "AND",
         "elgReq": [],
         # A real trophy, not -1 and not 0.
@@ -6792,17 +6848,65 @@ def _season_record(index: int, division: int, matches: int, promote: int, coins:
         # which removes a known-bad variable before the reduction ladder starts
         # -- there is no point bisecting a record that still carries a value
         # already known to send the client hunting.
-        "trophyResourceId": TROPHY_FIRST + (int(division) - 1) % (
-            TROPHY_LAST - TROPHY_FIRST + 1
-        ),
-        "trophyUseCount": 0,
-        "visStartDays": 3650,
-        "visEndDays": 3650,
-        "startDateTime": 0,
-        "endDateTime": FOREVER,
+        # Le trophee est l'id, et l'id est le trophee. Voir `season_id`.
+        "trophyResourceId": season_id(division),
+        "trophyUseCount": 1,
+        "visStartDays": 0,
+        "visEndDays": 365,
+        "startDateTime": start,
+        "endDateTime": start + SEASON_YEAR_SECONDS,
         "untilStartSeconds": 0,
-        "untilEndSeconds": 315360000,
+        "untilEndSeconds": SEASON_YEAR_SECONDS,
     }
+
+
+
+def season_definition(division: int) -> dict:
+    """Le disque qu'une division reçoit dans `season/list`."""
+    for position, row in enumerate(SEASON_DIVISIONS, start=1):
+        if int(row[0]) == int(division):
+            return _season_record(position, row[0], row[2], row[3], row[4])
+    return {}
+
+
+def season_points(won: int, draw: int) -> int:
+    """Trois points la victoire, un le nul. Rien d'autre n'est compté."""
+    return int(won) * 3 + int(draw)
+
+
+def season_outcome(division: int, points: int) -> tuple[str, int]:
+    """Le niveau atteint, et ce qu'il paie.
+
+    Lu dans le `prizeSet` **effectivement servi** plutôt que dans une table
+    parallèle, pour que l'écran de détails et le règlement ne puissent pas se
+    contredire : c'est exactement la façon dont le seuil de titre s'était mis à
+    bouger avec celui de la montée sans que rien ne le signale.
+
+    `prizeSet` est ordonné du seuil le plus haut au plus bas, donc le premier
+    niveau atteint est le bon. Aucun niveau atteint veut dire relégation, et la
+    relégation ne paie rien -- c'est pourquoi elle n'est pas dans la liste.
+    """
+    for prize in season_definition(division).get("prizeSet") or []:
+        if int(points) >= int(prize.get("thresholdPoint") or 0):
+            coins = 0
+            for mapping in prize.get("awardMappings") or []:
+                for award in mapping.get("awards") or []:
+                    if str(award.get("type")) == "coin":
+                        coins += int(award.get("value") or 0)
+            return str(prize.get("prizeLevel") or "MAINTENANCE"), coins
+    return "RELEGATION", 0
+
+
+def season_next_division(division: int, outcome: str) -> int:
+    """Où le club joue la saison suivante.
+
+    La Division 1 est le sommet et la 10 le bas, donc une montée **décrémente**.
+    """
+    if outcome in ("CHAMPIONSHIP", "PROMOTION"):
+        return max(1, int(division) - 1)
+    if outcome == "RELEGATION":
+        return min(10, int(division) + 1)
+    return int(division)
 
 
 def season_wire_mode() -> str:
@@ -6895,7 +6999,25 @@ def season_wire_mode() -> str:
     # Not understood yet. The four differences between the two are the
     # reversed list order, `seasonId`, `divisionId` and the `data` blob, and
     # nothing says which one costs the freeze.
-    raw = os.environ.get("FIFA14_SEASON_MODE", "native").strip().lower()
+    # `ac` est le defaut depuis le 4 septembre 2026.
+    #
+    # Ce qui precede laisse `native` et `kyro-data` dos a dos : l'un ouvre
+    # l'ecran et ne reprend pas, l'autre reprend et a gele une fois. Les quatre
+    # differences entre eux -- l'ordre de la liste, `seasonId`, `divisionId` et
+    # le blob -- n'ont jamais pu etre departagees parce que sur une liste de
+    # dix, la position d'une division et son numero sont le meme nombre.
+    #
+    # Le serveur PC d'AC (Discord, 31 aout 2026) ne tranche pas ce debat : il
+    # le supprime. Une saison porte un identifiant qui n'est la position de
+    # rien, `season/user` le renvoie tel quel, et `divisionId` est le numero de
+    # la division des deux cotes. Il n'y a plus deux lectures possibles d'un
+    # meme nombre, donc plus de desaccord a arbitrer.
+    #
+    # `FIFA14_SEASON_MODE=native` reprend l'ancien defaut, qui est la ou il
+    # faut revenir si cet ecran gele.
+    raw = os.environ.get("FIFA14_SEASON_MODE", "ac").strip().lower()
+    if raw in {"ac", "discord", "identity"}:
+        return "ac"
     if raw in {"current", "one"}:
         return "current"
     if raw == "default":
@@ -6951,6 +7073,26 @@ def seasons_response() -> bytes:
             SEASON_DIVISIONS, start=1
         )
     ]
+    if mode == "ac":
+        # Les dix divisions, la 10 en tete.
+        #
+        # L'ordre compte pour une seule raison : l'ecran s'ouvre sur la
+        # premiere tuile. `native` sert la table dans l'ordre 1..10, donc il
+        # ouvre sur la Division 1 -- la ou un club finit, pas la ou il
+        # commence. FUT demarre tout le monde en Division 10.
+        #
+        # Ce que l'ordre ne fait plus, c'est designer une saison : `id` est
+        # l'identifiant propre du disque depuis `season_id`, et il ne bouge pas
+        # avec la position. C'est ce qui permet de choisir cet ordre pour ce
+        # qu'il affiche, et rien d'autre.
+        records = [
+            _season_record(index, division, matches, promote, coins)
+            for index, (division, _name, matches, promote, coins) in enumerate(
+                reversed(SEASON_DIVISIONS), start=1
+            )
+        ]
+        return json.dumps({"seasons": records}, separators=(",", ":")).encode()
+
     if mode in ("kyro", "kyro-div9", "kyro-data", "kyro-full"):
         # `offline_seasons_list` from KyroGeorge2/FIFA-14-Local-FUT.
         #
@@ -7035,51 +7177,28 @@ def _season_matches_played(entry: dict) -> int:
 
 
 def served_season_index(division: int) -> int:
-    """`seasonId`: where a division sits in the list actually served.
+    """`seasonId` : l'identifiant propre de la saison d'une division.
 
-    NOT `divisionId`. The bisection recorded in `season_user_response` settles
-    that one separately: `divisionId` 0 renders a badge reading DIV 1, so it
-    indexes the *client's* table of ten divisions and Division 10 is 9. That is
-    unaffected by how many records this server sends.
+    Ce fut une position -- dans la liste servie, puis dans la table des dix --
+    et c'est ce que `docs/SEASONS.md` raconte sur une journee entiere sans
+    trancher, parce que sur une liste de dix la position d'une division et son
+    numero sont le meme nombre. Une liste reduite les separait enfin, et
+    donnait deux reponses opposees selon la ligne qu'on lisait.
 
-    `seasonId` is the one that depends on the list, and it is the one a reduced
-    rung breaks: every rung served a single record while this still answered
-    with the division's position in the full ten-row table, so `minimal` served
-    one season and pointed at season 10.
+    Depuis `season_id`, il n'y a plus de position a lire : un disque porte un
+    identifiant qui ne bouge ni avec l'ordre de la liste ni avec sa longueur,
+    et `season/user` renvoie le meme. Cette fonction reste parce que tous les
+    modes l'appellent, et elle ne fait plus qu'une chose.
 
-    The recorded bisection in `season_user_response` narrowed the freeze to
-    `divisionId` and noted what its value also is: "on a list of ten, 10 is one
-    past the last index; on a list of one it is far past". That reading could
-    not be tested while every reduced rung served Division 1 -- the club's
-    division and the served record were different rows, so index and division
-    number could never be told apart.
-
-    Serving Division 10 as the single record makes them separable. A list of
-    one holding Division 10 needs index 1; a full list of ten needs index 10,
-    which is also the division number, which is why the two readings agreed on
-    `native` and disagreed nowhere it was looked at.
-
-    So the index is computed from what is served rather than assumed to be the
-    division.
+    Ce que ca coute : le mode `kyro` n'est plus une reproduction fidele du
+    build de reference, qui sert `seasonId` 1 sur une liste ordonnee a
+    l'envers. C'est assume -- un mode dont le `seasonId` ne designe aucune
+    ligne de sa propre liste est exactement le defaut qu'on retire ici, et le
+    reste de ce que `kyro` reproduit (l'ordre, `divisionId`, les membres omis)
+    est intact.
     """
-    # The record's OWN id, not its position in the page.
-    #
-    # A record built for Division 10 carries `id` 10 whether it is served
-    # alone or beside nine others -- `_season_record` takes the index from
-    # `SEASON_DIVISIONS`, and slicing the list to one row does not renumber it.
-    # So `seasonId` has to name the record, and the client agrees: it saves to
-    # `/season/10/division/10/user`, season ten, on a list holding exactly one
-    # season.
-    #
-    # This was changed to "index into the page" earlier on the reasoning that a
-    # one-row list could not hold a season 10. It can: the row *is* season 10.
-    # The client accepted the reduced rungs, played a match, saved round 2 --
-    # and then reset to round 1, because the document beside its progress named
-    # a season that was not there.
-    for position, row in enumerate(SEASON_DIVISIONS, start=1):
-        if row[0] == int(division):
-            return position
-    return 1
+    return season_id(division)
+
 
 
 def season_user_response(division: int = 10, played: int = 0) -> bytes:
@@ -7095,6 +7214,47 @@ def season_user_response(division: int = 10, played: int = 0) -> bytes:
     is now deliberately without.
     """
     mode = season_wire_mode()
+    if mode == "ac":
+        # Le document que sert le serveur PC d'AC, membre pour membre :
+        #
+        #     {"seasonId":1103,"divisionId":1,"round":3,
+        #      "data":"EAAAAAUBAAAA…","dataVersion":"1"}
+        #
+        # Trois choses le separent de tout ce qui a ete servi ici.
+        #
+        # `seasonId` est l'id propre du disque, pas une position -- voir
+        # `season_id`. `divisionId` est le numero de la division, le meme des
+        # deux cotes. Et `dataVersion` part en **chaine**.
+        #
+        # Ce dernier point n'est pas un detail de style. Le lecteur
+        # `CardsDLLzf+0x1adf28` traite le membre 134 comme un entier et ne
+        # decode le blob que **s'il vaut 1** ; le membre 133 a deja rempli les
+        # registres de tampon. Envoyer un entier la ou le build qui reprend
+        # ses saisons envoie une chaine est la seule difference jamais
+        # observee sur cette branche, et elle coute un caractere.
+        #
+        # `data` avant `dataVersion`, toujours : la branche version decode avec
+        # les registres que la branche data remplit.
+        #
+        # Aucun membre de bilan. Kyro les omet en les appelant « unknown
+        # guessed progression members », AC ne les sert pas non plus, et on a
+        # deja mesure ici qu'ils ne sont pas lus.
+        saved = SEASON_PROGRESS.current()
+        entry: dict = {}
+        if saved is not None:
+            _season, saved_division = saved
+            entry = SEASON_PROGRESS.entries.get(saved) or {}
+            division = saved_division
+        played = _season_matches_played(entry)
+        document = {
+            "seasonId": season_id(division),
+            "divisionId": int(division),
+            "round": max(0, int(played)) + 1,
+        }
+        if entry.get("data"):
+            document["data"] = entry["data"]
+            document["dataVersion"] = str(entry.get("dataVersion", 1))
+        return json.dumps(document, separators=(",", ":")).encode()
     if mode in ("kyro", "kyro-div9", "kyro-data", "kyro-full"):
         # `offline_season_user` from KyroGeorge2/FIFA-14-Local-FUT, matched
         # member for member. That build resumes a season; this one does not,
@@ -7148,7 +7308,9 @@ def season_user_response(division: int = 10, played: int = 0) -> bytes:
         # `_season_division_id` honours FIFA14_SEASON_DIVISION_ID, so the value
         # can be varied against the console without another relaunch-per-idea.
         document = {
-            "seasonId": 1,
+            # Kyro sert 1 -- la position d'une liste ordonnee a l'envers. Voir
+            # `served_season_index` : il n'y a plus de position ici.
+            "seasonId": season_id(9 if mode == "kyro-div9" else 10),
             "divisionId": _season_division_id(9 if mode == "kyro-div9" else 10),
             "round": max(0, int(played)) + 1,
         }
@@ -8021,6 +8183,11 @@ class SeasonProgress:
 
     def __init__(self) -> None:
         self.entries: dict[tuple[int, int], dict] = {}
+        # La division où le club joue, et la seule chose ici qui survive à une
+        # saison. `divisionOffline` la lisait en dur à 10, donc aucune montée
+        # n'avait nulle part où s'inscrire : un club pouvait gagner sa saison
+        # et rouvrir le mode en Division 10.
+        self.division: int = 10
 
     @staticmethod
     def _key(season: int, division: int) -> tuple[int, int]:
@@ -8140,7 +8307,45 @@ class SeasonProgress:
         elif result in ("LOSS", "QUIT", "DNF"):
             entry["lost"] = int(entry.get("lost") or 0) + 1
         entry["coins"] = int(entry.get("coins") or 0) + max(0, int(coins))
+        # Les points, qui n'étaient comptés nulle part.
+        #
+        # Sans eux il n'y a pas de seuil à franchir, donc pas de titre, pas de
+        # montée et pas de fin de saison -- ce qui est exactement ce que le
+        # client attendait : AC le dit d'une phrase, « without those the client
+        # keeps offering fixtures ».
+        entry["points"] = season_points(
+            entry.get("won") or 0, entry.get("draw") or 0
+        )
         return entry
+
+    def finalize(self, season: int, division: int) -> dict:
+        """La saison est-elle finie, et sur quoi.
+
+        Rien, tant qu'il reste une rencontre. Une fois -- `finished` rend
+        l'appel idempotent, parce que `match/end` peut arriver deux fois pour
+        le même match et qu'une saison ne se gagne pas deux fois.
+        """
+        entry = self.entries.get(self._key(season, division))
+        if not entry or entry.get("finished"):
+            return {}
+        played = sum(int(entry.get(name) or 0)
+                     for name in ("won", "draw", "lost"))
+        total = int(season_definition(division).get("numMatches") or 10)
+        if played < total:
+            return {}
+        points = int(entry.get("points") or 0)
+        outcome, prize = season_outcome(division, points)
+        entry["finished"] = True
+        entry["outcome"] = outcome
+        entry["prize"] = prize
+        self.division = season_next_division(division, outcome)
+        return {
+            "outcome": outcome,
+            "prize": prize,
+            "points": points,
+            "division": self.division,
+            "played": played,
+        }
 
     def reset(self, season: int, division: int) -> bool:
         return self.entries.pop(self._key(season, division), None) is not None
@@ -8177,12 +8382,24 @@ class SeasonProgress:
         return max(order, key=played)
 
     def state(self) -> dict:
-        return {f"{season}:{division}": value
-                for (season, division), value in self.entries.items()}
+        saved = {f"{season}:{division}": value
+                 for (season, division), value in self.entries.items()}
+        # La division du club n'est pas une saison, et la clé le dit : toutes
+        # les autres sont `<saison>:<division>`, donc celle-ci ne peut pas en
+        # écraser une. Une sauvegarde écrite avant ce champ n'en a pas et
+        # retombe sur la Division 10, qui est là où on commence.
+        saved["division"] = {"offline": int(self.division)}
+        return saved
 
     def restore(self, saved: dict | None) -> None:
         for key, value in (saved or {}).items():
             if not isinstance(value, dict):
+                continue
+            if key == "division":
+                try:
+                    self.division = max(1, min(10, int(value.get("offline") or 10)))
+                except (TypeError, ValueError):
+                    self.division = 10
                 continue
             season, _, division = str(key).partition(":")
             try:

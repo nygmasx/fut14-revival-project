@@ -7312,10 +7312,29 @@ class IdentityHttpService:
                     # and a cup match moved nothing at all.
                     CLUB_RECORD.settle(result)
                     season_record = {}
+                    season_end = {}
                     if club.active_season is not None:
                         season_record = SEASON_PROGRESS.settle(
                             club.active_season[0], club.active_season[1], result, earned
                         )
+                        # La saison est-elle finie, et sur quoi.
+                        #
+                        # Le serveur tenait deja le compte -- `settle` enregistre
+                        # chaque resultat depuis le 16 aout -- et n'en disait
+                        # rien : son retour n'allait qu'au journal, pour ecrire
+                        # BILAN. Le client, lui, attend l'annonce ici. AC le dit
+                        # d'une phrase : « without those the client keeps
+                        # offering fixtures », et c'est exactement le symptome
+                        # -- une saison qui ne se termine jamais et un club qui
+                        # ne monte pas.
+                        #
+                        # `finalize` ne rend quelque chose qu'a la derniere
+                        # rencontre, et une seule fois.
+                        season_end = SEASON_PROGRESS.finalize(
+                            club.active_season[0], club.active_season[1]
+                        )
+                        if season_end.get("prize"):
+                            WALLET.credit(int(season_end["prize"]))
                     CLUB_SAVE.save(
                         CLUB_INVENTORY, WALLET, CARD_ACTIONS, MANAGER_TASKS
                     )
@@ -7481,6 +7500,25 @@ class IdentityHttpService:
                                     },
                                 }
                             )
+                        # Ce que le client attend a la fin d'une saison.
+                        #
+                        # `seasonEndResult` n'a jamais ete envoye par ce
+                        # serveur. Ce n'est pas un nom invente : la table de
+                        # noms de CardsDLL le porte a 0x101c0, releve dans
+                        # `docs/TOURNAMENTS.md`.
+                        #
+                        # `seasonCoins` partait deja, mais avec le portefeuille
+                        # entier dedans -- c'est ce qui fait afficher les
+                        # credits sur l'ecran de fin de match depuis le 27
+                        # aout, et ca reste vrai tant que la saison n'est pas
+                        # finie. Le jour ou elle l'est, ce membre porte le prix
+                        # de la saison : c'est le couple que le client lit avec
+                        # `seasonEndResult`, et servir le solde du club a la
+                        # place reviendrait a lui annoncer un gain de neuf cent
+                        # millions.
+                        if season_end:
+                            settled["seasonEndResult"] = season_end["outcome"]
+                            settled["seasonCoins"] = int(season_end["prize"])
                         if prize:
                             settled["tournamentPrize"] = prize
                         if cup:
@@ -7507,6 +7545,13 @@ class IdentityHttpService:
                             if season_record
                             else None
                         ),
+                        # Ce que la saison a donne, quand elle se termine :
+                        # sans ca, la seule trace d'une montee est un nombre
+                        # qui change dans un document servi plus tard.
+                        seasonEndResult=season_end.get("outcome"),
+                        seasonPrize=season_end.get("prize"),
+                        seasonPoints=season_end.get("points"),
+                        seasonDivision=season_end.get("division"),
                         fitnessWritten=played["fitness"],
                         goals=played["goals"],
                         assists=played["assists"],

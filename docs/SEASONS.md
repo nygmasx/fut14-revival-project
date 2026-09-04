@@ -542,3 +542,101 @@ Ce qui reste correct et acquis : `season/user` sert bien `data` avant
 `SeasonProgress.current()` choisit la bonne entrée. Rien de tout cela n'est à
 défaire — c'est simplement insuffisant pour contourner une limite qui n'est pas
 de notre côté.
+
+## Ce qui manquait n'était pas le blob — 4 septembre 2026
+
+La conclusion ci-dessus — « la reprise de saison n'est pas atteignable depuis
+le serveur » — repose sur un fait exact et sur une déduction fausse.
+
+Le fait tient : sur tous les journaux, treize requêtes vers
+`season/<id>/division/<div>/user`, **toutes en PUT, zéro GET**. Le client ne va
+jamais rechercher le blob qu'il a lui-même sauvegardé, et les coupes ont un
+`tournament/user/list` que les saisons n'ont pas.
+
+La déduction — donc aucune réponse serveur ne peut restaurer une saison — est
+démentie par un serveur qui le fait. AC, qui a rebâti FIFA 14 sur PC, décrit
+son montage le 31 août 2026 : il ne compte sur aucun GET séparé, **il renvoie
+le blob dans `season/user`**, exactement là où ce dépôt le renvoyait déjà.
+
+Ce qui lui manquait était ailleurs, et il le dit en une phrase :
+
+> The match/end reply then carries the announcement the client acts on:
+> `seasonEndResult` + `seasonCoins` — without those the client keeps offering
+> fixtures.
+
+### Ce que le serveur savait et ne disait pas
+
+`SeasonProgress.settle` enregistre chaque résultat depuis le 16 août. Son
+retour n'allait **qu'au journal**, pour écrire la ligne `BILAN` ; rien de ce
+qu'il calculait n'entrait dans la réponse à `match/end`. Et il ne calculait pas
+tout : ni les points (3/1/0), ni le franchissement d'un seuil, ni la clôture.
+`divisionOffline` valait `10` en dur, donc une montée n'avait nulle part où
+s'inscrire — un club pouvait gagner sa saison et rouvrir le mode en Division 10.
+
+`seasonEndResult` n'est pas un nom deviné : la table de noms de CardsDLL le
+porte à `0x101c0`, relevée dans `docs/TOURNAMENTS.md`.
+
+### L'identité d'une saison, qui n'est plus une position
+
+`seasonId` a porté trois lectures ici — la position dans la liste servie, la
+position dans la table des dix, le numéro de division — et les pages qui
+précèdent racontent une journée entière passée à les départager sans y arriver.
+La raison est mécanique : **sur une liste de dix, la position d'une division et
+son numéro sont le même nombre.** Une liste réduite les sépare enfin, et donne
+alors deux réponses opposées selon la ligne qu'on lit.
+
+AC ne tranche pas ce débat, il le supprime. Une saison porte un identifiant qui
+n'est la position de rien : la Division 1 est `id` 1103, `season/user` répond
+`seasonId` 1103, et `trophyResourceId` vaut 1103 aussi. `season_id(division)`
+place la série à 1102 + numéro, soit 1103..1112, ce qui tombe dans les soixante-
+dix trophées que `cards0.big` embarque à 1100..1169 — c'est pourquoi le même
+nombre peut servir d'identifiant et de trophée.
+
+Tous les modes partagent désormais cette identité, y compris `kyro`, qui cesse
+donc d'être une reproduction fidèle du build de référence sur ce point. C'est
+assumé : un mode dont le `seasonId` ne désigne aucune ligne de sa propre liste
+est exactement le défaut qu'on retire.
+
+### `dataVersion` part en chaîne
+
+Le lecteur `CardsDLLzf+0x1adf28` traite le membre 134 comme un entier et ne
+décode le blob que **s'il vaut 1**, avec les registres que le membre 133 a
+remplis. Ce dépôt envoyait l'entier `1` ; le build qui reprend ses saisons
+envoie la chaîne `"1"`. C'est la seule différence jamais observée sur cette
+branche, et elle coûte un caractère.
+
+Non vérifié sur console. C'est une hypothèse, servie parce qu'elle est gratuite
+et qu'elle vient d'un build qui marche — pas parce qu'on l'a mesurée.
+
+### Ce que `season/list` sert maintenant
+
+Trois niveaux de récompense au lieu de quatre, du seuil le plus haut au plus
+bas : `CHAMPIONSHIP`, `PROMOTION`, `MAINTENANCE`. La relégation n'est pas un
+niveau de récompense — elle ne paie rien, et son seuil valait zéro, le même que
+le maintien, donc les deux premières entrées étaient indiscernables.
+`season_outcome` lit cette liste dans l'ordre et retient le premier seuil
+atteint, ce qui garantit que le règlement et l'écran de détails ne peuvent pas
+diverger.
+
+Avec : `trophyUseCount` 1, `visStartDays` 0 et `visEndDays` 365, des dates
+réelles au lieu de 0 et 0x7FFFFFFF, et `untilEndSeconds` à un an plutôt qu'à
+dix. `matchLengthMin` reste à 6 : AC sert 1, mais c'est une durée de match, pas
+une pièce du protocole, et 6 est ce que FUT joue.
+
+La liste est ordonnée **Division 10 d'abord**. L'ordre ne désigne plus rien
+depuis `season_id` ; il ne fait qu'une chose, choisir la tuile sur laquelle
+l'écran s'ouvre, et un club commence en Division 10.
+
+### Ce qui reste à vérifier sur la console
+
+Tout. Rien de cette page n'a encore été mesuré sur le matériel : ce sont des
+documents rendus cohérents avec un serveur qui fonctionne ailleurs. Les trois
+choses à lire, dans l'ordre :
+
+1. l'écran s'ouvre-t-il ? `FIFA14_SEASON_MODE=native` reprend l'ancien défaut
+   si `ac` gèle ;
+2. l'écusson et le panneau de détails montrent-ils la bonne division ;
+3. après dix rencontres, l'annonce de fin tombe-t-elle, et la division
+   suivante suit-elle ? Le journal porte `seasonEndResult`, `seasonPrize`,
+   `seasonPoints` et `seasonDivision` sur l'événement `fut_match_end`, donc la
+   réponse se lit sans écran.

@@ -530,12 +530,18 @@ def test_seasons_serve_the_clubs_own_division_by_default() -> None:
     assert seasons[0]["divisionId"] == 10, "FUT starts a club in Division 10"
     # Both arrays: the ladder proved each separately and then together.
     assert len(seasons[0]["matches"]) == 10
-    assert len(seasons[0]["prizeSet"]) == 4
+    # Trois niveaux, du seuil le plus haut au plus bas. Il y en avait quatre,
+    # `RELEGATION` en tete -- mais la relegation ne paie rien et son seuil
+    # valait zero, le meme que le maintien, donc les deux premieres entrees
+    # etaient indiscernables. AC n'en sert que trois.
+    assert len(seasons[0]["prizeSet"]) == 3
 
     user = json.loads(user_doc)
     # seasonId is a 1-based position in the list served, and the row it selects
     # has to be the division the user document names.
-    assert user["seasonId"] == seasons[0]["id"] == 1
+    # `seasonId` designe une ligne par son identifiant propre, pas par sa
+    # position -- voir `season_id`.
+    assert user["seasonId"] == seasons[0]["id"] == inventory.season_id(10)
     assert user["divisionId"] == seasons[0]["divisionId"] == 10
     # `divisionId` is the division's own number, not an index into a table of
     # ten. "10 hangs the screen, 0-9 hold" was read off a 13 August bisection
@@ -574,7 +580,9 @@ def test_the_native_season_record_carries_its_schedule(monkeypatch) -> None:
             }
         # Rewards travel through prizeSet, not as flat top-level members.
         levels = [prize["prizeLevel"] for prize in season["prizeSet"]]
-        assert levels == ["RELEGATION", "MAINTENANCE", "PROMOTION", "CHAMPIONSHIP"]
+        # Decroissant : `season_outcome` lit cette liste dans l'ordre et
+        # retient le premier niveau dont le seuil est atteint.
+        assert levels == ["CHAMPIONSHIP", "PROMOTION", "MAINTENANCE"]
         for prize in season["prizeSet"]:
             assert "thresholdPoint" in prize
             assert isinstance(prize["awardMappings"][0]["awards"], list)
@@ -643,7 +651,7 @@ def test_the_club_starts_in_the_bottom_division(monkeypatch) -> None:
     # is decremented by the client, so 1 selects the first list record, and
     # round 1 is the first fixture -- wire 0 becomes its invalid sentinel.
     assert set(standing) == {"seasonId", "divisionId", "round"}
-    assert standing["seasonId"] == 10
+    assert standing["seasonId"] == inventory.season_id(10)
     # The division's number minus one: an index into the client's own table of
     # divisions, which starts at Division 1.
     #
@@ -661,7 +669,8 @@ def test_the_club_starts_in_the_bottom_division(monkeypatch) -> None:
     # A club in division 5 is the fifth record, and it reports division 5 --
     # the member names the division, not that number minus one.
     higher = json.loads(inventory.season_user_response(5))
-    assert (higher["seasonId"], higher["divisionId"]) == (5, 5)
+    assert (higher["seasonId"], higher["divisionId"]) == (
+        inventory.season_id(5), 5)
     assert json.loads(inventory.season_user_response(10, played=3))["round"] == 4
 
 
@@ -682,7 +691,8 @@ def test_a_season_under_way_is_reported_where_it_actually_stands(monkeypatch) ->
         # Still the division's number minus one.
         # (10, 10): the row `seasonId` selects carries divisionId 10, and
         # this has to agree with it, or a played season reads as absent.
-        assert (standing["seasonId"], standing["divisionId"]) == (10, 10)
+        assert (standing["seasonId"], standing["divisionId"]) == (
+            inventory.season_id(10), 10)
 
         # Promoted: division 9 is the ninth record, and index eight.
         inventory.SEASON_PROGRESS.entries.clear()
@@ -693,7 +703,7 @@ def test_a_season_under_way_is_reported_where_it_actually_stands(monkeypatch) ->
         # Division 9 reports `divisionId` 9, not 8: the member names the
         # division of the row `seasonId` selects, not that number minus one.
         assert (promoted["seasonId"], promoted["divisionId"], promoted["round"]) == (
-            9,
+            inventory.season_id(9),
             9,
             2,
         )
@@ -706,7 +716,8 @@ def test_a_season_under_way_is_reported_where_it_actually_stands(monkeypatch) ->
         back = json.loads(inventory.season_user_response())
         # Division 10 reports 10, not 9 -- the member names the division of
         # the row seasonId selects, not that number minus one.
-        assert (back["seasonId"], back["divisionId"], back["round"]) == (10, 10, 3)
+        assert (back["seasonId"], back["divisionId"], back["round"]) == (
+            inventory.season_id(10), 10, 3)
     finally:
         inventory.SEASON_PROGRESS.entries.clear()
 
@@ -4570,7 +4581,7 @@ def test_a_reduced_season_rung_points_at_a_season_it_actually_serves() -> None:
         # seasonId names the record, not its place in the page: a Division 10
         # record carries id 10 whether it is served alone or beside nine
         # others, and the client saves to /season/10/division/10/user.
-        assert user["seasonId"] == seasons[0]["id"] == 10, mode
+        assert user["seasonId"] == seasons[0]["id"] == inventory.season_id(10), mode
         # The division's own number, 1 to 10 -- not an index into a table of
         # ten, which is the reading the console disproved on 21 August.
         assert 1 <= user["divisionId"] <= 10, mode
@@ -4589,8 +4600,11 @@ def test_the_native_rung_still_points_at_the_last_of_ten() -> None:
     finally:
         os.environ.pop("FIFA14_SEASON_MODE", None)
     assert len(seasons) == 10
-    assert user["seasonId"] == 10
-    assert 1 <= user["seasonId"] <= len(seasons)
+    assert user["seasonId"] == inventory.season_id(10)
+    # Il designe une ligne servie -- ce n'etait autrefois verifiable que
+    # comme un rang dans la page, ce qui etait vrai et sans force : sur une
+    # liste de dix, tout nombre de 1 a 10 passe ce test.
+    assert [row for row in seasons if row["id"] == user["seasonId"]]
 
 
 def test_identical_consumables_stack_into_one_card() -> None:
@@ -4768,7 +4782,8 @@ def test_a_season_keeps_its_progress_after_a_match() -> None:
                                                 "progressDataVersion": 1})
         after = json.loads(inventory.season_user_response())
         assert after["round"] > fresh["round"], "the round did not advance"
-        assert after["seasonId"] == 1, "seasonId selects the first row served"
+        assert after["seasonId"] == inventory.season_id(10), (
+            "seasonId designe la ligne de la division jouee")
 
         served = json.loads(inventory.seasons_response())["seasons"]
         row = [s for s in served if s["id"] == after["seasonId"]]
@@ -5005,13 +5020,19 @@ def test_the_kyro_season_mode_matches_the_reference_build() -> None:
 
     # Ten rows, ordered Division 10 first, `id` a 1-based position in the list.
     assert len(listed) == 10
-    assert [row["id"] for row in listed] == list(range(1, 11))
+    # Les identifiants propres des dix divisions, dans l'ordre servi.
+    assert [row["id"] for row in listed] == [
+        inventory.season_id(row["divisionId"]) for row in listed
+    ]
     assert [row["divisionId"] for row in listed] == list(range(10, 0, -1))
 
     # Three members, and only three. `data`, `dataVersion`, seasonGames* and
     # seasonCoins are what Kyro calls "unknown guessed progression members".
     assert set(user) == {"seasonId", "divisionId", "round"}
-    assert user["seasonId"] == 1
+    # Kyro sert 1, la position d'une liste inversee. L'identite est partagee
+    # par tous les modes depuis `season_id` -- voir `served_season_index`
+    # pour ce que ca coute a cette reproduction.
+    assert user["seasonId"] == inventory.season_id(10)
     assert user["divisionId"] == 10
 
     # The one that has to hold: seasonId selects a row, and that row is the
@@ -5053,7 +5074,10 @@ def test_the_resume_season_shape_agrees_with_itself() -> None:
         os.environ.pop("FIFA14_SEASON_MODE", None)
 
     assert len(listed) == 10
-    assert [row["id"] for row in listed] == list(range(1, 11))
+    # Les identifiants propres des dix divisions, dans l'ordre servi.
+    assert [row["id"] for row in listed] == [
+        inventory.season_id(row["divisionId"]) for row in listed
+    ]
     selected = [row for row in listed if row["id"] == user["seasonId"]]
     assert len(selected) == 1, "seasonId must select exactly one row"
     assert selected[0]["divisionId"] == user["divisionId"], (
@@ -5076,14 +5100,19 @@ def test_the_default_season_shape_is_the_one_that_opens() -> None:
 
     import fut_inventory as inventory
 
-    assert inventory.season_wire_mode() == "native"
+    assert inventory.season_wire_mode() == "ac"
     listed = json.loads(inventory.seasons_response())["seasons"]
     assert len(listed) == 10
-    assert [row["id"] for row in listed] == list(range(1, 11))
+    # Les identifiants propres des dix divisions, dans l'ordre servi.
+    assert [row["id"] for row in listed] == [
+        inventory.season_id(row["divisionId"]) for row in listed
+    ]
     # Division 1 first, which is what `native` means and what `kyro-data`
     # reversed. The screen opens on the first tile, so this one opens on
     # Division 1 rather than on the division a new club is actually in.
-    assert listed[0]["divisionId"] == 1
+    # Le defaut ouvre sur la Division 10, la ou un club commence -- `native`
+    # ouvrait sur la Division 1, la ou il finit.
+    assert listed[0]["divisionId"] == 10
 def test_a_played_season_carries_its_blob_back() -> None:
     # The scores live in the client's own blob. Without it the fixture list
     # drew `-` for a match that had been won 4-0, even once the record was
@@ -5105,7 +5134,9 @@ def test_a_played_season_carries_its_blob_back() -> None:
         inventory.SEASON_PROGRESS = saved
 
     assert user["data"] == "BLOB"
-    assert user["dataVersion"] == 1
+    # En chaine : le build qui reprend ses saisons envoie "1", et la branche
+    # de decodage du lecteur 0x1adf28 pend a ce membre.
+    assert user["dataVersion"] == "1"
     assert list(user).index("data") < list(user).index("dataVersion")
     assert user["round"] == 2, "one match played is wire round 2"
 
