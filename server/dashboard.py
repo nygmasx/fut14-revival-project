@@ -37,6 +37,10 @@ import urllib.parse
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from game_records import RecordStore  # noqa: E402
 from typing import Any, Iterable
 
 HERE = Path(__file__).resolve().parent
@@ -744,6 +748,41 @@ class Runtime:
             rows.append(row)
         return rows[-limit:][::-1]
 
+    def leaderboards(self, limit: int = 20) -> dict:
+        """Les classements, et les matchs qui les ont produits.
+
+        Ils ne sont pas stockés : ils sont recalculés à chaque appel, à partir
+        du fichier de matchs. Un classement figé quelque part serait une
+        deuxième vérité à tenir à jour, et le jour où elle diverge de la
+        première c'est elle qu'on croit -- parce que c'est elle qui s'affiche.
+
+        Les noms viennent de la liste des joueurs quand elle en a un : un
+        rapport de match porte souvent un `NAME` vide, et un classement de
+        numéros ne se lit pas.
+        """
+        store = self.record_store()
+        boards = store.leaderboards(limit=limit)
+        known = {
+            player.get("persona_id"): player.get("name")
+            for player in self.players()
+            if player.get("name")
+        }
+        for rows in boards.values():
+            for row in rows:
+                if not row.get("name"):
+                    row["name"] = known.get(row["persona_id"], "")
+        matches = store.matches()
+        return {
+            "boards": boards,
+            "matches": matches[-limit:][::-1],
+            "played": len(matches),
+        }
+
+    def record_store(self) -> "RecordStore":
+        return RecordStore(
+            Path(os.environ.get("FIFA14_GAME_RECORDS", "runtime/game-records.jsonl"))
+        )
+
     def overview(self) -> dict:
         players = self.players()
         records = self.journal()
@@ -1027,6 +1066,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "feed": runtime.feed(limit=number("limit", 40)),
                 "timeline": runtime.timeline(),
             })
+        elif path == "/api/leaderboards":
+            self.send_json(runtime.leaderboards(limit=number("limit", 20)))
         elif path == "/api/players":
             self.send_json({"players": runtime.players()})
         elif path.startswith("/api/players/"):

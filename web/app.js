@@ -376,6 +376,62 @@ function renderActivite() {
     ${tile(`Journal — ${items.length} lignes`, feedBlock(items), {})}`;
 }
 
+// Les intitulés des classements, et ce qu'une valeur veut dire.
+//
+// « Buts encaissés » se lit à l'envers : en prendre moins est mieux. Le
+// serveur trie déjà dans le bon sens ; l'indiquer ici évite qu'un lecteur
+// croie voir le pire gardien en tête.
+const BOARDS = [
+  { key: 'victoires',       title: 'Victoires',        unit: 'victoires' },
+  { key: 'buts',            title: 'Buteurs',          unit: 'buts' },
+  { key: 'matchs',          title: 'Matchs joués',     unit: 'matchs' },
+  { key: 'tirs_cadres',     title: 'Tirs cadrés',      unit: 'cadrés' },
+  { key: 'passes_reussies', title: 'Passes réussies',  unit: 'passes' },
+  { key: 'tacles_reussis',  title: 'Tacles réussis',   unit: 'tacles' },
+  { key: 'buts_encaisses',  title: 'Défenses',         unit: 'encaissés', asc: true },
+];
+
+function boardRows(rows, unit) {
+  if (!rows || !rows.length) return '<p class="empty-note">Aucun match joué.</p>';
+  return `<table class="board">${rows.map((row) => `
+    <tr>
+      <td class="rank">${row.rang}</td>
+      <td class="who">${esc(row.name || String(row.persona_id))}</td>
+      <td class="val">${num(row.valeur)}<span class="unit"> ${unit}</span></td>
+    </tr>`).join('')}</table>`;
+}
+
+function matchLine(match) {
+  const players = match.players || [];
+  const first = players[0] || {};
+  const scored = first.buts || 0;
+  const conceded = first.buts_encaisses || 0;
+  const when = match.when ? new Date(match.when).toLocaleString('fr-FR') : '';
+  const name = esc(first.name || String(first.persona_id || ''));
+  return `<li><b>${scored} – ${conceded}</b> ${name}
+    <span class="muted">${esc(match.type || '')} ${when}</span></li>`;
+}
+
+function renderClassements() {
+  const data = state.boards;
+  if (!data) return;
+  const boards = data.boards || {};
+  $('view-classements').innerHTML = `
+    <div class="grid four" style="margin-bottom:10px">
+      ${tile('Matchs enregistrés', figure(num(data.played), 'depuis le premier rapport'), {})}
+    </div>
+    <div class="grid two" style="margin-bottom:10px">
+      ${BOARDS.map((board) => tile(
+        board.title + (board.asc ? ' — moins il y en a, mieux c\'est' : ''),
+        boardRows(boards[board.key], board.unit),
+        board.key === 'victoires' ? { gold: true } : {},
+      )).join('')}
+    </div>
+    ${tile('Derniers matchs', (data.matches || []).length ?
+      `<ul class="matches">${data.matches.map(matchLine).join('')}</ul>` :
+      '<p class="empty-note">Aucun match joué pour l\'instant. Les classements se remplissent tout seuls : chaque partie terminée envoie son rapport.</p>', {})}`;
+}
+
 function renderEconomie() {
   const data = state.economy;
   const home = state.home;
@@ -487,6 +543,9 @@ async function load() {
       if (state.verbose) query.set('verbose', '1');
       state.feed = await api(`/api/feed?${query}`);
       renderActivite();
+    } else if (state.view === 'classements') {
+      state.boards = await api('/api/leaderboards?limit=20');
+      renderClassements();
     } else if (state.view === 'economie') {
       if (!state.home) state.home = await api('/api/overview?limit=40');
       state.economy = await api('/api/economy');

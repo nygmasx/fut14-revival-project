@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,17 @@ UNION = 6
 VARIABLE = 7
 OBJECT_TYPE = 8
 OBJECT_ID = 9
+# Le dixième type, découvert dans un rapport de match le 22 août 2026.
+#
+# Un `submitGameReport` portait `CRAT` avec un type 10, que le décodeur ne
+# connaissait pas -- la liste s'arrêtait à `OBJECT_ID`. Quatre octets plus
+# loin, le champ suivant tombait pile : c'est un flottant sur 32 bits, gros
+# boutiste comme tout le reste du protocole.
+#
+# Il n'a rien d'exotique : un rapport de match porte des moyennes, des taux et
+# des notes. On ne l'avait simplement jamais croisé, parce qu'aucune des trames
+# lues jusque-là n'en contenait.
+FLOAT = 10
 
 
 @dataclass
@@ -66,10 +78,28 @@ def encode_integer(value: int) -> bytes:
     return bytes(output)
 
 
+TAG_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_ "
+)
+
+
+def plausible_tag(label: str) -> bool:
+    """Un tag Blaze ne s'écrit qu'avec ces caractères-là.
+
+    Les quatre caractères d'un tag sortent d'un encodage sur six bits qui ne
+    produit rien d'autre. Une étiquette qui contient `]`, `@` ou `[` n'est pas
+    un tag : c'est du bruit lu comme un tag, donc la preuve qu'on est décalé.
+    """
+    return bool(label) and all(character in TAG_ALPHABET for character in label)
+
+
 class Decoder:
     def __init__(self, data: bytes) -> None:
         self.data = data
         self.position = 0
+        self.leftover = 0
+        self.resynchronised_at = None
+        self.skipped = 0
 
     def take(self, size: int) -> bytes:
         end = self.position + size
@@ -112,7 +142,7 @@ class Decoder:
         self.position += 1
         return fields
 
-    def list_item(self, item_type: int) -> Any:
+    def list_item(self, item_type: int, unions: bool = True) -> Any:
         if item_type == INTEGER:
             return self.integer()
         if item_type == STRING:
@@ -142,13 +172,27 @@ class Decoder:
             # which is also a lone 0x00. None has ever appeared here, and a
             # union with no members would be indistinguishable from it on the
             # wire in any decoder.
-            if self.position < len(self.data) and self.data[self.position] < TAG_FIRST_BYTE:
+            #
+            # `unions` is False for map keys and values, and that is not a
+            # detail. `joinGame` carries a map of strings to structs whose one
+            # value is an *empty* struct -- a lone 0x00 -- and this rule read
+            # that as a union index and then swallowed the fields after it.
+            # The frame died at "Unsupported TDF type 201 for @PCN", which is
+            # what a desynchronised decoder always looks like.
+            #
+            # Blaze has lists of unions; it does not have maps of them. So the
+            # rule belongs to lists, where the evidence for it came from, and
+            # nowhere else.
+            if (unions and self.position < len(self.data)
+                    and self.data[self.position] < TAG_FIRST_BYTE):
                 return (self.byte(), self.struct())
             return self.struct()
         if item_type == OBJECT_TYPE:
             return (self.integer(), self.integer())
         if item_type == OBJECT_ID:
             return (self.integer(), self.integer(), self.integer())
+        if item_type == FLOAT:
+            return struct.unpack(">f", self.take(4))[0]
         raise ValueError(
             f"Unsupported TDF list item type {item_type} "
             f"at offset 0x{self.position:X}"
@@ -176,8 +220,8 @@ class Decoder:
             count = self.integer()
             pairs = [
                 (
-                    self.list_item(key_type),
-                    self.list_item(value_type),
+                    self.list_item(key_type, unions=False),
+                    self.list_item(value_type, unions=False),
                 )
                 for _ in range(count)
             ]
@@ -212,6 +256,8 @@ class Decoder:
             value = (self.integer(), self.integer())
         elif field_type == OBJECT_ID:
             value = (self.integer(), self.integer(), self.integer())
+        elif field_type == FLOAT:
+            value = struct.unpack(">f", self.take(4))[0]
         else:
             raise ValueError(
                 f"Unsupported TDF type {field_type} for {label} "
@@ -219,7 +265,81 @@ class Decoder:
             )
         return Field(label, field_type, value)
 
-    def all(self) -> list[Field]:
+    def all(self, tolerant: bool = False) -> list[Field]:
+        """Décode les champs. En mode tolérant, s'arrête à la première
+        incompréhension au lieu de la propager.
+
+        Une trame Blaze est une suite de champs indépendants, dans l'ordre des
+        tags. Si l'on ne sait pas lire le neuvième, cela ne rend pas les huit
+        premiers faux -- ils ont déjà été lus, entièrement, et ils portent
+        presque toujours ce qui compte. Le `joinGame` du 22 août en est
+        l'exemple : il s'est cassé sur un dictionnaire de chaînes vers structs,
+        mais `GID`, le numéro de la partie à rejoindre, était lu depuis
+        longtemps.
+
+        Le reste est perdu, et c'est assumé -- pas deviné. `self.leftover`
+        retient combien d'octets n'ont pas été compris, pour que l'appelant
+        sache qu'il travaille sur une lecture partielle et que le journal
+        garde de quoi finir le travail plus tard.
+        """
+        if not tolerant:
+            return self._all_strict()
+        fields: list[Field] = []
+        while self.position < len(self.data):
+            mark = self.position
+            try:
+                fields.append(self.field())
+            except (ValueError, IndexError):
+                self.position = mark
+                recovered = self.resynchronise()
+                if recovered is None:
+                    break
+                fields.extend(recovered)
+                break
+        self.leftover = len(self.data) - self.position
+        return fields
+
+    def resynchronise(self) -> list[Field] | None:
+        """Reprendre après un champ qu'on ne sait pas mesurer.
+
+        C'est une resynchronisation, pas une grammaire : on ne prétend pas
+        comprendre le champ fautif, on cherche où la trame redevient lisible.
+        Deux conditions, et elles sont strictes.
+
+        D'abord, le reste doit se décoder **exactement** jusqu'au dernier
+        octet. Un décalage d'un seul octet produit presque toujours un type
+        inconnu ou une longueur qui dépasse la fin ; tomber pile sur la fin
+        par hasard est possible mais rare, et c'est ce qui rend le critère
+        utile.
+
+        Ensuite, toutes les étiquettes retrouvées doivent être de vrais tags.
+        Sur le `joinGame` du 22 août, quatre décalages décodaient jusqu'au
+        bout -- mais trois rendaient des étiquettes comme `]@TA` ou `@P`, et
+        un seul rendait `SLEN SLID SLOT STRT TIDX USER XSES`. Sans cette
+        seconde condition on aurait pris le premier, et lu de travers.
+
+        On prend le plus proche qui satisfait les deux. S'il n'y en a aucun,
+        on ne rend rien : mieux vaut une trame amputée qu'une trame inventée.
+        """
+        start = self.position
+        end = len(self.data)
+        for offset in range(start + 1, end):
+            probe = Decoder(self.data[offset:])
+            try:
+                candidate = probe._all_strict()
+            except (ValueError, IndexError):
+                continue
+            if probe.position != end - offset or not candidate:
+                continue
+            if not all(plausible_tag(field.label) for field in candidate):
+                continue
+            self.position = end
+            self.resynchronised_at = offset
+            self.skipped = offset - start
+            return candidate
+        return None
+
+    def _all_strict(self) -> list[Field]:
         fields: list[Field] = []
         while self.position < len(self.data):
             fields.append(self.field())
@@ -250,6 +370,8 @@ def encode_item(item_type: int, value: Any) -> bytes:
             + encode_integer(value[1])
             + encode_integer(value[2])
         )
+    if item_type == FLOAT:
+        return struct.pack(">f", value)
     raise ValueError(f"Unsupported TDF item type {item_type}")
 
 
@@ -300,6 +422,8 @@ def encode_field(field: Field) -> bytes:
         output += encode_integer(field.value[0])
         output += encode_integer(field.value[1])
         output += encode_integer(field.value[2])
+    elif field.type == FLOAT:
+        output += struct.pack(">f", field.value)
     else:
         raise ValueError(f"Unsupported TDF type {field.type}")
     return bytes(output)
@@ -348,7 +472,7 @@ def json_value(value: Any) -> Any:
     return value
 
 
-def decode_frame(data: bytes) -> dict[str, Any]:
+def decode_frame(data: bytes, tolerant: bool = False) -> dict[str, Any]:
     if len(data) < 12:
         raise ValueError("ProtoFire frame is shorter than its header")
     payload_size = int.from_bytes(data[0:2], "big")
@@ -357,6 +481,8 @@ def decode_frame(data: bytes) -> dict[str, Any]:
             f"ProtoFire size mismatch: header={payload_size}, "
             f"actual={len(data) - 12}"
         )
+    decoder = Decoder(data[12:])
+    fields = decoder.all(tolerant=tolerant)
     message_type = data[8] >> 4
     message_number = ((data[9] & 0xF) << 16) | int.from_bytes(data[10:12], "big")
     return {
@@ -366,7 +492,23 @@ def decode_frame(data: bytes) -> dict[str, Any]:
         "error": int.from_bytes(data[6:8], "big"),
         "message_type": message_type,
         "message_number": message_number,
-        "fields": Decoder(data[12:]).all(),
+        "fields": fields,
+        "leftover": decoder.leftover,
+        # Une lecture obtenue par resynchronisation n'a pas la même valeur
+        # qu'une lecture franche, et l'appelant doit pouvoir faire la
+        # différence.
+        #
+        # Le 22 août, un rapport de match resynchronisé a rendu un champ
+        # `YSDU` qui n'existe pas : le décalage retenu consommait bien toute la
+        # trame et ses étiquettes passaient le test de plausibilité, mais la
+        # lecture était fausse. Le vrai champ était `RPRT`, et il a fallu
+        # découvrir le type flottant pour le voir.
+        #
+        # Le critère « ça se décode jusqu'au bout avec des tags plausibles »
+        # est donc nécessaire, pas suffisant. Ce qui sort d'ici après une
+        # resynchronisation est une hypothèse, pas une lecture.
+        "resynchronised": decoder.resynchronised_at,
+        "skipped": decoder.skipped,
     }
 
 

@@ -299,8 +299,7 @@ mais personne ne devrait le lire comme une connaissance sur ce jeu.
   un adversaire inventé (`FIFA14_TEST_OPPONENT`, désactivé par défaut). Le
   maillage ne peut pas se fermer contre quelqu'un qui n'existe pas : la
   console rapporte `DISCONNECTED`, ce qui est la bonne réponse.
-- **`joinGame` (commande 9)** et le navigateur de parties (100/101), pour
-  qu'une deuxième console puisse entrer.
+- ~~**`joinGame` (commande 9)**~~ — fait le 22 août, voir plus bas.
 - **Les modes FUT en ligne** — on ne sait pas encore s'ils passent par
   GameManager ou par l'API web FUT.
 
@@ -319,3 +318,235 @@ il a fallu le bouton d'alimentation.
 
 Donc : arrêter `fut-patch-watch` avant toute lecture XBDM, et ne pas enchaîner
 les cycles d'accroche manette.
+
+### 22 août : ce que XBDM supporte réellement, mesuré
+
+Quatre chutes dans l'après-midi, chacune coûtant un appui sur le bouton
+d'alimentation. Trois hypothèses ont été formulées et écartées, dans cet
+ordre :
+
+1. **La taille des blocs.** Faux. La chute attribuée aux blocs de 16 Ko s'est
+   produite avant que ce balayage n'ait lu un seul octet -- la console était
+   déjà tombée pendant la lecture *précédente*, et le socket a échoué à la
+   connexion. Un test à 4 Ko a semblé confirmer l'hypothèse par coïncidence.
+2. **Une région non mappée.** Faux. `modsections` donne la carte exacte, et
+   toutes les adresses lues étaient dans `.rdata` ou `.data`.
+3. **Une adresse en particulier.** Faux. La chute à `0x83CDA000` porte sur une
+   adresse qu'un balayage antérieur du même après-midi avait lue sans incident.
+
+Ce qui reste, et qui colle aux quatre : **le volume cumulé**. La console
+encaisse de l'ordre de **250 à 400 Ko** de `getmem` pendant que le titre
+tourne, puis lâche, quelle que soit la région et quelle que soit la taille des
+blocs. C'est cohérent avec la note d'origine sur le surveillant de patch, qui
+balayait 4 à 8 Mo en boucle et précédait deux chutes sur trois.
+
+Conséquence pratique : lire les 2 Mo de `.data` demanderait six ou sept
+redémarrages. Toute analyse mémoire doit donc être **ciblée** -- une adresse
+connue, quelques kilo-octets -- et jamais un balayage exploratoire.
+
+### La carte du titre, pour ne plus chercher au mauvais endroit
+
+    .rdata   0x82000400   0x00328DB4
+    .pdata   0x82329200   0x0009E1E0
+    .text    0x823D0000   0x018B4838
+    .data    0x83C90000   0x001FAED8
+
+Obtenue en deux commandes XBDM qui ne lisent aucune mémoire :
+`modules`, puis `modsections name="default.xex"`. Un balayage de
+« code » lancé à `0x82000000` visait en réalité `.rdata` : le code commence
+25 Mo plus loin.
+
+Et surtout : chercher les paires `lis`/`ori` dans `.text` est inutile pendant
+que le jeu tourne. Elles écrivent dans `.data`, et `.data` est déjà rempli --
+il suffit de lire la table, si on sait où elle est.
+
+
+## Les types de partie, reconnus à leur signature
+
+    gameType0     Face-à-Face
+    gameType20    Matchs amicaux en ligne
+    gameType95    Match local (rapport de match du 22 août)
+
+`gameType20` se distingue aussi par sa capacité : les deux joueurs sont placés
+dans le **deuxième** groupe d'équipes (`[0, [0, 2, 0, 0]]`) là où le
+Face-à-Face les met dans le premier (`[0, [2, 0, 0, 0]]`). C'est ce qui a
+attiré l'attention avant que le joueur ne confirme d'où il venait.
+
+Ce qui compte : la séquence est **identique**. Création, `finalizeGameCreation`,
+attente d'un second joueur. Les amicaux en ligne empruntent donc le même chemin
+GameManager que le Face-à-Face, et tout ce qui a été corrigé pour l'un vaut
+pour l'autre -- le `joinGame` par identifiant de joueur, la notification 30 qui
+manquait, le contexte de mise en place, le coup d'envoi laissé à l'hôte.
+
+## Ce que les rapports de match donnent
+
+Le `submitGameReport` de fin de partie porte, par joueur : buts, buts
+encaissés, tirs, tirs cadrés, passes tentées et réussies, tacles tentés et
+réussis, corners, hors-jeu, fautes, cartons, arrêts, interceptions, résultat.
+
+Les libellés ne sont pas devinés par ressemblance : sur la trame du 22 août,
+`GOAL` valait 1, `GLAG` 0 et `WINS` 1, pour un match gagné 1-0. C'est cette
+concordance qui les établit. Deux restent des lectures plausibles et sont
+gardées comme telles : `PSCT` (67, probablement la possession en pourcentage)
+et `GTIM` (5567, une durée dont l'unité est inconnue).
+
+Un rapport de match local ne contient qu'un joueur. Un rapport de match en
+ligne devrait en contenir deux -- c'est la seule chose qui distingue les deux
+cas, et elle n'a pas encore été observée.
+
+## Le 23 août : le maillage, et pourquoi une seule console composait
+
+Deux consoles, une en France et une aux États-Unis, ont fait six appariements
+dans l'après-midi. Le Blaze s'est déroulé sans faute à chaque fois. Le
+maillage, jamais. Ce que la journée a établi, dans l'ordre où ça s'est su.
+
+### L'invitation entre amis ne traverse pas Blaze
+
+Quand une console invite, **elle n'envoie rien au serveur**. Sur la fenêtre
+complète d'une invitation, le journal ne montre qu'un `getStatsByGroup`, un
+`createGame` et un `getClubInvitations` -- aucune trame d'invitation, ni
+servie ni refusée. La liste de tout ce qui est jamais tombé en
+`unknown_route` ne contient rien qui y ressemble non plus.
+
+L'invitation passe donc par la file de notifications Xbox LIVE (`XSessionInvite`,
+XAM), pas par Blaze. Hors ligne elle n'existe pas, et **aucun code serveur ne
+peut la rattraper**. Le chemin qui marche est « rejoindre depuis la liste
+d'amis », qui produit un vrai `joinGame` avec `GID = 0` et l'hôte dans
+`USER.ID`.
+
+Corollaire pratique : deux joueurs qui s'attendent mutuellement finissent
+chacun par créer sa propre partie, et le journal montre alors deux parties à
+un joueur au lieu d'une à deux.
+
+### Réécrire une adresse sur trois revient à n'en réécrire aucune
+
+`FIFA14_PEER_RELAY` réécrit l'adresse publique du XNADDR pour la faire pointer
+sur le relais. Elle n'était appliquée qu'au roster de la notification 20. La
+trame envoyée à l'invité portait donc **trois** `XDDR` :
+
+    192.168.1.25 / 2.11.99.154:3074     l'hôte, adresse réelle
+    192.168.1.25 / 87.106.7.87:3074     l'hôte, réécrite
+    10.0.0.179  / 73.128.188.206:3074   l'invité lui-même
+
+La console avait le choix et a composé la vraie. Deux sites manquaient :
+`HNET`, qui sortait de `game.host_addresses` sans être touché, et la
+notification 21, construite sans `viewer`. La 21 annonce toujours une arrivée
+à quelqu'un d'autre que l'arrivant, donc le membre décrit n'y est jamais le
+destinataire et la réécriture s'y applique sans condition. `createGame` doit
+au contraire passer `viewer=state` : le créateur est l'hôte, et une console ne
+passe pas par un relais pour s'atteindre elle-même.
+
+### Un relais qui affirme avoir livré coûte plus cher qu'un paquet perdu
+
+Le relais n'écrit qu'aux adresses dont il a reçu un paquet -- mais il ne les
+oubliait jamais, et son dictionnaire vivait en mémoire d'un processus démarré
+la veille. Il a expédié dix paquets vers une correspondance NAT apprise le 22,
+en journalisant `relay_forwarded`. La lecture du journal a été fausse pendant
+un quart d'heure : on cherchait pourquoi les paquets mouraient à la box, alors
+que le vrai fait à expliquer était qu'une des deux consoles n'émettait pas.
+
+Une adresse silencieuse depuis plus de quarante-cinq secondes est maintenant
+périmée, et une paire défaite efface les siennes.
+
+### C'est la notification 22 qui fait composer l'invité
+
+Trois essais aux rôles inversés ont donné le même résultat : **seul l'hôte
+émettait de l'UDP**. L'invité n'envoyait ni paquet vers le relais ni
+`updateMeshConnection`, alors qu'il avait l'adresse, le roster, et une clé de
+session identique à l'octet près à celle que l'hôte avait déposée -- vérifié
+sur `XNNC` (16 octets) et `XSES` (256 octets). Ce n'était donc pas une console
+qui avait un problème, c'était le rôle.
+
+La notification 22, `NotifyJoiningPlayerInitiateConnections`, porte la même
+charge que la 20 -- le binaire n'a qu'une classe 557 -- et dit à celui qui
+arrive de composer le maillage au lieu d'attendre. Essayée **seule** le
+22 août, elle rendait la console muette. Envoyée **après** la 20, elle a
+produit immédiatement ce qu'on cherchait :
+
+    relay_endpoint  peer: 2.11.99.154:3074   partner: 73.128.188.206
+    relay_flushed   packets: 9  →  73.128.188.206:3074
+
+Le trafic circule désormais dans les deux sens. `FIFA14_JOIN_NOTIFICATION`
+accepte `20`, `22` ou `both` ; le défaut reste `20`, parce que remplacer l'une
+par l'autre est une régression mesurée.
+
+### Ce qui bloque encore
+
+Les paquets circulent et le maillage ne conclut pas. Les deux consoles
+déclarent `STAT = 0` **dix secondes** après le premier paquet, à chaque fois --
+un délai fixe du titre, pas un aléa réseau.
+
+Quatre hypothèses ont été testées dans l'après-midi. **Les quatre sont
+mortes**, et c'est le résultat le plus utile de la journée : elles n'ont plus
+à être reprises.
+
+**Le désaccord de mode XNet.** Le relais échantillonne les premiers octets de
+chaque pair. Deux consoles sans rapport ont envoyé la même sonde de 122
+octets, identique sauf deux octets vers la fin :
+
+    000000000C58760000000000800148CDF22BBA0300 C5BD 00
+    000000000C58760000000000800148CDF22BBA0300 A7C6 00
+
+Même dialecte, donc. Et `fifa14_dirtysock_mode_state.py` confirme sur le
+matériel : `+0x21A=0 +0x21D=1 +0x22C=0`, soit **nosecure complet**. Il n'y a
+rien à réparer chez personne.
+
+**La réécriture d'adresse.** Un essai avec `FIFA14_PEER_RELAY` désarmé donne
+`STAT = 0` au même délai. Les vingt octets d'`abOnline` qu'on ne réécrit pas
+ne sont donc pas ce qui casse le maillage.
+
+**`UGID` nul.** Les consoles envoient `SCG = (0, 0, 0)` et `TCG = (30722, 2,
+N)`. On y a vu une console qui sait nommer l'autre et pas elle-même, et on a
+rempli les trois `UGID` avec la forme qu'elle emploie. `SCG` est resté nul.
+Un `SCG` à zéro veut probablement dire « moi » par convention. Le changement
+est gardé -- il est plus juste que trois zéros de remplissage -- mais **aucun
+effet ne lui est attribué**.
+
+**Les paquets rejetés à la réception.** Le crochet de réception directe
+DirtySock (`fifa14_plain_recv_log_hook`) ne voit **aucune** réception de 122
+octets, y compris sur un essai où le relais a démontrablement livré dix
+paquets du pair. Mais ce crochet est posé sur le chemin qu'emprunte Blaze,
+qui est du TCP -- son silence ne prouve donc pas une perte, il peut aussi
+dire qu'on ne regarde pas au bon endroit.
+
+### Ce que la journée a établi sur les rôles
+
+Sur six appariements : **celui qui héberge émet vers le relais, celui qui
+rejoint reste souvent muet**. Ce n'est pas une console -- la même a émis en
+hébergeant et s'est tue en rejoignant, dans la même heure.
+
+Et un relais n'apprend les adresses que par les paquets reçus : un invité
+muet est donc **injoignable**, et les paquets de l'hôte s'accumulent en
+attente. Quand l'invité émet, en revanche, la livraison se fait dans les deux
+sens -- `relay_flushed`, dix paquets de chaque côté.
+
+### Un avertissement sur l'outillage
+
+`fifa14_plain_send_hook` **n'est pas une sonde passive**. Il contient une
+branche `local_ack` qui court-circuite certains envois selon le propriétaire
+de la socket, vestige d'une expérience antérieure. Posé le 23 août comme un
+simple journal, il a avalé quatre requêtes au redirecteur : la console
+affichait « les serveurs EA ne sont pas disponibles » pendant que le titre
+émettait des trames parfaitement formées. Lire le corps d'un outil avant de
+le poser, même quand son nom dit « log ».
+
+Le crochet de réception, lui, est bien passif : il n'écrit que dans son
+tampon.
+
+### La piste suivante
+
+Instrumenter le `recvfrom` **UDP**, celui du trafic de match. Trois adresses
+sont déjà connues du dépôt et n'ont pas encore été exploitées :
+
+    0x83C7DBF4   le thunk d'import recvfrom du titre
+    0x81741C78   un export de réception de XAM
+    0x82D69ACC   la réception DirtySock, dans le titre
+
+`NetDll_WSARecvFrom` (0x81741D58) est écarté : aucun appel en 70 secondes.
+L'export `0x81741C78` n'a rien donné non plus, mais sur une fenêtre où aucune
+tentative de match n'a eu lieu -- donc à refaire.
+
+Contrainte : un localisateur à point d'arrêt fige le titre, et la fenêtre
+utile ne dure que dix secondes. Il faut donc **synchroniser** -- armer, puis
+enchaîner immédiatement le créer/rejoindre -- ou écrire un compteur passif à
+l'une de ces adresses plutôt qu'un point d'arrêt.

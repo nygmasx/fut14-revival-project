@@ -2804,7 +2804,17 @@ class SyntheticOpponentTests(unittest.TestCase):
         _, roster = by_label(self.pushed()[0], "PROS").value
         player = {f.label: f.value for f in roster[0]}
         self.assertEqual(player["UID"], 2535469248587161)
-        self.assertEqual(player["UGID"], (0, 0, 0))
+        # `UGID` doit s'accorder avec `CONG`, parce que c'est là que la console
+        # lit son *propre* groupe de connexion. Tant qu'on y écrivait trois
+        # zéros, elle rapportait `SCG = (0, 0, 0)` dans ses trames de maillage :
+        # elle savait à qui écrire et pas qui elle était. La forme vient du
+        # `TCG` que les consoles envoient elles-mêmes.
+        self.assertEqual(
+            player["UGID"],
+            (SERVER.CONNECTION_GROUP_COMPONENT,
+             SERVER.CONNECTION_GROUP_TYPE,
+             player["CONG"]),
+        )
         # Fifteen of the eighteen: BLOB, PATT and ROLE are empty and left out,
         # which is what the client does with its own -- its 611-byte
         # createGame is thirty-four members less seven empty containers.
@@ -2898,8 +2908,14 @@ class SyntheticOpponentTests(unittest.TestCase):
         os.environ["FIFA14_TEST_OPPONENT"] = "Sparring"
         session = self.search()
         self.protocol.expire_matchmaking(self.state, session)
+        self.channel.sent.clear()
         answered = self.mesh(self.state.connection_id, 2)
-        started = [decode_frame(f) for f in answered[1:]]
+        # Le coup d'envoi est poussé à toute la partie, pas rendu à celui qui
+        # a parlé en dernier. Rendu, il n'atteignait que lui -- et le 22 août
+        # la console qui hébergeait est restée sur son chargement pendant que
+        # l'autre était déjà en jeu.
+        self.assertEqual(answered, answered[:1])
+        started = [f for f in self.pushed() if f["command"] == 100]
         self.assertEqual([(f["component"], f["command"]) for f in started], [(4, 100)])
         # 131 is IN_GAME. 130 was PRE_GAME, which is where the setup left it.
         self.assertEqual(by_label(started[0], "GSTA").value, 131)
@@ -2925,8 +2941,12 @@ class SyntheticOpponentTests(unittest.TestCase):
         session = self.search()
         self.protocol.expire_matchmaking(self.state, session)
         host = self.state.connection_id
-        self.assertEqual(len(self.mesh(host, 2)), 2)
+        self.channel.sent.clear()
         self.assertEqual(len(self.mesh(host, 2)), 1)
+        self.assertEqual(len([f for f in self.pushed() if f["command"] == 100]), 1)
+        self.channel.sent.clear()
+        self.assertEqual(len(self.mesh(host, 2)), 1)
+        self.assertEqual([f for f in self.pushed() if f["command"] == 100], [])
 
     def test_a_game_with_nobody_to_play_never_starts(self) -> None:
         """A host connected to itself is not a match. "Everything reported is
@@ -3204,10 +3224,21 @@ class TwoConsolesTests(unittest.TestCase):
             sorted(f.label for f in reply["fields"]), ["GID", "JEX", "JGS", "REX"]
         )
         self.assertEqual([f["command"] for f in self.pushed(self.two)], [])
+        # 20, pas 22.
+        #
+        # 22 -- `NotifyJoiningPlayerInitiateConnections` -- porte le nom de ce
+        # qu'un arrivant devrait recevoir, et c'est pour ça qu'il avait été
+        # choisi. Le 22 août 2026, deux consoles ont tranché : celle qui a reçu
+        # la 20 a répondu deux secondes plus tard avec sa session XNet, celle
+        # qui a reçu la 22 n'a plus rien dit. On envoie donc à l'arrivant
+        # exactement ce qu'on envoie à un joueur apparié, et ce qui distingue
+        # les deux cas est `REAS`, qui est fait pour ça.
         self.assertEqual(
-            [decode_frame(f)["command"] for f in answered[1:]], [22, 30]
+            [decode_frame(f)["command"] for f in answered[1:]], [20, 71, 30, 100]
         )
-        # And the one already in there hears that somebody arrived.
+        # And the one already in there hears that somebody arrived -- 21 --
+        # and then qu'il est arrivé -- 30. Sans la seconde, l'arrivant reste
+        # `ACTIVE_CONNECTING` dans son roster et n'est jamais attendu.
         self.assertEqual([f["command"] for f in self.pushed(self.one)], [21, 30])
         self.assertEqual(len(self.protocol.games[7].members), 2)
 

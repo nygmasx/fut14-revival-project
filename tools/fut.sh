@@ -207,9 +207,16 @@ except Exception:
 launch_title() {
     step "launching the title"
     require_xbdm || return 1
+    # `*FIFA*` matched the console 1 install -- `Hdd:\Games\FIFA 14\default.xex`
+    # carries the name in its path. A disc-launched title does not: console 2
+    # runs FIFA from the DVD and `running_title` returns a path with no `FIFA`
+    # in it, so this step silently skipped `await_dashboard` and armed the
+    # launcher against a title that was already up -- waiting for a `modload`
+    # that could not come. `default.xex` is the reliable signal: the dashboard
+    # is `dash.xex`, so any `default.xex` is a game.
     case "$(running_title)" in
-        *FIFA*|*fifa*)
-            print "   FIFA is already running."
+        *FIFA*|*fifa*|*default.xex*)
+            print "   A title is already running."
             await_dashboard || return 1
             ;;
     esac
@@ -284,6 +291,24 @@ WATCH_MISSES=${WATCH_MISSES:-4}
 # watcher would keep sweeping the heap for nothing. Give up after this many
 # consecutive misses.
 WATCH_GIVE_UP=${WATCH_GIVE_UP:-20}
+# Combien la console encaisse d'un coup, en lecture XBDM.
+#
+# Ce balayage lisait par blocs de 4 Mo. Les mesures du 22 août donnent une
+# tolérance d'environ 300 Ko de `getmem` pendant que le titre tourne, au-delà
+# de laquelle XBDM se fige et la console tombe du réseau -- quatre fois dans
+# l'après-midi, bouton d'alimentation à chaque fois. Ce surveillant s'infligeait
+# donc, tout seul et en boucle, plus de dix fois la dose. Il précédait deux des
+# trois chutes notées en août, et personne n'avait fait le rapprochement.
+#
+# Le balayage est un peu plus lent ainsi. Une console qui répond lentement vaut
+# mieux qu'une console qu'il faut aller rallumer.
+WATCH_SWEEP_CHUNK=${WATCH_SWEEP_CHUNK:-0x40000}
+# Depuis combien de secondes une requête FUT vaut encore « il est dedans ».
+#
+# Assez large pour couvrir un écran qui ne parle pas au serveur pendant un
+# moment -- un match, une animation de pochette -- sans quoi le surveillant
+# repartirait au milieu de la partie.
+FUT_WINDOW=${FUT_WINDOW:-300}
 WATCH_LOG=runtime/patch-watch.log
 
 stop_watch() {
@@ -317,14 +342,38 @@ start_watch() {
             # both back to normal the second this process was killed. Counting
             # twenty failures is four to eight minutes of that.
             #
-            # The journal is the oracle, as everywhere else here: the first FUT
-            # route served says the title is inside, in its own words.
-            if grep -ql 'fut_route_request\|/ut/auth' \"\$(ls -t runtime/live-easw-*.jsonl 2>/dev/null | head -1)\" 2>/dev/null; then
-                print \"\$(date +%T) FUT entered -- watcher stopped\"
-                break
-            fi
+            # ATTENTION -- pas de backtick sous ce toit.
+            #
+            # Ce corps est une chaîne entre guillemets, construite par le shell
+            # appelant et passée telle quelle a zsh -c. Le # ne protege rien :
+            # il ne veut dire "commentaire" que pour l enfant, et le parent a
+            # deja tout substitue. Un backtick dans ces lignes est donc une
+            # substitution de commande, executee avant que le surveillant ne
+            # demarre. Ecrit ici le 24 aout apres l avoir appris ainsi.
+            #
+            # Le serveur est l oracle, et on l interroge au lieu de le lire.
+            # C etait le journal local, ce qui ne tenait que si le serveur
+            # tournait sur cette machine. Pointe sur le VPS, ce journal ne
+            # recoit plus une ligne, le grep ne peut plus matcher, et le
+            # surveillant balaie pendant toute la partie -- exactement ce que
+            # cet arret devait empecher.
+            #
+            # La route repond sur le pair qui demande : le Mac et la console
+            # sortent par la meme adresse publique. Un serveur partage ne doit
+            # pas arreter ce surveillant-ci parce que quelqu un d autre a
+            # ouvert son club.
+            #
+            # Un serveur muet, injoignable ou trop vieux repond non, et le
+            # surveillant continue comme avant : le mauvais cote sur lequel se
+            # tromper, mais le seul honnete. Son compteur d echecs lui reste.
+            case \"\$(curl -s --max-time 4 'http://$MAC:$IDENTITY_PORT/revival/inside-fut?window=$FUT_WINDOW' 2>/dev/null)\" in
+                *'\"inside\": true'*|*'\"inside\":true'*)
+                    print \"\$(date +%T) FUT entered -- watcher stopped\"
+                    break
+                    ;;
+            esac
             if [ \$misses -ge $WATCH_MISSES ]; then
-                out=\$('$PY' tools/fifa14_tu3_helperfunctions_runtime_patch.py '$XBOX' --timeout 20 --chunk-size 0x400000 2>&1 | tail -1)
+                out=\$('$PY' tools/fifa14_tu3_helperfunctions_runtime_patch.py '$XBOX' --timeout 20 --chunk-size $WATCH_SWEEP_CHUNK 2>&1 | tail -1)
                 misses=0
             else
                 out=\$('$PY' tools/fifa14_tu3_helperfunctions_runtime_patch.py '$XBOX' --hint-only --timeout 8 --interval 2 --chunk-size 0x100000 2>&1 | tail -1)
@@ -390,6 +439,13 @@ case "${1:-}" in
     # anything is said -- and that silence reads like a patch that will not
     # take, when it is a console that is not there.
     --patch)  require_xbdm || exit 1; apply_patch; release_pad; exit 0 ;;
+    # `--watch` relance le seul surveillant, sur un titre déjà lancé et patché.
+    #
+    # Il existe parce que son arrêt anticipé ne pouvait pas être observé
+    # autrement : le vérifier demandait de relancer tout le titre, donc de
+    # détruire l'état qu'on voulait justement regarder. Un surveillant déjà en
+    # place est remplacé, pas doublé.
+    --watch)  require_xbdm || exit 1; stop_watch; start_watch; exit 0 ;;
     # Same as the full run. Kept because it is the spelling this project is
     # used to typing; the patch applies on its own either way.
     --launch)

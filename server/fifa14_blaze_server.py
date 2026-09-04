@@ -27,6 +27,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -154,6 +155,52 @@ USER_UPDATE_HARDWARE_FLAGS = 8
 USER_UPDATE_NETWORK_INFO = 20
 
 STATS_GET_STAT_GROUP_LIST = 3
+STATS_GET_STAT_GROUP = 4
+STATS_GET_STATS_BY_GROUP = 16
+# Le code exact n'est pas connu. Ce qui est vérifié sur la console, c'est
+# qu'une erreur la sort de son attente là où un succès vide l'y laisse.
+STATS_ERR_NO_DATA = 1
+
+# Rejoindre une partie qui n'est plus là.
+#
+# Le 23 août, une console a demandé à rejoindre un salon que son hôte venait
+# de quitter. On lui a répondu un succès **vide** : ni `GID`, ni `JGS`, ni
+# rien. Elle a donc appris qu'elle avait rejoint quelque chose, sans savoir
+# quoi, et a attendu -- jusqu'au gel du titre.
+#
+# Une erreur est la seule réponse honnête, et c'est aussi la seule utile : la
+# console sait afficher « cette session de jeu n'existe plus », ce qui est
+# exactement le cas. La valeur n'est pas lue dans le binaire ; c'est la même
+# erreur générique que les stats emploient déjà et à laquelle le titre réagit
+# proprement, et elle est nommée ici pour que ce choix soit visible plutôt
+# qu'enfoui dans un appel.
+GAME_MANAGER_ERR_NO_SUCH_GAME = 1
+
+# Le groupe de connexion, tel que la console l'écrit elle-même.
+#
+# `updateMeshConnection` porte deux identifiants d'objet : `TCG`, la cible, et
+# `SCG`, la source. La console sait remplir `TCG` -- elle vaut
+# `(30722, 2, <CONG de l'autre>)`, et le `CONG` vient de nous. Elle mettait
+# `SCG = (0, 0, 0)`, parce que son propre groupe, elle le lit dans son `UGID`
+# de roster, et qu'on y écrivait trois zéros.
+#
+# Chaque console savait donc à qui écrire et **aucune ne savait qui elle
+# était**. Un paquet adressé à un groupe de connexion n'était reconnu par
+# personne. Ces deux nombres ne sont pas devinés : ils sont lus dans le `TCG`
+# que les consoles nous envoient depuis le 21 août.
+CONNECTION_GROUP_COMPONENT = 30722
+CONNECTION_GROUP_TYPE = 2
+
+
+def connection_group(group: int) -> tuple[int, int, int]:
+    """L'identifiant d'objet d'un groupe de connexion."""
+    return (CONNECTION_GROUP_COMPONENT, CONNECTION_GROUP_TYPE, int(group))
+# Le nom de cette commande n'est pas lu dans le binaire : il est déduit de son
+# seul argument, `NAME`, et des valeurs qu'on lui voit passer --
+# « FriendliesLeaderboards ». C'est un arbre de classements demandé par son
+# nom, et c'est dit ainsi plutôt que baptisé d'un nom de SDK qu'on ne peut pas
+# vérifier.
+STATS_GET_LEADERBOARD_TREE = 17
 STATS_GET_KEY_SCOPES_MAP = 15
 # Leaderboards. Command 10 arrives as LBID plus NAME ("SkillGame41"), which is
 # a request for one leaderboard's descriptor; command 13 arrives as CENT (the
@@ -237,6 +284,16 @@ SETUP_REASON_MATCHMAKING = 3
 # The made-up opponent's nucleus id. Far from any real one.
 SYNTHETIC_PERSONA = 1_000_002
 SETUP_CONTEXT_CREATE_GAME = 0
+# L'énumérateur suivant : celui qui entre dans une partie déjà là.
+#
+# Le 0 de CREATE_GAME est lu dans le binaire. Le 1 ne l'est pas -- c'est la
+# valeur suivante d'une énumération dont l'ordre est celui du SDK, et c'est
+# dit ici plutôt que caché. Ce qui est certain, c'est que 0 est faux à cet
+# endroit : on annonçait à une console qui venait de rejoindre la partie d'un
+# autre qu'elle venait d'en créer une. Elle se comportait alors en créateur et
+# attendait que quelqu'un arrive -- « chargement en cours », indéfiniment,
+# pendant que l'hôte affichait « En attente d'adversaire » en face.
+SETUP_CONTEXT_JOIN_GAME = 1
 
 MATCHMAKING_SUCCESS_CREATED_GAME = 0
 MATCHMAKING_SUCCESS_JOINED_NEW_GAME = 1
@@ -254,6 +311,13 @@ MATCHMAKING_SESSION_CANCELED = 4
 # what a field might mean.
 NOTIFY_SERVER_CENSUS_DATA = 1
 GAME_MANAGER_CENSUS_TDF_ID = 0x21239231
+
+# The configuration sections whose contents were read off this console's own
+# image and verified against it.  They are answered exactly as they were, and
+# nothing shared is merged into them -- see `fetch_config`.
+SECTIONS_RECOVERED_FROM_THE_XBOX_IMAGE = frozenset(
+    {"OSDK_CORE", "OSDK_CLIENT", "OSDK_ROSTER", "IdentityParams"}
+)
 
 CENSUS_SUBSCRIBE = 1
 CENSUS_UNSUBSCRIBE = 2
@@ -379,6 +443,15 @@ class ClientState:
     email: str = "offline@localhost"
     authenticated: bool = False
     request_count: int = 0
+    # When this connection was last heard from, on the monotonic clock. A
+    # console that reboots its title leaves the TCP connection half open: the
+    # server keeps writing census notifications into a socket nobody reads,
+    # and keeps holding the game that connection created at the name of a
+    # host that no longer exists. Blaze's heartbeat only travels one way --
+    # the client sends `Utility.ping` every twenty seconds and the server
+    # never asks -- so silence is the only symptom available, and this is
+    # where it gets noticed.
+    last_seen: float = field(default_factory=time.monotonic)
     send_lock: threading.Lock = field(default_factory=threading.Lock)
     # The socket this connection is on, so the server can say something the
     # client did not ask for. Every frame until now was a reply, written by
@@ -584,6 +657,46 @@ class AccountStores:
 # build posts a form to ``/authentication360`` with a ``version`` query and
 # its own EASW-* signature headers.  Accept both.
 EASW_AUTH_PATHS = ("/authentication360", "/v2/authenticationNucleusPersona")
+
+# `POST /easw/event/personas/<persona>/sku/<sku>/event` -- the EA Sports
+# Football Club module reporting that this player is present.
+#
+# It appeared for the first time on 2026-08-28 at 00:09:57, minutes after the
+# ten empty configuration sections were finally filled, and without anything
+# being pressed: the module read `OSDK_EASW_EVENT_URL`, re-armed itself, and
+# started posting every twenty seconds.  Until that evening it had never sent
+# anything at all -- its reconnect timer had expired years of console-time ago
+# and had nothing configured to re-arm it with.
+#
+# The SKU segment is how this build names itself: `FFA14XBX`, where the PC
+# build says `FFA14PCC`.
+EASW_EVENT_PATH = re.compile(
+    r"^/easw/event/personas/(?P<persona>\d+)/sku/(?P<sku>[A-Za-z0-9]+)/event$"
+)
+
+# The other things the module posts once it is talking.  All three are
+# *uploads*: the console telling the service about itself, not asking it for
+# anything.  `buddies` carries this player's Xbox Live friends list, and
+# `online_stats` a small create with SKILL, DNF and TIMEZONE.
+#
+# They are answered, and the two EASW *reads* -- `GET .../configuration` and
+# `GET .../personas/<id>/sku/<sku>;full` -- deliberately are not.  The
+# difference is not timidity: 404 on an upload is plainly wrong, while a read
+# answered with an invented document is the failure mode that cost this
+# project an evening on the stats screens, where a shape the client
+# half-accepted left it waiting forever for a follow-up.  Those two wait until
+# the parser in powdllzf has been read.
+EASW_UPLOAD_PATHS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("presence", EASW_EVENT_PATH),
+    ("buddies", re.compile(r"^/easw/req/personas/(?P<persona>\d+)/buddies$")),
+    (
+        "online_stats",
+        re.compile(
+            r"^/easw/req/personas/(?P<persona>\d+)"
+            r"/sku/(?P<sku>[A-Za-z0-9]+)/online_stats$"
+        ),
+    ),
+)
 
 # The FUT HTTP surface, keyed by exact path.  Every body here is the response
 # the corresponding FIFA 14 parser treats as "nothing yet": empty collections
@@ -944,6 +1057,12 @@ def with_balance(payload: bytes, coins: int) -> bytes:
 # The club's cards. Built once at import from the icebreaker packs this build
 # ships, so every screen that asks about the club sees the same inventory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from game_records import (  # noqa: E402
+    RecordStore,
+    extract_players,
+)
+from game_records import match_duration as report_duration  # noqa: E402
+from game_records import match_type as report_match_type  # noqa: E402
 from fut_inventory import (  # noqa: E402
     GOLD_PACK_ID,
     TOURNAMENT_NAMES,
@@ -1021,6 +1140,19 @@ EASW_TOKEN = "LOCAL-FIFA14-EASW-TOKEN"
 EASW_SESSION = "LOCAL-FIFA14-EASW-SESSION"
 
 REQUEST_BODY_PREVIEW_LIMIT = 4096
+
+
+def easw_event_category(body: bytes) -> str:
+    """The `term` of the Atom entry's `<category>`, e.g. "presence".
+
+    Read with a regular expression rather than an XML parser on purpose: this
+    body arrives from the network on every event, and a full parser is a much
+    larger surface to hand an attacker than one bounded match.  A body that
+    does not look like the expected entry simply has no category, which is
+    what the journal will then show.
+    """
+    match = re.search(rb'<category\s+term="([A-Za-z0-9_.-]{1,64})"', body[:2048])
+    return match[1].decode("ascii") if match is not None else ""
 
 
 def request_body_preview(body: bytes) -> str | None:
@@ -1442,14 +1574,27 @@ def response_frame(
     error: int = 0,
     message_type: int = REPLY,
 ) -> bytes:
-    decoded = decode_frame(request[:12] + request[normal_header_size(request):])
+    # L'en-tête d'une réponse ne se déduit que de l'en-tête de la requête.
+    #
+    # Ceci décodait la trame entière -- charge utile comprise -- pour en tirer
+    # trois nombres qui tiennent tous dans les douze premiers octets. Le 22
+    # août, ça a coûté la partie : un `joinGame` portant un champ dont la
+    # grammaire nous échappe était traité correctement, le joueur rejoignait
+    # bien, puis la construction de la réponse relisait la même trame en mode
+    # strict et l'exception fermait la connexion. Le journal montrait
+    # `player_joined` suivi d'un `connection_error`, et la console affichait
+    # « Cette session de jeu n'existe plus ».
+    #
+    # Ce n'est pas seulement une erreur rattrapée trop tard : c'est un travail
+    # qui n'avait pas lieu d'être. Répondre à une requête ne demande pas de la
+    # comprendre.
     result = bytearray(
         encode_frame(
-            decoded["component"],
-            decoded["command"],
+            int.from_bytes(request[2:4], "big"),
+            int.from_bytes(request[4:6], "big"),
             error,
             message_type,
-            decoded["message_number"],
+            ((request[9] & 0x0F) << 16) | int.from_bytes(request[10:12], "big"),
             payload,
         )
     )
@@ -1540,6 +1685,62 @@ def relayed_address(address: bytes, relay: tuple[str, int]) -> bytes:
     if len(packed) != 4:
         return address
     return address[:4] + packed + port.to_bytes(2, "big") + address[10:]
+
+
+def relayed_host_addresses(addresses: "Field | None",
+                           relay: tuple[str, int] | None) -> "Field | None":
+    """`HNET`, with the host's public address pointed at the relay.
+
+    The roster carried a rewritten address and `HNET` carried the real one,
+    in the same notification 20. A guest handed both dialled the real one and
+    the relay never saw a packet -- which is exactly what the 23 August
+    capture shows: three `XDDR` in one frame, only the middle one rewritten.
+    Rewriting one copy of an address is the same as rewriting none.
+    """
+    if addresses is None or relay is None:
+        return addresses
+    try:
+        item_type, items = addresses.value
+    except (TypeError, ValueError):
+        return addresses
+    rewritten_items = []
+    for item in items:
+        try:
+            active, entries = item
+        except (TypeError, ValueError):
+            rewritten_items.append(item)
+            continue
+        rewritten_items.append((active, [
+            Field("XDDR", BINARY, relayed_address(bytes(entry.value), relay))
+            if getattr(entry, "label", None) == "XDDR" else entry
+            for entry in entries
+        ]))
+    return Field("HNET", LIST, (item_type, rewritten_items))
+
+
+def join_notification_choice() -> str:
+    """Ce qu'un arrivant reçoit : `20`, `22`, ou les deux.
+
+    La notification 22 s'appelle `NotifyJoiningPlayerInitiateConnections` et
+    porte la même charge que la 20 -- le binaire n'a qu'une classe 557. Ce qui
+    les distingue est ce qu'elles font faire : la 20 décrit une partie, la 22
+    dit à celui qui arrive de composer le maillage au lieu d'attendre qu'on
+    l'appelle.
+
+    Le défaut est `20`, et il est mesuré, pas choisi : le 22 août 2026, la
+    console qui a reçu la 20 a répondu deux secondes plus tard avec sa session
+    XNet, celle qui a reçu la 22 seule n'a plus rien dit. Remplacer l'une par
+    l'autre est donc une régression connue.
+
+    Ce qui n'a jamais été essayé, c'est les deux ensemble -- et c'est ce que
+    le 23 août rend intéressant : sur deux essais aux rôles inversés, seul
+    l'hôte a émis de l'UDP, l'invité n'a envoyé ni paquet ni
+    `updateMeshConnection` alors qu'il avait l'adresse, la clé de session et
+    le roster. `both` est là pour trancher ça en un essai, réversible sans
+    redéployer, parce que la réponse se lit sur le réseau et pas dans le code.
+    """
+    choice = os.environ.get("FIFA14_JOIN_NOTIFICATION", "20").strip().lower()
+    return choice if choice in ("20", "22", "both") else "20"
 
 
 def mirror_test_host_address() -> bool:
@@ -1667,6 +1868,11 @@ class Fifa14Protocol:
         self.core_port = core_port
         self.logger = logger
         self.identity_port = identity_port
+        # Ce que les matchs ont laissé. Un classement en est la somme, rien
+        # de plus -- il n'y a donc rien à stocker d'autre que les matchs.
+        self.records = RecordStore(
+            Path(os.environ.get("FIFA14_GAME_RECORDS", "runtime/game-records.jsonl"))
+        )
         # `accounts` is the registry; `account_store` stays as the store for
         # the console that has not named itself, which is what every caller
         # without a persona in hand means.
@@ -1925,6 +2131,110 @@ class Fifa14Protocol:
             return f"{self.advertise}:{self.core_port}"
         return f"http://{self.advertise}:{self.identity_port}"
 
+    def shared_config(self, state: "ClientState | None") -> list[tuple[str, str]]:
+        """Configuration served for *every* section, not just the four we knew.
+
+        The title asks for fourteen sections -- OSDK_TICKER, OSDK_ARENA,
+        OSDK_TOLLBOOTH, OSDK_SOCIAL_NETWORKS and the rest -- and until now ten
+        of them came back empty, because this method only recognised the four
+        whose contents had been recovered from the Xbox image.  Impulsum14, a
+        working FIFA 14 PC server, answers *the same full dictionary whatever
+        section is asked for*, and its EAS FC works.  A section that returns
+        nothing is not a neutral answer: a module that reads its settings from
+        OSDK_ARENA and receives an empty map has no URL, no retry period, and
+        no reason to try twice.
+
+        What is shared here is deliberately narrower than Impulsum14's
+        dictionary.  Anything that steers authentication (AUTH_TYPE,
+        USE_TOKEN_AUTH, NUCLEUS_*, ORIGIN_LOGIN_ENABLED) is PC-only and is
+        left out: this console logs in through Xbox Live and that path already
+        works.  Anything pointing at a service we do not serve (CMS_*, the
+        DIME and downloader trees) is left out too, because a URL that 404s is
+        worse than a switch that stays at its default.  What remains is the
+        EA Sports Football Club block, the POW switches, and timings.
+        """
+        identity = self.identity_base
+        core = f"{self.advertise}:{self.core_port}"
+        return [
+            # EA Sports Football Club.  OSDK_EASW_CONNECT_RETRY_PERIOD is the
+            # one this project has been missing without knowing it: powdllzf
+            # arms a reconnect timestamp, and when that timer expires it
+            # disarms itself and never re-arms.  A module with no configured
+            # retry period has nothing to re-arm it with.
+            ("EASW/ENABLED", "1"),
+            ("OSDK_EASW_CONNECT_RETRY_PERIOD", "30"),
+            ("OSDK_EASW_REQ_URL", f"{identity}/easw/req"),
+            ("OSDK_EASW_EVENT_URL", f"{identity}/easw/event"),
+            ("OSDK_EASW_MEDIA_URL", f"{identity}/easw/media"),
+            ("OSDK_EASW_GF_FILE_URL", f"{identity}/easw/gf"),
+            # POW, the module behind the FOOTBALL CLUB tab.  These are
+            # switches, not endpoints: they decide whether it backs out of the
+            # screen on the first error and whether it insists on downloading
+            # a scenario roster that no longer exists anywhere.
+            ("POW/ASSERT_POW_ERROR", "0"),
+            ("POW/POW_DISABLE_ERROR_BACKOUT", "1"),
+            ("POW/POW_WIDGET", "1"),
+            ("POW/ENABLE_ALL_UNLOCKABLES", "1"),
+            ("POW/ENABLE_RPUPS", "0"),
+            ("POW/ENABLE_USER_NEWS", "0"),
+            ("POW/FIRST_BOOT_ACTIVITY", "0"),
+            ("POW/FORCE_SCENARIO_COMPLETE", "1"),
+            ("POW/SEND_ACTIVITIES", "0"),
+            ("POW/SKIP_SCENARIO_ROSTER_DOWNLOAD", "1"),
+            ("POW/STORE_CUSTOM_CATALOG", "0"),
+            ("POW_MDL_MAX_IMAGESIZE", "1048576"),
+            ("POW_MDL_DELAYNEWSDOWNLOAD", "0"),
+            ("FIFA_POW_MMM_URI", f"{identity}/"),
+            # RS4, the EAS FC redirect.  Left unset the module falls back to
+            # hostnames that have been dead for a decade.
+            ("ONLINE/SERVER_RS4", identity),
+            ("FIFA_RS4_URL", identity),
+            ("FIFA_RS4_TIMEOUT", "30"),
+            ("ONLINE/POW_CUSTOMURL", core),
+            ("ONLINE/POW_CUSTOMCONTENTURL", identity),
+            # Services we deliberately do not run.  Off is an answer; empty is
+            # not, and a module left at its retail default looks for a host
+            # that stopped answering in 2016.
+            ("ABUSE_REPORTING_ENABLED", "0"),
+            ("WEBOFFER_ENABLED", "0"),
+            ("ROSTER_UPDATE_ENABLED", "0"),
+            ("SPONSORED_EVENT_ENABLED", "0"),
+            ("PRIVATE_BETA", "0"),
+            ("EMAIL_OPT_IN", "0"),
+            ("SKIP_LEGAL_DOC", "1"),
+            ("ALLOW_OFFLINE", "1"),
+            ("OSDK_ONLINE_ENABLED", "1"),
+            # Timings and buffer sizes, verbatim from the working PC server.
+            ("OSDK_PEERBUFFERSIZE", "16384"),
+            ("OSDK_DISTBUFFERSIZE_IN", "16384"),
+            ("OSDK_DISTBUFFERSIZE_OUT", "16384"),
+            ("OSDK_MAXGAMES", "16"),
+            ("OSDK_MAXROOMS", "16"),
+            ("OSDK_USERROOM_PREFIX", "room"),
+            ("OSDK_MATCHUP_TIMEOUT", "30"),
+            ("OSDK_KEEPALIVEINTERVAL", "30"),
+            ("OSDK_STATS_EMPTY_CELL", "-1"),
+            ("OSDK_TICKER_COUNT", "10"),
+            ("OSDK_USERLIST_REQUEST_MAX_USERS", "50"),
+            ("JOIN_GAME_TIMEOUT", "30"),
+            ("CLIENT_TIMEOUT", "90"),
+            ("REQUEST_TIMEOUT", "80"),
+        ]
+
+    @staticmethod
+    def merge_config(
+        shared: list[tuple[str, str]], section: list[tuple[str, str]]
+    ) -> list[tuple[str, str]]:
+        """Section values win over shared ones, and no key appears twice.
+
+        The frame carries a map, and a map with a repeated key is a decoder's
+        problem, not a server's licence.  Where both define a key the section
+        wins, because those values were read off the Xbox image and the shared
+        ones were read off a PC server.
+        """
+        overridden = {key for key, _ in section}
+        return [pair for pair in shared if pair[0] not in overridden] + section
+
     def fetch_config(
         self,
         request: bytes,
@@ -2094,6 +2404,24 @@ class Fifa14Protocol:
                 ("ROSTER_LKR", ""),
                 ("ROSTER_CSUM", ""),
             ]
+        # The shared block goes only where there was nothing.
+        #
+        # Serving it everywhere is what the working PC server does, and doing
+        # the same here broke the login outright on 2026-08-27: the console
+        # authenticated, took the redirect, dropped the connection one second
+        # later and retried every seventy seconds behind "les serveurs EA ne
+        # sont pas disponibles".  Reverting the server and relaunching against
+        # it held the session, which named the change without ambiguity.
+        #
+        # The mistake was one of standing, not of content.  The four sections
+        # below were recovered from this console's own image and verified on
+        # hardware; `OSDK_CORE` and `OSDK_CLIENT` in particular are what
+        # CardsDLL reads.  Fifty keys lifted from a PC server -- among them
+        # ALLOW_OFFLINE, SKIP_LEGAL_DOC and OSDK_ONLINE_ENABLED -- do not get
+        # to outrank that.  An empty section, by contrast, has nothing to
+        # lose.
+        if name not in SECTIONS_RECOVERED_FROM_THE_XBOX_IMAGE:
+            values = self.merge_config(self.shared_config(state), values)
         journal_fetch(values)
         return response_frame(
             request,
@@ -2459,7 +2787,8 @@ class Fifa14Protocol:
             Field("HSLT", INTEGER, 0),
         ]
 
-    def replicated_game_data(self, game: HostedGame) -> list[Field]:
+    def replicated_game_data(self, game: HostedGame,
+                             viewer: ClientState | None = None) -> list[Field]:
         """The game, all thirty-six members of it.
 
         The first pass sent fourteen, because fourteen was all the title's
@@ -2492,7 +2821,13 @@ class Fifa14Protocol:
             Field("GSTA", INTEGER, game.state),
             Field("GTYP", STRING, game.game_type),
             Field("GURL", STRING, game.status_url),
-            game.host_addresses or Field("HNET", LIST, (STRUCT, [])),
+            # Pointed at the relay for everyone but the host itself, on the
+            # same rule as the roster: a console is never told to dial
+            # through a relay to reach the machine it is running on.
+            (relayed_host_addresses(game.host_addresses, peer_relay())
+             if viewer is None or viewer.xuid != game.persona_id
+             else game.host_addresses)
+            or Field("HNET", LIST, (STRUCT, [])),
             # The session that hosts the topology.
             Field("HSES", INTEGER, game.persona_id),
             Field("IGNO", INTEGER, 0),
@@ -2546,6 +2881,13 @@ class Fifa14Protocol:
         address is left alone -- it knows where it lives -- and everybody
         else's is pointed at the relay, because those are the ones it will
         dial.
+
+        No `viewer` means the recipient is somebody other than this member --
+        which is what notification 21 is, always: it announces an arrival to
+        the players who were already there, and never to the arrival itself.
+        So the relay rewrite applies there too. It did not, and that is why
+        the host kept dialling the guest's real address on 23 August while a
+        relay sat armed and idle.
         """
         fields = [
             Field("CONG", INTEGER, member["group"]),
@@ -2575,14 +2917,14 @@ class Fifa14Protocol:
                   else PLAYER_STATE_ACTIVE_CONNECTING),
             Field("TIDX", INTEGER, member["team"]),
             Field("TIME", INTEGER, int(time.time())),
-            Field("UGID", OBJECT_ID, (0, 0, 0)),
+            Field("UGID", OBJECT_ID, connection_group(member["group"])),
             # mPlayerSessionId: how a client recognises itself in a roster.
             Field("UID", INTEGER, member["persona"]),
         ]
         address = member["address"]
         relay = peer_relay()
-        if (address is not None and relay is not None and viewer is not None
-                and member["persona"] != viewer.xuid):
+        if (address is not None and relay is not None
+                and (viewer is None or member["persona"] != viewer.xuid)):
             active, valu = address
             rewritten = []
             for entry in valu.value:
@@ -2613,7 +2955,7 @@ class Fifa14Protocol:
         one-field test.
         """
         fields = [
-            Field("UGID", OBJECT_ID, (0, 0, 0)),
+            Field("UGID", OBJECT_ID, connection_group(game.connection_group)),
             # The same id the login notifications gave this session.
             Field("UID", INTEGER, game.persona_id),
             Field("CONG", INTEGER, game.connection_group),
@@ -2635,7 +2977,8 @@ class Fifa14Protocol:
         return sorted(fields, key=lambda field: encode_tag(field.label))
 
     def setup_reason(self, session: int,
-                     result: int = MATCHMAKING_SUCCESS_CREATED_GAME) -> tuple:
+                     result: int = MATCHMAKING_SUCCESS_CREATED_GAME,
+                     context: int = SETUP_CONTEXT_CREATE_GAME) -> tuple:
         """Why this game exists, in the shape the client asks for.
 
         A game the console asked for itself is union index 0 -- a dataless
@@ -2653,7 +2996,7 @@ class Fifa14Protocol:
             return (
                 SETUP_REASON_DATALESS,
                 Field("VALU", STRUCT, [
-                    Field("DCTX", INTEGER, SETUP_CONTEXT_CREATE_GAME),
+                    Field("DCTX", INTEGER, context),
                 ]),
             )
         return (
@@ -2665,6 +3008,171 @@ class Fifa14Protocol:
                 Field("RSLT", INTEGER, result),
             ]),
         )
+
+    def stat_group(self, request: bytes) -> bytes:
+        """La description d'un groupe de statistiques, réduite à ce qu'on sait.
+
+        Le titre demande quatre groupes par leur nom -- `MyFriends`,
+        `MyFriendlies`, `VProStatAccom`, `SkillGameStats` -- et redemande le
+        même toutes les cinq secondes tant qu'on ne lui répond rien d'utile.
+        Vingt et une fois dans la journée du 22 août.
+
+        La structure complète de `StatGroupResponse` n'est pas connue ici, et
+        rien n'est inventé pour la combler : la réponse ne porte que le nom du
+        groupe, tel que demandé, et une description vide. Un décodeur TDF
+        ignore les tags qu'il ne connaît pas et met des valeurs par défaut au
+        reste -- c'est ce qui a été établi sur `NotifyGameSetup`, et c'est ce
+        qui rend une réponse partielle sûre là où une réponse inventée ne le
+        serait pas.
+
+        Ce que ça teste est net : si la console cesse de redemander, le nom
+        était ce qu'elle attendait. Si elle continue, il lui faut les colonnes
+        du groupe, et il faudra aller les lire dans la table de réflexion du
+        titre plutôt que les deviner.
+        """
+        asked = find_field(decode_frame(request)["fields"], "NAME")
+        name = str(asked.value) if asked is not None else ""
+        self.logger.event("stat_group_requested", group=name)
+        return response_frame(request, encode_fields([
+            Field("DESC", STRING, ""),
+            Field("NAME", STRING, name),
+        ]))
+
+    def stats_by_group(self, request: bytes) -> bytes:
+        """Les valeurs d'un groupe de statistiques, pour des joueurs donnés.
+
+        Ce que la console fait est sans ambiguïté : elle demande une fois, puis
+        n'envoie plus que ses pings toutes les vingt secondes. Elle n'attend
+        rien d'autre que cette réponse -- l'écran des matchs amicaux reste sur
+        « Téléchargement informations match amicaux » indéfiniment.
+
+        La classe de la réponse n'est pas connue. La lire dans la table de
+        réflexion du titre demanderait de balayer deux mégaoctets de `.data`,
+        et cette console ne supporte qu'environ 300 Ko de `getmem` avant de
+        tomber du réseau -- six ou sept redémarrages pour un écran de
+        statistiques.
+
+        Alors on procède autrement, et honnêtement : la réponse porte
+        **plusieurs conteneurs vides candidats à la fois**. Un décodeur TDF
+        ignore les tags qu'il ne connaît pas et met des valeurs par défaut au
+        reste -- c'est ce qui a été établi sur `NotifyGameSetup`, où une
+        notification à moitié comprise se lisait aussi bien qu'une complète.
+        Un seul essai couvre donc autant de candidats qu'on veut, et c'est la
+        console qui tranche.
+
+        `VID` est renvoyé tel qu'il est venu. Si le client raisonne en vues,
+        c'est le fil qui relie sa question à la réponse ; sinon il l'ignore,
+        et ça ne coûte rien.
+
+        Le groupe est vide de toute façon : `getStatGroup` ne déclare aucune
+        colonne, donc zéro ligne est la seule réponse vraie. Ce qu'on cherche
+        ici, c'est le tag sous lequel dire « zéro ».
+        """
+        fields = decode_frame(request, tolerant=True)["fields"]
+        view = find_field(fields, "VID")
+        group = find_field(fields, "NAME")
+        self.logger.event(
+            "stats_by_group_requested",
+            group=str(group.value) if group is not None else "",
+            view=int(view.value) if view is not None else 0,
+        )
+        # Dire « il n'y en a pas » plutôt que de ne rien dire.
+        #
+        # Ce fut l'affaire de la soirée du 22 août. La console demandait les
+        # valeurs du groupe `MyFriendlies`, recevait un succès portant zéro
+        # ligne, et restait sur « Téléchargement informations match amicaux »
+        # indéfiniment -- plus rien que ses pings toutes les vingt secondes.
+        # Elle ne réessayait même pas.
+        #
+        # Deux hypothèses opposées ont été essayées sur la console elle-même.
+        # Un succès vide, poussé sous vingt-quatre numéros de notification à la
+        # fois : aucun effet. Une erreur : l'historique des amicaux en ligne
+        # s'est affiché. Le client lit donc « succès, zéro ligne » comme « les
+        # données ne sont pas encore là », et attend un envoi qui ne viendra
+        # jamais.
+        #
+        # Ce serveur n'a aucune statistique à donner, et c'est vrai de tous les
+        # groupes qu'on lui demande. Répondre une erreur est la seule chose
+        # exacte qu'il puisse dire, et c'est ce qui rend l'écran utilisable.
+        # Le jour où il y aura des lignes à rendre, il faudra la forme exacte
+        # de la réponse -- que la table de réflexion du titre détient et qu'on
+        # n'a pas pu lire, cette console ne supportant qu'environ 300 Ko de
+        # `getmem` avant de tomber du réseau.
+        #
+        # `FIFA14_STATS_EMPTY_OK=1` rend le succès vide, pour rejouer l'essai
+        # sans toucher au code.
+        if not os.environ.get("FIFA14_STATS_EMPTY_OK", "").strip():
+            self.logger.event(
+                "stats_by_group_refused",
+                group=str(group.value) if group is not None else "",
+            )
+            return response_frame(request, error=STATS_ERR_NO_DATA)
+        return response_frame(request, encode_fields([
+            Field("KVAL", LIST, (STRUCT, [])),
+            Field("STAT", LIST, (STRING, [])),
+            Field("SVAL", LIST, (STRUCT, [])),
+            Field("VID", INTEGER, int(view.value) if view is not None else 0),
+        ]))
+
+    def leaderboard_tree(self, request: bytes) -> bytes:
+        """Un arbre de classements demandé par son nom.
+
+        Même raisonnement que pour les valeurs de statistiques, et il vient
+        d'être vérifié sur la console : quand ce serveur n'a rien, le dire est
+        ce qui débloque l'écran, et se taire poliment est ce qui le fige. Un
+        succès portant un arbre vide se lit « pas encore arrivé ».
+
+        Il n'y a aucun classement ici, et il n'y en aura pas tant que personne
+        n'aura joué : un classement est un agrégat de matchs, et ce serveur
+        n'en a aucun à agréger. L'erreur est donc exacte, pas commode.
+        """
+        asked = find_field(decode_frame(request, tolerant=True)["fields"], "NAME")
+        self.logger.event(
+            "leaderboard_tree_refused",
+            tree=str(asked.value) if asked is not None else "",
+        )
+        return response_frame(request, error=STATS_ERR_NO_DATA)
+
+    def stats_notification_sweep(self, request: bytes,
+                                 state: ClientState) -> list[bytes]:
+        """Chercher le numéro de la notification qui clôt un `...Async`.
+
+        C'est une expérience, pas un comportement, et elle ne s'allume qu'avec
+        `FIFA14_STATS_NOTIFY_SWEEP`. Elle envoie la même charge utile sous
+        plusieurs numéros de notification à la fois.
+
+        Ce qui rend ça possible : une notification dont le client n'a pas de
+        gestionnaire est ignorée sans un mot. On l'a constaté en août avec la
+        22, qui a été envoyée pendant des heures à une console qui n'en a
+        jamais rien fait. Le coût d'un mauvais numéro est donc nul, et un seul
+        aller-retour couvre autant de candidats qu'on veut.
+
+        Si l'écran se débloque, on dichotomise sur l'intervalle pour isoler le
+        bon numéro, puis on retire tout ceci. S'il ne se débloque pas, c'est
+        que ce que la console attend n'est pas une notification de ce
+        composant, et il faudra chercher ailleurs -- ce qui est aussi une
+        réponse.
+        """
+        raw = os.environ.get("FIFA14_STATS_NOTIFY_SWEEP", "").strip()
+        if not raw:
+            return []
+        try:
+            first, last = (int(piece) for piece in raw.split("-", 1))
+        except ValueError:
+            return []
+        fields = decode_frame(request, tolerant=True)["fields"]
+        view = find_field(fields, "VID")
+        payload = encode_fields([
+            Field("KVAL", LIST, (STRUCT, [])),
+            Field("STAT", LIST, (STRING, [])),
+            Field("SVAL", LIST, (STRUCT, [])),
+            Field("VID", INTEGER, int(view.value) if view is not None else 0),
+        ])
+        self.logger.event("stats_notify_sweep", first=first, last=last)
+        return [
+            notification_frame(STATS, number, payload)
+            for number in range(first, last + 1)
+        ]
 
     def borrowed_address(self, real) -> tuple | None:
         """A real console's XNADDR, worn by somebody invented.
@@ -2779,7 +3287,7 @@ class Fifa14Protocol:
         dial it, it will fail -- and *where* it fails is the measurement.
         """
         fields = [
-            Field("UGID", OBJECT_ID, (0, 0, 0)),
+            Field("UGID", OBJECT_ID, connection_group(SYNTHETIC_PERSONA)),
             Field("UID", INTEGER, SYNTHETIC_PERSONA),
             Field("CONG", INTEGER, SYNTHETIC_PERSONA),
             Field("CSID", INTEGER, 1),
@@ -2821,7 +3329,8 @@ class Fifa14Protocol:
 
     def game_setup_payload(self, game: HostedGame, session: int = 0,
                            result: int = MATCHMAKING_SUCCESS_CREATED_GAME,
-                           viewer: ClientState | None = None) -> list[Field]:
+                           viewer: ClientState | None = None,
+                           context: int = SETUP_CONTEXT_CREATE_GAME) -> list[Field]:
         """The five members of NotifyGameSetup.
 
         Shared by notification 20 and notification 22, because the 557-class
@@ -2830,13 +3339,13 @@ class Fifa14Protocol:
         do, not in what they carry.
         """
         return [
-            Field("GAME", STRUCT, self.replicated_game_data(game)),
+            Field("GAME", STRUCT, self.replicated_game_data(game, viewer)),
             Field("LFPJ", INTEGER, 0),
             Field("PROS", LIST, (STRUCT, [
                 self.member_player(game, member, viewer) for member in game.members
             ] or [self.replicated_game_player(game)])),
             Field("QUEU", LIST, (STRUCT, [])),
-            Field("REAS", UNION, self.setup_reason(session, result)),
+            Field("REAS", UNION, self.setup_reason(session, result, context)),
         ]
 
     def game_setup_notifications(
@@ -3006,33 +3515,54 @@ class Fifa14Protocol:
         )
         return [
             response_frame(request, encode_fields([Field("GID", INTEGER, game_id)])),
-            *self.game_setup_notifications(game),
+            # `viewer=state` because this one goes back to the creator, and
+            # the creator is the host: it must read its own address, not the
+            # relay's. Everyone else is told to dial through the relay.
+            *self.game_setup_notifications(game, viewer=state),
         ]
 
     def join_game(self, request: bytes, state: ClientState) -> list[bytes]:
-        """Somebody entering a game that already exists.
+        """Rejoindre la partie de quelqu'un -- par son numéro, ou par lui.
 
-        The joiner brings everything needed with it -- its own `PNET` and its
-        own `XSES` -- so nothing about the second console has to have been
-        cached beforehand. It is added to the roster, told what it joined, and
-        the people already in there are told somebody arrived.
+        C'est le chemin de l'invitation entre amis, et il ne ressemble pas à
+        celui du matchmaking. Le 22 août, la trame envoyée par la console
+        invitée disait :
 
-        The response is four members, not the two the published tables give:
-        `JEX` and `REX` list external players who came along, and are empty
-        here because nobody brings a party to a two-player match.
+            GID  = 0
+            SLOT = 1
+            USER = { ID: 2535469248587161, ... }
+
+        `GID` à zéro n'est pas une partie introuvable : c'est le client qui dit
+        qu'il ne raisonne pas en numéro de partie. Il désigne son hôte par son
+        identifiant de joueur, parce qu'il l'a pris dans sa liste d'amis et
+        non dans une liste de salons. Un serveur qui cherche `self.games[0]`
+        ici répond « aucune partie » à une demande parfaitement valide -- ce
+        qu'il faisait.
+
+        La lecture est tolérante parce que cette trame porte `RRST`, un
+        dictionnaire dont la grammaire nous échappe encore ; le décodeur se
+        resynchronise après lui et retrouve `USER`, qui est tout l'objet de
+        la requête.
         """
-        decoded = decode_frame(request)
+        try:
+            decoded = decode_frame(request, tolerant=True)
+        except ValueError:
+            return [response_frame(request)]
         fields = decoded["fields"]
         game_id = find_field(fields, "GID")
-        game = self.games.get(int(game_id.value) if game_id is not None else 0)
+        wanted = int(game_id.value) if game_id is not None else 0
+        game = self.games.get(wanted) if wanted else None
+        if game is None:
+            game = self.game_hosted_by(find_field(fields, "USER"))
         if game is None:
             self.logger.event(
                 "join_refused",
                 connection=state.connection_id,
-                game=int(game_id.value) if game_id is not None else 0,
+                game=wanted,
                 reason="no such game",
             )
-            return [response_frame(request)]
+            return [response_frame(
+                request, error=GAME_MANAGER_ERR_NO_SUCH_GAME)]
 
         network = find_field(fields, "PNET")
         address = None
@@ -3040,10 +3570,10 @@ class Fifa14Protocol:
             active, valu = network.value
             if valu is not None:
                 address = (active, valu)
+        slot = len(game.members)
         joined = self.member(
             game, state.xuid, state.gamertag, state.connection_id,
-            address, slot=len(game.members), team=len(game.members) % 2,
-            state=state,
+            address, slot=slot, team=slot % 2, state=state,
         )
         game.members.append(joined)
         game.roster.append(state.connection_id)
@@ -3052,25 +3582,20 @@ class Fifa14Protocol:
             connection=state.connection_id,
             game=game.game_id,
             persona=state.xuid,
+            by=("game_id" if wanted else "host_persona"),
             players=len(game.members),
         )
-        self.tell_members(game, notification_frame(
-            GAME_MANAGER,
-            NOTIFY_PLAYER_JOINING,
-            encode_fields([
-                Field("GID", INTEGER, game.game_id),
-                Field("PDAT", STRUCT, self.member_player(game, joined)),
-            ]),
-        ), skip=state)
-        self.tell_members(game, notification_frame(
-            GAME_MANAGER,
-            NOTIFY_PLAYER_JOIN_COMPLETED,
-            encode_fields([
-                Field("GID", INTEGER, game.game_id),
-                Field("PID", INTEGER, state.xuid),
-            ]),
-        ), skip=state)
-        self.broadcast_census()
+        # La réponse d'abord, les notifications ensuite, et la 20 plutôt que
+        # la 22 : c'est le seul jeu qui ait jamais fait parler une deuxième
+        # console. Il est produit par le même code que l'arrivée dans un salon
+        # qui attendait, pour que le client voie la même chose quelle que
+        # soit la porte qu'il a prise.
+        follow_up = self.announce_late_join(
+            game,
+            {"member": joined, "session": 0, "slot": slot},
+            state,
+            deferred=True,
+        )
         return [
             response_frame(request, encode_fields([
                 Field("GID", INTEGER, game.game_id),
@@ -3078,22 +3603,34 @@ class Fifa14Protocol:
                 Field("JGS", INTEGER, JOIN_STATE_JOINED_GAME),
                 Field("REX", LIST, (INTEGER, [])),
             ])),
-            notification_frame(
-                GAME_MANAGER,
-                NOTIFY_JOINING_PLAYER_INITIATE_CONNECTIONS,
-                encode_fields(self.game_setup_payload(
-                    game, session=0, result=MATCHMAKING_SUCCESS_JOINED_EXISTING_GAME
-                )),
-            ),
-            notification_frame(
-                GAME_MANAGER,
-                NOTIFY_PLAYER_JOIN_COMPLETED,
-                encode_fields([
-                    Field("GID", INTEGER, game.game_id),
-                    Field("PID", INTEGER, state.xuid),
-                ]),
-            ),
+            *follow_up,
         ]
+
+    def game_hosted_by(self, user: Field | None) -> HostedGame | None:
+        """La partie que tient le joueur désigné par `USER`.
+
+        `USER` est une struct, et l'identifiant y apparaît deux fois : `ID` et
+        `EXID`. Les deux portaient la même valeur dans la seule trame qu'on
+        ait ; on lit `ID` d'abord et `EXID` en second plutôt que d'en choisir
+        un et d'espérer.
+        """
+        if user is None or not isinstance(user.value, list):
+            return None
+        persona = None
+        for label in ("ID", "EXID"):
+            found = find_field(user.value, label)
+            if found is not None and int(found.value):
+                persona = int(found.value)
+                break
+        if persona is None:
+            return None
+        for game in self.games.values():
+            if game.persona_id != persona:
+                continue
+            if game.state not in (GAME_STATE_INITIALIZING, GAME_STATE_PRE_GAME):
+                continue
+            return game
+        return None
 
     def advance_game_state(self, request: bytes, state: ClientState) -> list[bytes]:
         """The host moves the game on by itself.
@@ -3326,23 +3863,48 @@ class Fifa14Protocol:
         if any(seen.get(peer) != MESH_CONNECTED for peer in expected):
             return []
         peers = expected
-        game.state = GAME_STATE_IN_GAME
         self.logger.event(
             "mesh_complete",
             game=game.game_id,
             peers=sorted(peers),
             synthetic=bool(test_opponent()),
         )
-        return [
-            notification_frame(
-                GAME_MANAGER,
-                NOTIFY_GAME_STATE_CHANGE,
-                encode_fields([
-                    Field("GID", INTEGER, game.game_id),
-                    Field("GSTA", INTEGER, game.state),
-                ]),
-            )
-        ]
+        # Le coup d'envoi appartient à l'hôte, pas au serveur.
+        #
+        # Cette avance automatique a été écrite pour l'adversaire inventé, qui
+        # n'a pas de console pour envoyer `advanceGameState`. Avec deux vraies
+        # consoles elle est fausse, et le 22 août elle a coûté le match : dès
+        # le maillage fermé, la partie était déclarée IN_GAME alors que l'hôte
+        # était sur l'écran de sélection des équipes, à afficher « En attente
+        # d'adversaire ». Une partie en cours dont les deux clients sont
+        # encore en avant-match, ça ne se rattrape pas tout seul.
+        #
+        # L'hôte enverra la commande 3 quand il aura fini. Le serveur note
+        # simplement que tout le monde se voit.
+        if not test_opponent():
+            return []
+        game.state = GAME_STATE_IN_GAME
+        # Le coup d'envoi se dit à toute la partie, pas au dernier arrivé.
+        #
+        # Ceci ne rendait la notification qu'à l'appelant, et l'appelant est
+        # la console dont le rapport de maillage a complété le tableau. Le 22
+        # août, deux consoles se sont enfin trouvées : le maillage s'est
+        # bouclé, la partie est passée en IN_GAME -- et seul Racim l'a su. La
+        # console qui hébergeait est restée sur son écran de chargement à
+        # attendre un signal qui ne lui était pas adressé.
+        #
+        # Un état de partie appartient à la partie. Il se pousse à tous ses
+        # membres, y compris celui qui vient de parler.
+        started = notification_frame(
+            GAME_MANAGER,
+            NOTIFY_GAME_STATE_CHANGE,
+            encode_fields([
+                Field("GID", INTEGER, game.game_id),
+                Field("GSTA", INTEGER, game.state),
+            ]),
+        )
+        self.tell_members(game, started)
+        return []
 
     def expire_matchmaking(self, state: ClientState, session: int) -> None:
         """End a search nobody could be found for.
@@ -3467,6 +4029,161 @@ class Fifa14Protocol:
             return
         self.logger.event("relay_pairs_published", pairs=pairs)
 
+    def game_awaiting_player(self, state: ClientState) -> HostedGame | None:
+        """Une partie créée par quelqu'un d'autre et qui a une place libre."""
+        for game in self.games.values():
+            if game.persona_id == state.xuid:
+                continue
+            if len(game.members) >= max(2, game.max_capacity):
+                continue
+            if game.protocol_version and game.protocol_version != getattr(
+                self.searches.get(state.connection_id, {}).get("draft"),
+                "protocol_version", game.protocol_version,
+            ):
+                continue
+            if game.state not in (GAME_STATE_INITIALIZING, GAME_STATE_PRE_GAME):
+                continue
+            return game
+        return None
+
+    def enlist_in_waiting_game(self, state: ClientState, mine: dict,
+                               game: HostedGame) -> dict | None:
+        """Inscrire celui qui cherche dans la partie qui l'attendait.
+
+        Appelée avec le verrou tenu, et ne fait donc que muter la partie :
+        pas un octet n'est envoyé d'ici. Les notifications partent de
+        `announce_late_join`, une fois le verrou rendu -- pousser des trames
+        vers deux consoles en tenant le verrou du matchmaking, c'est le tenir
+        pendant tout un aller-retour réseau.
+        """
+        self.searches.pop(state.connection_id, None)
+        slot = len(game.members)
+        joined = self.member(
+            game, state.xuid, state.gamertag, state.connection_id,
+            mine["draft"].host_address, slot=slot, team=slot % 2, state=state,
+        )
+        game.members.append(joined)
+        game.roster.append(state.connection_id)
+        return {"member": joined, "session": mine["session"], "slot": slot}
+
+    def announce_late_join(self, game: HostedGame, arrival: dict,
+                           state: ClientState,
+                           deferred: bool = False) -> list[bytes]:
+        """Dire à l'arrivant où il arrive, et aux autres qui arrive.
+
+        C'est le même jeu de notifications que l'appariement de deux
+        recherches -- 20 pour l'arrivant, 21 pour ceux qui étaient là -- et
+        c'est voulu. Le client ne sait pas si sa partie est née d'une
+        recherche appariée ou d'un salon déjà ouvert ; ce qui le renseigne,
+        c'est `REAS`, et rien d'autre ne doit changer.
+        """
+        self.forget_matchmaking(state.connection_id)
+        self.logger.event(
+            "matchmaking_joined_waiting_game",
+            game=game.game_id,
+            host=game.persona_id,
+            guest=state.xuid,
+            slot=arrival["slot"],
+        )
+        setup = encode_fields(self.game_setup_payload(
+            game, session=arrival["session"],
+            result=MATCHMAKING_SUCCESS_JOINED_EXISTING_GAME,
+            viewer=state, context=SETUP_CONTEXT_JOIN_GAME))
+        choice = join_notification_choice()
+        frames = [
+            *([notification_frame(GAME_MANAGER, NOTIFY_GAME_SETUP, setup)]
+              if choice in ("20", "both") else []),
+            *([notification_frame(
+                GAME_MANAGER,
+                NOTIFY_JOINING_PLAYER_INITIATE_CONNECTIONS, setup)]
+              if choice in ("22", "both") else []),
+            notification_frame(
+                GAME_MANAGER,
+                NOTIFY_PLATFORM_HOST_INITIALIZED,
+                encode_fields([
+                    Field("GID", INTEGER, game.game_id),
+                    Field("PHID", INTEGER, game.persona_id),
+                    Field("PHST", INTEGER, 0),
+                ]),
+            ),
+            notification_frame(
+                GAME_MANAGER,
+                NOTIFY_PLAYER_JOIN_COMPLETED,
+                encode_fields([
+                    Field("GID", INTEGER, game.game_id),
+                    Field("PID", INTEGER, state.xuid),
+                ]),
+            ),
+            notification_frame(
+                GAME_MANAGER,
+                NOTIFY_GAME_STATE_CHANGE,
+                encode_fields([
+                    Field("GID", INTEGER, game.game_id),
+                    Field("GSTA", INTEGER, game.state),
+                ]),
+            ),
+        ]
+        # L'hôte a déjà fini sa création : sa session XNet existe depuis
+        # longtemps, et l'arrivant ne la recevra jamais par la 115 que le
+        # serveur a poussée avant qu'il n'existe. Il faut la lui redonner ici,
+        # sinon il a une partie complète et personne à appeler.
+        if game.xnet_session:
+            frames.append(notification_frame(
+                GAME_MANAGER,
+                NOTIFY_GAME_SESSION_UPDATED,
+                encode_fields([
+                    Field("GID", INTEGER, game.game_id),
+                    Field("XNNC", BINARY, game.xnet_nonce or b""),
+                    Field("XSES", BINARY, game.xnet_session),
+                ]),
+            ))
+        if deferred:
+            # L'arrivant doit lire la réponse à sa requête *avant* les
+            # notifications qu'elle déclenche. Poussées ici, elles partiraient
+            # d'abord -- c'est précisément ce qui a fait rester l'invité muet
+            # le 22 août, quand la 22 et la 30 sont arrivées avant la réponse
+            # qui portait son identifiant de session.
+            pending = frames
+        else:
+            pending = []
+            for frame in frames:
+                if state.push(frame):
+                    self.logger.frame("notification", state, frame)
+
+        self.tell_members(game, notification_frame(
+            GAME_MANAGER,
+            NOTIFY_PLAYER_JOINING,
+            encode_fields([
+                Field("GID", INTEGER, game.game_id),
+                Field("PDAT", STRUCT,
+                      self.member_player(game, arrival["member"])),
+            ]),
+        ), skip=state)
+        # Et qu'il est arrivé, pas seulement qu'il arrivait.
+        #
+        # La 21 annonce une arrivée en cours ; la 30 la conclut. Sans elle,
+        # l'arrivant reste `ACTIVE_CONNECTING` dans le roster de ceux qui
+        # étaient déjà là. Le 22 août, l'hôte est passé à la sélection des
+        # maillots pendant que l'invité restait sur son chargement : l'hôte
+        # n'avait jamais appris que l'autre avait fini de se connecter, donc
+        # il ne l'attendait pas -- et l'invité attendait d'être reconnu.
+        #
+        # L'ancien `joinGame` envoyait bien cette paire. Elle a été perdue en
+        # factorisant les deux chemins d'arrivée ; la remettre ici la rend aux
+        # deux.
+        self.tell_members(game, notification_frame(
+            GAME_MANAGER,
+            NOTIFY_PLAYER_JOIN_COMPLETED,
+            encode_fields([
+                Field("GID", INTEGER, game.game_id),
+                Field("PID", INTEGER, state.xuid),
+            ]),
+        ), skip=state)
+
+        self.broadcast_census()
+        self.publish_relay_pairs()
+        return pending
+
     def pair_searches(self, state: ClientState) -> list[bytes]:
         """Two consoles looking for a game at the same time are each other's.
 
@@ -3488,6 +4205,25 @@ class Fifa14Protocol:
         with self.matchmaking_lock:
             mine = self.searches.get(state.connection_id)
             if mine is None:
+                return []
+            # Une partie déjà créée et qui attend quelqu'un compte comme un
+            # joueur qui cherche.
+            #
+            # L'écran de Face-à-Face a deux portes : une qui lance une
+            # recherche, et un bouton "Créer un match" qui fabrique un salon.
+            # Deux joueurs qui prennent la seconde se retrouvent chacun seul
+            # dans son coin, à s'attendre -- ce qui est arrivé le 22 août, et
+            # ce que rien ici ne rattrapait. Un serveur dont le comportement
+            # dépend du bouton choisi est un serveur qui a tort.
+            waiting_game = self.game_awaiting_player(state)
+            arrival = (
+                self.enlist_in_waiting_game(state, mine, waiting_game)
+                if waiting_game is not None else None
+            )
+        if arrival is not None:
+            return self.announce_late_join(waiting_game, arrival, state)
+        with self.matchmaking_lock:
+            if self.searches.get(state.connection_id) is None:
                 return []
             # Un hôte de test attend déjà, s'il y en a un et qu'il n'y a
             # personne d'autre.
@@ -4142,7 +4878,55 @@ class Fifa14Protocol:
         )
 
     def handle(self, request: bytes, state: ClientState) -> list[bytes]:
-        decoded = decode_frame(request)
+        try:
+            decoded = decode_frame(request)
+        except ValueError as error:
+            # Une trame dont la charge utile ne se décode pas ne doit pas
+            # emporter la connexion.
+            #
+            # Le 22 août, un `joinGame` portait un dictionnaire de chaînes
+            # vers structs -- une forme jamais vue -- et le décodeur est mort
+            # dessus en pleine partie. L'exception a fermé la socket Blaze
+            # d'un joueur au moment précis où il essayait de rejoindre
+            # l'autre. Ce n'est pas le décodeur qui était de trop, c'est le
+            # fait qu'il soit fatal.
+            #
+            # L'en-tête, lui, se lit toujours : douze octets, taille,
+            # composant, commande. C'est tout ce qu'il faut pour répondre
+            # quelque chose plutôt que de raccrocher, et pour écrire dans le
+            # journal de quoi comprendre plus tard.
+            self.logger.event(
+                "frame_payload_unreadable",
+                connection=state.connection_id,
+                component=int.from_bytes(request[2:4], "big") if len(request) >= 4 else None,
+                command=int.from_bytes(request[4:6], "big") if len(request) >= 6 else None,
+                error=str(error),
+                hex=request.hex().upper(),
+            )
+            # Deuxième chance : lire ce qui se laisse lire.
+            #
+            # Une trame Blaze est une suite de champs indépendants. Ne pas
+            # savoir lire le neuvième ne rend pas les huit premiers faux. On
+            # repart donc de la lecture partielle et on route normalement --
+            # le gestionnaire verra moins de champs qu'il n'y en avait, ce
+            # qu'il traite comme n'importe quel champ absent.
+            try:
+                decoded = decode_frame(request, tolerant=True)
+            except ValueError:
+                return [response_frame(request)]
+            self.logger.event(
+                "frame_payload_partial",
+                connection=state.connection_id,
+                component=decoded["component"],
+                command=decoded["command"],
+                read=[field.label for field in decoded["fields"]],
+                leftover=decoded.get("leftover", 0),
+                # Dit si ces champs sortent d'une resynchronisation, et combien
+                # d'octets elle a sautés. Sans ça, une lecture devinée se
+                # présente dans le journal exactement comme une lecture sûre.
+                resynchronised=decoded.get("resynchronised"),
+                skipped=decoded.get("skipped", 0),
+            )
         route = (decoded["component"], decoded["command"])
 
         if route == (REDIRECTOR, REDIRECTOR_GET_SERVER_INSTANCE):
@@ -4300,6 +5084,15 @@ class Fifa14Protocol:
                     encode_fields([Field("GRPS", LIST, (STRUCT, []))]),
                 )
             ]
+        if route == (STATS, STATS_GET_STAT_GROUP):
+            return [self.stat_group(request)]
+        if route == (STATS, STATS_GET_LEADERBOARD_TREE):
+            return [self.leaderboard_tree(request)]
+        if route == (STATS, STATS_GET_STATS_BY_GROUP):
+            return [
+                self.stats_by_group(request),
+                *self.stats_notification_sweep(request, state),
+            ]
         if route == (STATS, STATS_GET_PERIOD_IDS):
             return [self.period_ids(request)]
         if route == (GAME_MANAGER, GAME_MANAGER_JOIN_GAME):
@@ -4428,11 +5221,47 @@ class Fifa14Protocol:
                 grid = find_field(report.value, "GRID")
                 if grid is not None and isinstance(grid.value, int):
                     identifier = max(0, grid.value)
+            # Garder ce que le match a produit.
+            #
+            # Ce rapport porte tout : buts, tirs, passes, tacles, cartons,
+            # résultat. Il était jeté jusqu'au 22 août parce qu'on ne savait
+            # pas le lire -- le décodeur mourait sur un flottant. Un classement
+            # n'est rien d'autre que la somme de ces rapports, donc les jeter
+            # revenait à décréter qu'il n'y aurait jamais de classement.
+            #
+            # L'enregistrement ne doit jamais faire échouer la soumission : le
+            # titre attend son accusé de réception pour quitter l'écran de fin
+            # de match, et une erreur de disque n'est pas une raison de l'y
+            # laisser.
+            recorded = []
+            if report is not None:
+                try:
+                    recorded = extract_players(report)
+                    self.records.add(
+                        recorded,
+                        kind=report_match_type(report),
+                        duration=report_duration(report),
+                        when=datetime.now(timezone.utc).isoformat(),
+                    )
+                except Exception as error:      # noqa: BLE001
+                    self.logger.event(
+                        "game_report_not_recorded",
+                        connection=state.connection_id,
+                        error=f"{type(error).__name__}: {error}",
+                    )
             self.logger.event(
                 "game_report_submitted",
                 connection=state.connection_id,
                 reportId=identifier,
                 fields=[field.label for field in decoded["fields"]],
+                players=[
+                    {
+                        "persona": entry.persona_id,
+                        "buts": entry.stats.get("buts", 0),
+                        "encaisses": entry.stats.get("buts_encaisses", 0),
+                    }
+                    for entry in recorded
+                ],
             )
             return [
                 response_frame(request),
@@ -4457,11 +5286,25 @@ class Fifa14Protocol:
                 )
             ]
 
+        # What the console *asked for* matters more than the fact that it
+        # asked.  Until now this line recorded only the numbers, and the
+        # numbers alone cannot be answered: `getStatGroup` is the most
+        # frequent unanswered command in the journal, and every one of its
+        # replies is built around the group NAME it carries.  Recording the
+        # fields turns one console session into a specification -- the group
+        # names, the board ids, the entity types the title actually wants --
+        # instead of a list of things to guess at.
+        #
+        # `hex` is kept beside them because a field this decoder reads wrongly
+        # would otherwise be recorded wrongly and look right; the raw frame is
+        # the one thing that cannot be misread later.
         self.logger.event(
             "unknown_route",
             connection=state.connection_id,
             component=route[0],
             command=route[1],
+            fields=json_value(decoded["fields"]),
+            hex=request.hex().upper(),
         )
         return [response_frame(request)]
 
@@ -4487,6 +5330,16 @@ class IdentityHttpService:
         self.accounts = accounts if accounts is not None else AccountStores()
         self.server: http.server.ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
+        # Quand chaque pair a touché une route `/ut/` pour la dernière fois.
+        #
+        # Ça ne sert pas au jeu : ça sert au surveillant de patch, qui balaie
+        # la mémoire de la console en XBDM et doit s'arrêter dès que le titre
+        # est entré dans Ultimate Team -- continuer, c'est ralentir les menus
+        # et l'animation des pochettes chez quelqu'un qui joue. Le titre est le
+        # seul à savoir où il en est, et une requête `/ut/` est la façon dont
+        # il le dit. Voir `GET /revival/inside-fut`.
+        self.fut_seen: dict[str, float] = {}
+        self.fut_seen_lock = threading.Lock()
 
     @property
     def public_base(self) -> str:
@@ -4594,6 +5447,42 @@ class IdentityHttpService:
                 if parsed.path == "/health":
                     self.reply(200, b"ok\n", {"Content-Type": "text/plain"})
                     return
+                if parsed.path == "/revival/inside-fut":
+                    # Le titre est-il dans Ultimate Team ?
+                    #
+                    # Répond sur le pair qui demande, sans paramètre : la
+                    # machine qui pose la question est derrière le même NAT que
+                    # la console, donc le serveur voit la même adresse publique
+                    # pour les deux. C'est ce qui rend la route sûre sur un
+                    # serveur partagé -- personne n'apprend rien sur les autres
+                    # joueurs -- et ce qui la rend utilisable sans que
+                    # l'appelant ait à savoir sous quelle adresse il sort.
+                    #
+                    # `peer` force l'adresse, pour un réseau où les deux ne
+                    # sortent pas ensemble, et `window` la fenêtre en secondes.
+                    query = urllib.parse.parse_qs(parsed.query)
+                    peer = (query.get("peer") or [self.client_address[0]])[0]
+                    try:
+                        window = float((query.get("window") or ["120"])[0])
+                    except ValueError:
+                        window = 120.0
+                    with owner.fut_seen_lock:
+                        last = owner.fut_seen.get(peer)
+                    age = None if last is None else time.time() - last
+                    inside = age is not None and age <= window
+                    self.reply(
+                        200,
+                        json.dumps({
+                            "peer": peer,
+                            "inside": inside,
+                            "age": None if age is None else round(age, 1),
+                        }).encode("utf-8") + b"\n",
+                        {
+                            "Content-Type": "application/json",
+                            "Cache-Control": "no-store",
+                        },
+                    )
+                    return
                 if parsed.path == "/revival/reset" and self.command == "POST":
                     self.account_store().reset()
                     owner.journal.event(
@@ -4658,6 +5547,14 @@ class IdentityHttpService:
                 normalized_path = FUT_ROUTE_SPELLINGS.get(
                     normalized_path.lower(), normalized_path
                 )
+                # Noté ici plutôt qu'à chaque route : c'est le seul endroit où
+                # toutes les orthographes de FUT sont déjà ramenées à une, donc
+                # le seul où « le titre est dans Ultimate Team » se dit une fois
+                # et couvre tout. Un `fut_route_request` ne couvrirait que les
+                # routes statiques, une petite partie de ce que FUT appelle.
+                if normalized_path.startswith("/ut/"):
+                    with owner.fut_seen_lock:
+                        owner.fut_seen[self.client_address[0]] = time.time()
                 if normalized_path in EASW_AUTH_PATHS:
                     # The native success parser reads these headers and hands
                     # EASW-Session and EASW-Token to CardsDLL.  Supplying them
@@ -4684,6 +5581,57 @@ class IdentityHttpService:
                             "EASW-Session": EASW_SESSION,
                             "EASW-Nucleus-Persona": str(persona_id),
                             "EASW-Userid": str(persona_id),
+                        },
+                    )
+                    return
+                easw_kind, easw_event = "", None
+                for candidate_kind, pattern in EASW_UPLOAD_PATHS:
+                    easw_event = pattern.match(normalized_path)
+                    if easw_event is not None:
+                        easw_kind = candidate_kind
+                        break
+                if easw_event is not None:
+                    # Every one of these bodies is XML the console composed
+                    # itself, and all of it is recorded: this is the first
+                    # traffic the module has ever produced and nothing else
+                    # documents its vocabulary.  A presence entry carries an
+                    # `<updated>` stamp, a `<category term="...">` and one
+                    # `<e:event>` with the console xuid and the player handle;
+                    # `buddies` carries the Xbox Live friends list; and
+                    # `online_stats` three named values.
+                    owner.journal.event(
+                        "easw_event",
+                        peer=self.client_address[0],
+                        upload=easw_kind,
+                        persona=easw_event["persona"],
+                        sku=easw_event.groupdict().get("sku"),
+                        category=easw_event_category(body),
+                        bytes=len(body),
+                        body=request_body_preview(body),
+                    )
+                    # An empty 200 rather than an invented entry.
+                    #
+                    # What EASW answers here is not known, and the lesson from
+                    # the stats screens on 22 August is that guessing at a
+                    # success shape can be worse than admitting emptiness: a
+                    # fabricated reply the client half-parses leaves it waiting
+                    # for a follow-up that never comes, while an honest answer
+                    # lets it move on.  A presence event is fire-and-forget --
+                    # the client posts it and does not read a body back -- so
+                    # the smallest well-formed acceptance is the honest answer
+                    # here, and 404 plainly was not.
+                    #
+                    # If the console keeps re-posting the same event id after
+                    # this, the next thing to try is 201 with the entry echoed
+                    # back; the journal above is what will say which.
+                    self.reply(
+                        200,
+                        b"",
+                        {
+                            "Content-Type": "text/xml",
+                            "Cache-Control": "no-store",
+                            "EASW-Token": EASW_TOKEN,
+                            "EASW-Session": EASW_SESSION,
                         },
                     )
                     return
@@ -7507,14 +8455,33 @@ class BlazeService:
         state.channel = client
         self.protocol.remember_connection(state)
         buffer = bytearray()
+        # How long a connection may stay silent before it is treated as gone.
+        # The console sends `Utility.ping` every twenty seconds and keeps
+        # doing so through a match, so two minutes is silence rather than a
+        # slow menu -- while still being far short of the forever a half-open
+        # socket would otherwise last. Zero disables the check.
+        idle_limit = float(os.environ.get("FIFA14_IDLE_TIMEOUT", "120"))
         try:
             while not self.stop_event.is_set():
                 try:
                     block = client.recv(65536)
                 except socket.timeout:
+                    if (
+                        idle_limit > 0
+                        and time.monotonic() - state.last_seen > idle_limit
+                    ):
+                        self.journal.event(
+                            "connection_idle",
+                            connection=state.connection_id,
+                            local_port=state.local_port,
+                            silent_for=round(time.monotonic() - state.last_seen, 1),
+                            requests=state.request_count,
+                        )
+                        return
                     continue
                 if not block:
                     return
+                state.last_seen = time.monotonic()
                 buffer.extend(block)
 
                 # A TLS ClientHello starts with a TLS record byte, not a Blaze

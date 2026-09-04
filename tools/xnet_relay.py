@@ -53,31 +53,58 @@ class Pairs:
         self.partner: dict[str, str] = {}
         self._stamp: tuple = ()
 
-    def refresh(self) -> None:
+    def refresh(self) -> bool:
+        """Relit le fichier si besoin. Vrai si la table a changé."""
         if self.path is None:
-            return
+            return False
         try:
             stat = self.path.stat()
         except OSError:
+            changed = bool(self.partner)
             self.partner = {}
-            return
+            return changed
         key = (stat.st_size, stat.st_mtime)
         if key == self._stamp:
-            return
+            return False
         try:
             document = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return
+            return False
         table: dict[str, str] = {}
         for pair in document.get("pairs", []):
             if len(pair) == 2 and pair[0] != pair[1]:
                 table[str(pair[0])] = str(pair[1])
                 table[str(pair[1])] = str(pair[0])
+        changed = table != self.partner
         self.partner = table
         self._stamp = key
+        return changed
 
     def of(self, address: str) -> str | None:
         return self.partner.get(address)
+
+
+def fresh_endpoint(endpoint: dict[str, tuple[str, int]],
+                   seen_at: dict[str, float],
+                   address: str, now: float,
+                   fresh: float) -> tuple[str, int] | None:
+    """Où joindre `address`, ou rien si c'est trop vieux pour y croire.
+
+    Le relais ne devine jamais une adresse : il n'écrit qu'à celles dont il a
+    reçu un paquet. Ce qu'il ne faisait pas, c'est les oublier. Son
+    dictionnaire vivait en mémoire d'un processus démarré la veille, et le
+    23 août il a expédié dix paquets à une correspondance NAT apprise le 22 --
+    en journalisant `relay_forwarded`, donc en affirmant les avoir livrés.
+
+    Un paquet perdu se rattrape. Un journal qui ment coûte un quart d'heure de
+    diagnostic à contresens, ce qui est plus cher.
+    """
+    target = endpoint.get(address)
+    if target is None:
+        return None
+    if now - seen_at.get(address, 0.0) > fresh:
+        return None
+    return target
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -98,6 +125,20 @@ def main(argv: list[str] | None = None) -> int:
     pairs = Pairs(arguments.pairs)
     # L'endroit d'où chaque console parle réellement, appris de ses paquets.
     endpoint: dict[str, tuple[str, int]] = {}
+    # Et quand on l'a appris.
+    #
+    # Ce dictionnaire vivait en mémoire d'un processus démarré la veille. Le
+    # 23 août, une console a reçu dix paquets à une adresse apprise le 22 :
+    # la correspondance NAT avait expiré depuis des heures, le relais les a
+    # expédiés dans le vide et a journalisé `relay_forwarded` -- en toute
+    # bonne foi. La lecture du journal a été fausse pendant un quart d'heure
+    # à cause de ça, ce qui est pire qu'un paquet perdu.
+    #
+    # Une correspondance UDP tient rarement plus d'une minute sans trafic.
+    # Passé ce délai on ne sait plus, et on le dit : le paquet est mis en
+    # attente comme pour un partenaire qui n'a jamais parlé.
+    seen_at: dict[str, float] = {}
+    FRESH = 45.0
     counts: dict[str, int] = {}
     dropped: dict[str, int] = {}
     # Ce qu'un joueur a envoyé avant que son partenaire n'ait parlé.
@@ -113,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
     # début de la conversation, pas son milieu.
     waiting: dict[str, list[bytes]] = {}
     HELD = 16
+    # Les formes déjà échantillonnées : (adresse, taille).
+    sampled: set[tuple[str, int]] = set()
 
     def note(kind: str, **values: object) -> None:
         record = {
@@ -128,7 +171,15 @@ def main(argv: list[str] | None = None) -> int:
                 stream.write(line + "\n")
 
     while True:
-        pairs.refresh()
+        if pairs.refresh():
+            # La partie a changé de composition. Une adresse apprise pour
+            # quelqu'un qui n'est plus appairé n'a plus de raison d'être
+            # gardée, et en la gardant on prépare la livraison d'après-demain
+            # à l'adresse d'hier.
+            for stale in [a for a in endpoint if pairs.of(a) is None]:
+                endpoint.pop(stale, None)
+                seen_at.pop(stale, None)
+                waiting.pop(stale, None)
         try:
             payload, peer = sock.recvfrom(4096)
         except socket.timeout:
@@ -139,11 +190,27 @@ def main(argv: list[str] | None = None) -> int:
             break
 
         source, port = peer
+        now = time.monotonic()
         if endpoint.get(source) != (source, port):
             endpoint[source] = (source, port)
             note("relay_endpoint", peer=f"{source}:{port}",
                  partner=pairs.of(source))
+        seen_at[source] = now
         counts[source] = counts.get(source, 0) + 1
+
+        # Les premiers octets de chaque pair, une seule fois.
+        #
+        # Les deux consoles s'envoient dix sondes de 122 octets et se les
+        # jettent mutuellement. Si l'une parle XNet sécurisé et l'autre en
+        # clair, ça se lit ici et nulle part ailleurs : le relais est le seul
+        # point du montage qui voie les deux côtés. On ne journalise qu'un
+        # échantillon par pair et par taille, parce que le but est de
+        # comparer des formes, pas de capturer une session.
+        shape = (source, len(payload))
+        if shape not in sampled:
+            sampled.add(shape)
+            note("relay_sample", peer=source, bytes=len(payload),
+                 head=payload[:24].hex().upper())
 
         partner = pairs.of(source)
         if partner is None:
@@ -152,7 +219,13 @@ def main(argv: list[str] | None = None) -> int:
             if dropped[source] in (1, 100, 1000):
                 note("relay_unpaired", peer=source, packets=dropped[source])
             continue
-        target = endpoint.get(partner)
+        target = fresh_endpoint(endpoint, seen_at, partner, now, FRESH)
+        if target is None and partner in endpoint:
+            note("relay_endpoint_expired", peer=partner,
+                 target="%s:%d" % endpoint[partner],
+                 silent_for=round(now - seen_at.get(partner, 0.0), 1))
+            endpoint.pop(partner, None)
+            seen_at.pop(partner, None)
         if target is None:
             # L'autre n'a pas encore parlé : on garde, on ne jette pas.
             held = waiting.setdefault(source, [])

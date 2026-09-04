@@ -569,3 +569,35 @@ table.data td.name { font-family: var(--head); font-size: 1rem; letter-spacing: 
   .event .who { grid-column: 2; }
   table.data .opt { display: none; }
 }
+
+/* --------------------------------------------------------- classements */
+
+/* Le rang, le nom, la valeur. Trois colonnes, et la valeur alignée à droite
+   pour que les chiffres se comparent d'un coup d'oeil -- un classement dont
+   les nombres ne s'alignent pas se lit deux fois plus lentement. */
+.board { width: 100%; border-collapse: collapse; }
+.board tr { border-bottom: 1px solid rgba(255, 255, 255, .06); }
+.board tr:last-child { border-bottom: 0; }
+.board td { padding: 7px 4px; font-size: 13px; }
+.board .rank {
+  width: 30px; color: var(--muted); font-variant-numeric: tabular-nums;
+  text-align: right; padding-right: 10px;
+}
+/* Les trois premiers se remarquent sans avoir à lire le rang. */
+.board tr:nth-child(1) .rank { color: var(--gold); font-weight: 700; }
+.board tr:nth-child(2) .rank,
+.board tr:nth-child(3) .rank { color: #cfd6e4; font-weight: 600; }
+.board .who { color: #eef2f8; }
+.board .val {
+  text-align: right; font-variant-numeric: tabular-nums; font-weight: 700;
+}
+.board .val .unit { font-weight: 400; color: var(--muted); font-size: 11px; }
+
+.matches { list-style: none; margin: 0; padding: 0; }
+.matches li {
+  padding: 7px 2px; font-size: 13px;
+  border-bottom: 1px solid rgba(255, 255, 255, .06);
+}
+.matches li:last-child { border-bottom: 0; }
+.matches b { color: var(--gold); font-variant-numeric: tabular-nums; }
+.matches .muted { color: var(--muted); font-size: 11px; margin-left: 6px; }
