@@ -41,10 +41,18 @@ mkdir -p "$HERE/runtime/clubs"
 # closed door. Keep this list in step with LOCAL_PLAINTEXT_PORTS in
 # tools/fifa14_connect_redirect.py.
 
-# The seasons and cups list only appear in native mode; without this the client
-# reads "Les saisons ne sont pas disponibles". It is the mode every working
-# launch uses, so it is the default here rather than a thing to remember.
-export FIFA14_SEASON_MODE="${FIFA14_SEASON_MODE:-native}"
+# The seasons and cups list only appear when a mode is set; without this the
+# client reads "Les saisons ne sont pas disponibles". It is set here rather
+# than left to be remembered.
+#
+# `native` was pinned here while the code default was something else, which is
+# how three branches came to be eliminated on the grounds that they served
+# identical documents -- true, and useless, because they shared a default that
+# this line was overriding. The code default is `ac` now, and this line no
+# longer disagrees with it.
+#
+# Set FIFA14_SEASON_MODE=native to go back if the screen freezes.
+export FIFA14_SEASON_MODE="${FIFA14_SEASON_MODE:-ac}"
 
 exec "$PY" "$HERE/server/fifa14_blaze_server.py" \
     --listen 0.0.0.0 \
