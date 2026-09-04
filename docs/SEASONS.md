@@ -640,3 +640,60 @@ choses à lire, dans l'ordre :
    suivante suit-elle ? Le journal porte `seasonEndResult`, `seasonPrize`,
    `seasonPoints` et `seasonDivision` sur l'événement `fut_match_end`, donc la
    réponse se lit sans écran.
+
+### Mesuré sur la console — 4 septembre 2026, 19:39
+
+L'écran s'ouvre, et **la saison se reprend**. C'est ce que la section
+« Conclusion » ci-dessus déclarait hors d'atteinte depuis le serveur.
+
+Ce que la console a demandé en entrant dans le mode :
+
+    17:17:28  GET season/user                     type=offline
+    17:19:18  GET season/list                     divisionList=10
+    17:19:18  GET /fut/items/xbl2/1112 … 1103     dix, une par division
+    17:19:18  GET season/user
+    17:19:18  GET trophies/xbl2/item.big
+    17:19:20  GET season/user/history             ← le 13 août, plus rien ici
+
+Les dix requêtes d'items portent exactement `1103`..`1112`, donc le client lit
+le nouveau `trophyResourceId` et distingue les dix divisions. Le panneau de
+détails de la Division 10 affiche **12 pts titre, 2 montée, 1900 / 1500 / 300**
+— les trois montants sont ceux du disque servi, là où le 13 août relevait 400
+en championnat.
+
+Puis une rencontre gagnée :
+
+    17:38:44  fut_match_end     WIN, seasonRecord 1-0-1, season [1112, 10]
+    17:38:44  PUT season/1112/division/10/user    round 3, blob 704 o
+    17:39:03  GET season/list, season/user, season/user/history
+
+Et à la ré-entrée, l'écran affiche **deux matchs joués et huit restants**. Pas
+de modal « Voulez-vous vraiment débuter cette Saison Joueur Solo ? ».
+
+L'état côté serveur, lu dans la sauvegarde du club :
+
+    1112:10   round 3, gagné 1, perdu 1, 781 crédits, blob 352 o
+    1:10      round 1, gagné 1        résidus de l'ancien schéma d'identité
+    10:10     round 1, vide
+    division  offline 10
+
+`SeasonProgress.current()` retient `1112:10` parce que c'est l'entrée avec le
+plus de rencontres derrière elle — la règle écrite en août pour exactement ce
+cas tient face aux deux résidus.
+
+**Ce qui reste non mesuré :** l'annonce de fin de saison. Elle ne tombe qu'à la
+dixième rencontre, et deux ont été jouées. Le journal la portera sur
+`fut_match_end` — `seasonEndResult`, `seasonPrize`, `seasonPoints`,
+`seasonDivision` — donc elle se lira sans avoir à croire l'écran.
+
+**Ce qui n'est pas départagé :** `dataVersion` en chaîne. Le client envoie
+lui-même l'entier `1` dans son PUT ; on lui répond `"1"`, et ça reprend. Donc
+la chaîne n'empêche rien — mais rien ne dit que l'entier aurait échoué. Ce
+changement voyageait avec quatre autres et aucun essai ne l'isole. Le
+départager coûterait une relance et une saison à rejouer, pour une question
+qui n'a plus de conséquence.
+
+**Un défaut cosmétique repéré au passage :** sur les dix trophées demandés,
+seuls `1104`, `1108` et `1112` résolvent vers une définition réelle (154-161
+octets) ; les sept autres reviennent à 112, la réponse vide. Sept divisions
+auront donc un écusson nu. C'est de l'illustration, pas du protocole.
