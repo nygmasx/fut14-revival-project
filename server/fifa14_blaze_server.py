@@ -869,6 +869,9 @@ HANDLED_ROUTES = (
     "/ut/game/fifa14/transfermarket",
     "/ut/game/fifa14/user/club",
     "/ut/game/fifa14/user/list",
+    # World Cup Ultimate Team. Le binaire construit cette route a 0x2dcbc et
+    # la forme de sa reponse est juste apres : `{"cupsWon":%d}`.
+    "/ut/game/fifa14/user/tournament",
     "/ut/game/fifa14/watchlist",
 )
 
@@ -1636,6 +1639,16 @@ def relay_pairs_path() -> Path | None:
     """
     raw = os.environ.get("FIFA14_RELAY_PAIRS", "").strip()
     return Path(raw) if raw else None
+
+
+def world_cup_mode() -> int:
+    """`enableWorldCupMode` : 1 pour ouvrir World Cup Ultimate Team.
+
+    `FIFA14_WORLD_CUP=1`. Desarme par defaut parce que rien de ce mode n'a
+    jamais tourne ici, et qu'un hub FUT qui gele coute une relance du titre.
+    """
+    raw = os.environ.get("FIFA14_WORLD_CUP", "").strip().lower()
+    return 1 if raw in ("1", "true", "yes", "on") else 0
 
 
 def peer_relay() -> tuple[str, int] | None:
@@ -6072,6 +6085,71 @@ class IdentityHttpService:
                 # The draw for a cup. The module's template is
                 # `/teams?groupId=%d&count=%d`; count is how many opponents the
                 # tree needs, the club itself taking the remaining slot.
+                # Les deux routes que le binaire construit et que rien
+                # n'avait encore servies, parce que le mode qui les emploie
+                # n'a jamais ete allume.
+                #
+                # Elles sont lues dans le `.rdata` de CardsDLL, en clair :
+                # `/schedule/tournamentid/%u` a 0x2b17c et `/user/tournament`
+                # a 0x2dcbc, ce dernier suivi immediatement de la forme de sa
+                # reponse -- `{"cupsWon":%d}`.
+                #
+                # Une route inconnue tombe sur le 404 generique, et un 404 est
+                # un gel sans rien a lire : c'est ce que `season/user/history`
+                # a coute avant d'etre ecrit. Elles repondent donc du vide bien
+                # forme plutot que rien, en attendant de savoir ce que le mode
+                # en fait -- ce qui se lira sur le fil, une fois allume.
+                if (
+                    normalized_path.startswith(
+                        "/ut/game/fifa14/tournament/schedule/tournamentid/"
+                    )
+                    and self.command == "GET"
+                ):
+                    try:
+                        wanted = int(normalized_path.rsplit("/", 1)[-1])
+                    except ValueError:
+                        wanted = 0
+                    payload = b"{}"
+                    owner.journal.event(
+                        "fut_tournament_schedule",
+                        peer=self.client_address[0],
+                        tournament=wanted,
+                        bytes=len(payload),
+                    )
+                    self.reply(
+                        200,
+                        payload + b"\n",
+                        {
+                            "Content-Type": "application/json; charset=utf-8",
+                            "Cache-Control": "no-store",
+                        },
+                    )
+                    return
+                if normalized_path == "/ut/game/fifa14/user/tournament":
+                    # `{"cupsWon":%d}` est la forme que le binaire porte a
+                    # cote de la route, a 0x2dcd0. Le compte est celui que
+                    # `TournamentProgress` tient deja -- `trophies`, leve par
+                    # `advance` a chaque finale gagnee et lu par
+                    # `trophyUserCount` -- plutot qu'un zero de principe.
+                    payload = json.dumps(
+                        {"cupsWon": int(getattr(TOURNAMENT_PROGRESS, "trophies", 0) or 0)},
+                        separators=(",", ":"),
+                    ).encode()
+                    owner.journal.event(
+                        "fut_user_tournament",
+                        peer=self.client_address[0],
+                        method=self.command,
+                        bytes=len(payload),
+                    )
+                    self.reply(
+                        200,
+                        payload + b"\n",
+                        {
+                            "Content-Type": "application/json; charset=utf-8",
+                            "Cache-Control": "no-store",
+                        },
+                    )
+                    return
                 if (
                     normalized_path == "/ut/game/fifa14/tournament/teams"
                     and self.command == "GET"
@@ -7955,6 +8033,34 @@ class IdentityHttpService:
                     # Field names recovered from FIFA 14's FutSettings parser.
                     # clubCreateThreshold stays at zero so a brand-new account
                     # is allowed to create its club immediately.
+                    #
+                    # `enableWorldCupMode` est la porte de World Cup Ultimate
+                    # Team, et ce n'est pas une hypothese : le membre est dans
+                    # la liste que le parser de `/settings` compare, a 0x28c54
+                    # du `.rdata` de CardsDLL, juste apres
+                    # `tokenRedemptionEnabled`.
+                    #
+                    # Le mode est present dans ce build. Le binaire charge
+                    # s'est construit le **15 avril 2014**, la date de la mise
+                    # a jour Coupe du Monde de FIFA 14, et son `.rdata` porte
+                    # tout ce qu'il faut : `GOTO_WORLD_CUP` a cote de
+                    # `GOTO_MY_CLUB` dans la liste des destinations du hub FUT,
+                    # cinq destinations `GOTO_WC_TOURNAMENT_*`, les mises en
+                    # page `FutFluxHubWCCfg.xml` et
+                    # `FutFluxOfflineTournamentWCCfg.xml`, et neuf fonctions
+                    # natives -- `GetOfflineWCTournamentGroupData`,
+                    # `GetUserCurrentWCRound`, `UpdateWCGroupData`,
+                    # `SaveWCTournyGroupLastMatchData` et le reste.
+                    #
+                    # Les deux routes que le mode ajoute sont deja servies :
+                    # `/season/user/history?type=WC_TOURNAMENT_OFFINE` -- la
+                    # faute de frappe est d'EA -- et `..._ONLINE` tombent sur
+                    # `season_history_response`, qui repond `{}`.
+                    #
+                    # Reste desarme par defaut : rien de tout ca n'a jamais ete
+                    # allume sur cette console, et un ecran de hub qui gele est
+                    # ce que ce depot a paye deux fois sur les saisons.
+                    # `FIFA14_WORLD_CUP=1` l'allume.
                     payload = (
                         json.dumps(
                             {
@@ -7963,7 +8069,7 @@ class IdentityHttpService:
                                 "clubCreateThreshold": 0,
                                 "fifaPointsCancelTransactionFix": 1,
                                 "tokenRedemptionEnabled": 0,
-                                "enableWorldCupMode": 0,
+                                "enableWorldCupMode": world_cup_mode(),
                             },
                             separators=(",", ":"),
                         )
