@@ -1687,6 +1687,101 @@ def relayed_address(address: bytes, relay: tuple[str, int]) -> bytes:
     return address[:4] + packed + port.to_bytes(2, "big") + address[10:]
 
 
+def lan_direct() -> tuple[bool, int | None]:
+    """Deux consoles derriere le meme NAT : rendre a chacune l'adresse locale.
+
+    Le 4 septembre 2026, les deux consoles de ce projet ont annonce le meme
+    `inaOnline` -- `020B639A`, soit `2.11.99.154`, l'adresse publique de la
+    box qu'elles partagent. Chacune recevait donc, pour joindre l'autre,
+    l'adresse publique de son propre NAT. Il faudrait que le routeur renvoie
+    vers le LAN un paquet adresse a sa propre facade (le « hairpin »), ce que
+    la plupart des box domestiques ne font pas -- et meme quand elles le font,
+    rien ne garantit que le port entrant retombe sur la bonne console.
+
+    Le maillage se fermait quand meme au niveau Blaze (`STAT 2` des deux
+    cotes), puis cinquante-trois secondes de silence et un `DNF` : la signature
+    exacte d'un canal pair-a-pair dont aucun paquet n'arrive.
+
+    `FIFA14_LAN_DIRECT=1` reecrit `inaOnline` avec le `ina` que la console a
+    elle-meme mis dans son XNADDR -- son adresse locale. Les deux consoles se
+    parlent alors directement sur le LAN, sans NAT du tout.
+
+    `FIFA14_LAN_DIRECT=3074` force en plus le port. Il existe parce que les
+    deux consoles ont annonce des `wPortOnline` differents -- 3074 pour l'une,
+    1024 pour l'autre -- et qu'un port remappe par le NAT n'a aucune raison
+    d'etre celui sur lequel la console ecoute chez elle. Lequel des deux est
+    juste se lit sur le reseau, pas ici : d'ou les deux modes.
+
+    Ne pas laisser ceci arme pour un adversaire reellement distant : une
+    adresse privee ne mene nulle part depuis l'exterieur.
+    """
+    raw = os.environ.get("FIFA14_LAN_DIRECT", "").strip().lower()
+    if not raw or raw in ("0", "false", "no", "off"):
+        return False, None
+    if raw in ("1", "true", "yes", "on"):
+        return True, None
+    try:
+        return True, int(raw)
+    except ValueError:
+        return True, None
+
+
+def lan_direct_address(address: bytes, port: int | None) -> bytes:
+    """Un XNADDR dont l'adresse publique redevient l'adresse locale.
+
+    Seuls `inaOnline` -- et le port, si on l'a force -- changent. `abEnet` et
+    les vingt octets d'`abOnline` sont laisses tels quels, pour la meme raison
+    que dans `relayed_address` : c'est de la matiere que la console a
+    fabriquee et qu'on ne sait pas lire.
+    """
+    if len(address) < 10:
+        return address
+    packed_port = address[8:10] if port is None else int(port).to_bytes(2, "big")
+    return address[:4] + address[:4] + packed_port + address[10:]
+
+
+def peer_address(address: bytes) -> bytes:
+    """L'adresse d'un pair telle qu'on la donne a l'autre console.
+
+    Un seul endroit decide, parce que le 23 aout a montre qu'en reecrire une
+    copie sur deux revient a n'en reecrire aucune.
+    """
+    direct, port = lan_direct()
+    if direct:
+        return lan_direct_address(address, port)
+    relay = peer_relay()
+    if relay is None:
+        return address
+    return relayed_address(address, relay)
+
+
+def peer_host_addresses(addresses: "Field | None") -> "Field | None":
+    """`HNET`, passe par la meme decision que le roster."""
+    if addresses is None:
+        return addresses
+    direct, _ = lan_direct()
+    relay = peer_relay()
+    if not direct and relay is None:
+        return addresses
+    try:
+        item_type, items = addresses.value
+    except (TypeError, ValueError):
+        return addresses
+    rewritten_items = []
+    for item in items:
+        try:
+            active, entries = item
+        except (TypeError, ValueError):
+            rewritten_items.append(item)
+            continue
+        rewritten_items.append((active, [
+            Field("XDDR", BINARY, peer_address(bytes(entry.value)))
+            if getattr(entry, "label", None) == "XDDR" else entry
+            for entry in entries
+        ]))
+    return Field("HNET", LIST, (item_type, rewritten_items))
+
+
 def relayed_host_addresses(addresses: "Field | None",
                            relay: tuple[str, int] | None) -> "Field | None":
     """`HNET`, with the host's public address pointed at the relay.
@@ -2824,7 +2919,7 @@ class Fifa14Protocol:
             # Pointed at the relay for everyone but the host itself, on the
             # same rule as the roster: a console is never told to dial
             # through a relay to reach the machine it is running on.
-            (relayed_host_addresses(game.host_addresses, peer_relay())
+            (peer_host_addresses(game.host_addresses)
              if viewer is None or viewer.xuid != game.persona_id
              else game.host_addresses)
             or Field("HNET", LIST, (STRUCT, [])),
@@ -2922,15 +3017,15 @@ class Fifa14Protocol:
             Field("UID", INTEGER, member["persona"]),
         ]
         address = member["address"]
-        relay = peer_relay()
-        if (address is not None and relay is not None
+        direct, _ = lan_direct()
+        if (address is not None and (direct or peer_relay() is not None)
                 and (viewer is None or member["persona"] != viewer.xuid)):
             active, valu = address
             rewritten = []
             for entry in valu.value:
                 if entry.label == "XDDR":
                     rewritten.append(Field(
-                        "XDDR", BINARY, relayed_address(bytes(entry.value), relay)
+                        "XDDR", BINARY, peer_address(bytes(entry.value))
                     ))
                 else:
                     rewritten.append(entry)
